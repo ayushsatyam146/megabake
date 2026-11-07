@@ -60,7 +60,17 @@ def kv_attention(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     valid_length: torch.Tensor,
+    scale: float = 0.0,
+    window: int = 0,
+    softcap: float = 0.0,
 ) -> torch.Tensor:
+    """One-token decode attention that appends to bounded KV caches.
+
+    Scores are the BF16 q·k products scaled in FP32 by ``scale`` (0 means
+    head_dim**-0.5), then mapped to softcap * tanh(s / softcap) when
+    ``softcap`` is set. With ``window`` set the query sees only the last
+    ``window`` keys (its own included): sliding-window attention over a
+    linear cache."""
     if source.shape[1] != 1:
         raise RuntimeError("megabake kv_attention supports one-token decode only")
     start = int(valid_length.item())
@@ -80,7 +90,11 @@ def kv_attention(
         group_size = query.shape[1] // keys.shape[1]
         keys = keys.repeat_interleave(group_size, dim=1)
         values = values.repeat_interleave(group_size, dim=1)
-    scores = (query @ keys.transpose(-2, -1)).float() * source.shape[-1] ** -0.5
+    scores = (query @ keys.transpose(-2, -1)).float() * (scale or source.shape[-1] ** -0.5)
+    if softcap:
+        scores = softcap * torch.tanh(scores / softcap)
+    if window and end > window:
+        scores[..., : end - window] = float("-inf")
     probabilities = torch.softmax(scores, dim=-1).to(source.dtype)
     output = probabilities @ values
     return output.permute(0, 2, 1, 3).reshape(
@@ -96,6 +110,9 @@ def _kv_attention_fake(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
     valid_length: torch.Tensor,
+    scale: float = 0.0,
+    window: int = 0,
+    softcap: float = 0.0,
 ) -> torch.Tensor:
     return torch.empty(
         (
@@ -245,6 +262,8 @@ class Attention:
     kv_state: KVCacheAccess | None = None
     # Keyed by the operand load they replace: attention:q or attention:new_k.
     prologues: Mapping[str, Prologue] = field(default_factory=dict)
+    # Scaled scores s become softcap * tanh(s / softcap) when set.
+    softcap: float = 0.0
 
 
 def _declared_grouping(query: IndexedLoad, key: IndexedLoad) -> HeadGrouping:
@@ -574,6 +593,8 @@ def stateful_candidate(operation: Op, graph: ComputeGraph) -> RegionCandidate | 
     state = program.state_accesses[0]
     loads = {load.id: load for load in program.loads}
     output_id = operation.results[0]
+    scale, window, softcap = _kv_attention_options(operation)
+    head_dim = loads["attention:q"].source_shape[3]
     return RegionCandidate(
         id=f"region:{operation.id.removeprefix('op:')}:kv_attention",
         source_op_ids=(operation.id,),
@@ -587,8 +608,12 @@ def stateful_candidate(operation: Op, graph: ComputeGraph) -> RegionCandidate | 
             k=loads["attention:k"],
             v=loads["attention:v"],
             grouping=_declared_grouping(loads["attention:q"], loads["attention:k"]),
-            scale=loads["attention:q"].source_shape[3] ** -0.5,
-            mask=Mask("stateful_causal", causal_offset=0),
+            scale=scale or head_dim**-0.5,
+            mask=Mask(
+                "stateful_causal",
+                causal_offset=0,
+                window_offsets=(1 - window, 0) if window else None,
+            ),
             outputs=(output_id,),
             boundary_output=output_id if output_id in graph.outputs else None,
             cache=CacheEffects(
@@ -605,6 +630,7 @@ def stateful_candidate(operation: Op, graph: ComputeGraph) -> RegionCandidate | 
                 ),
             ),
             kv_state=state,
+            softcap=softcap,
         ),
         cost_bytes=(
             2
@@ -615,6 +641,20 @@ def stateful_candidate(operation: Op, graph: ComputeGraph) -> RegionCandidate | 
             * 2
         ),
     )
+
+
+def _kv_attention_options(operation: Op) -> tuple[float, int, float]:
+    """``scale``, ``window`` and ``softcap`` of a ``megabake::kv_attention``
+    call, positional or keyword, with the op's defaults."""
+    arguments = tuple(operation.attributes.get("fx_args", ()))[6:]
+    keywords = dict(operation.attributes.get("fx_kwargs", {}) or {})
+    names = ("scale", "window", "softcap")
+    values = dict(zip(names, arguments))
+    values.update({name: keywords[name] for name in names if name in keywords})
+    scale, window, softcap = (values.get(name, 0) for name in names)
+    if not all(isinstance(value, (int, float)) for value in (scale, window, softcap)):
+        raise UnsupportedLowering("KV attention scale, window and soft cap must be static")
+    return float(scale), int(window), float(softcap)
 
 
 def prologue_candidates(

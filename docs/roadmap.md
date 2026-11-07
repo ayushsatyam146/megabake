@@ -1,16 +1,30 @@
 # MegaBake roadmap
 
-**Updated 2026-10-27 (flash-decoding attention, part of step 11); steps 1-2b measured in `artifacts/step2b_2026-10-21` (steps 1-2 in `artifacts/step12b_2026-10-21`), step 3 in `artifacts/step3_2026-10-21`. This file says what to do next. The analysis behind it is the 2026-10-18 megakernel gap analysis; the 2026-10-20/21 measurements below supersede its estimates where they disagree. Steps R0–R3 come from the 2026-10-22 HazyResearch comparison. The external Llama-3.2-1B comparison (2026-10-23) follows step 3.**
+**Updated 2026-11-07 (decode attention generalized and sped up, more of step 11; see the section below and `agent_space/research_notes/landscape_2026-11/landscape_and_experiments.md` §9); earlier: 2026-10-27 (flash-decoding attention); steps 1-2b measured in `artifacts/step2b_2026-10-21` (steps 1-2 in `artifacts/step12b_2026-10-21`), step 3 in `artifacts/step3_2026-10-21`. This file says what to do next. The analysis behind it is the 2026-10-18 megakernel gap analysis; the 2026-10-20/21 measurements below supersede its estimates where they disagree. Steps R0–R3 come from the 2026-10-22 HazyResearch comparison. The external Llama-3.2-1B comparison (2026-10-23) follows step 3.**
 
 Where we are, in three lines:
 
 - Against a real CUDA-graphed Inductor decode, MegaBake wins on 6 of 8 models when calls are pipelined (5–55%), and roughly ties when each call synchronizes. The old "1.2–5x" wins came from host syncs in the ungraphed baseline.
 - Decode is bound by fixed per-phase latency, not by grid barriers: barrier release is ~11% of the 135M kernel. Gemma 3 (1.3x) and Qwen3.5 (1.9x) decode still lose to graphed Inductor. Prefill calls lose on every model except DeepSeek draft (a tie).
 - Cross-GEMM fusion is built (step 1): residual adds and SiLU·mul run in GEMM epilogues, gate/up as one paired GEMM, RoPE inside decode attention.
-- Decode attention is flash decoding (2026-10-27, part of step 11): one statistics exchange per chunk, and rows that pack a KV group at long contexts. At 4,096 cached keys decode is 6–29% faster on the head_dim-64 models and up to 1% faster on the head_dim-256 ones; no model is slower beyond run-to-run spread.
+- Decode attention is one body for every softmax decode variant (2026-11-07): MHA/GQA/MQA, head_dim any multiple of 8 up to 256, a score scale, sliding windows and soft caps are parameters. Coalesced score loads and an exchange/split rework made decode 2–37% faster on 7 checkpoints (attention 8–64%), held-out models included. Before that (2026-10-27): flash decoding with one statistics exchange per chunk and KV-group rows at long contexts.
 - Weight streaming into shared memory across phases is built and off (step 3): the preloads themselves change decode by −0.7% to +1.5%. Weights still stream only inside GEMM phases by default.
 - HazyResearch's megakernels suggest a different reading of what step 3, L2 prefetch and the events estimate each measured. Cross-op overlap needs three things together: fixed warp roles with a producer warp that never joins consumer syncs, shared-memory pages handed from op to op, and fine-grained counters. Megabake has tried each piece alone. The next runtime experiment is the role split (R1), not another streaming variant.
 - On an external H100 benchmark (Llama-3.2-1B, 2026-10-23), MegaBake runs 1.8x slower than both hand-written CUDA graphs + PDL and Hazy's megakernel. The causes are per-call host time, decode attention that splits short contexts across CTAs (~330 µs of a ~1,850 µs kernel at position 100), GEMMs whose tile counts do not fill the SMs, and barrier intervals that carry only RoPE. The LM head runs near peak. Graphed Inductor on the 60-SM slice hid all of it, and a wrong RoPE in the test reference hid that the Llama reference itself produced gibberish.
+
+## Done: more of step 11, decode attention generalized (2026-11-07)
+
+Measured on the 60-SM H200 slice; artifacts in `artifacts/x2a_2026-11-07/`; method and every number in `agent_space/research_notes/landscape_2026-11/landscape_and_experiments.md` §9 (X2a).
+
+- [x] **Coalesced scores.** One thread per key loaded its row as head_dim scalar 2-byte loads with lanes a KV row apart (5.25 of 7.4 µs per item on Llama-1B, found with per-stage `globaltimer` stamps, `tools/attention_stages.py`). Now `head_dim/8` lanes per key take one 16-byte load each and sum with butterfly shuffles; 4 keys per lane in flight; value unroll 16.
+- [x] **Merge loads unrolled to the compile-time chunk bound.** A loop to the run-time chunk count issued the coherent L2 loads one at a time (~2 µs per exchange). The new key's score is computed by warp 0, not thread 0.
+- [x] **Split cost model** (`decode_split_steps`) replaces `DECODE_MIN_CHUNK_KEYS` (64), `DECODE_SECOND_WAVE_KEYS` (512) and the 0.15 pass factor. It never leaves a chunk empty: it picks c chunks only past (c−1)² keys (an empty trailing chunk counted the new key twice; found by a 600-token Gemma-3 decode, fixed before merge; a device-side recount instead cost ~0.8 µs per layer). Rates are measured on this slice (`shortcut:` in the code) and need a per-body calibration.
+- [x] **One body, more variants.** `kv_attention` takes `scale`, `window` and `softcap`; `DecodeStep` passes HF's scaling (no longer folded into q), the interface's `sliding_window` argument and the soft cap. Head dims 80, 96 and 112-style multiples of 8 now take the split body instead of the one-row-per-warp body. Sliding windows no longer cap the KV capacity (Gemma-3 decodes past 512 keys). `tools/attention_variants.py` checks 10 configurations (Llama GQA/MHA/MQA, head_dim 64/80/96/128/256, Qwen3 q/k-norm, Mistral window, Gemma-2 soft cap + window, Gemma-3 mixed layers) at every position of an 800-token decode against HF's own fp32 forward: all pass, and dropping the window, the soft cap or the empty-chunk fix fails it (50–280× HF bf16's error).
+- [x] **Bug fixed: Mistral-style sliding windows were ignored.** transformers 5.x passes the window as an attention-interface argument, not a module attribute; `DecodeStep` ran full attention past the window.
+- [x] **Results.** Kernel faster in all 20 (model, context) cells, −2.4% to −37.4%; attention −8% to −64%; Llama-1B at 113 keys 1,685 → 1,581 µs, SmolLM-135M 1,074 → 920 µs, SmolLM-1.7B at 4,013 keys 5,274 → ~3,300 µs. Greedy tokens on 7 checkpoints are unchanged against HEAD.
+- [ ] SmolLM-1.7B at 4,013 keys runs +1.8% against the old fitted split with the same 3 chunks: a codegen effect in the value sum, open.
+- [ ] **q/k-norm models lose the RoPE fusion** (table below): the norm is a reduction, and the prologue takes elementwise producers only. Top next item for model breadth.
+- [ ] Still open from step 11: the 8,192-key cap (FP32 score row in scratch), the packing thresholds, sinks, K/V of different widths (MLA, via weight absorption), per-body calibration of the split rates. Long contexts stay at 20–30% of HBM bandwidth: the body is load-issue and register bound (220 registers per thread), so the next gain needs a producer warp staging K/V (R1/R2).
 
 ## Done: part of step 11, flash-decoding attention (2026-10-27)
 
@@ -21,7 +35,7 @@ The split-context decode body (`bodies/attention.py`) keeps the captured roundin
 - [x] **Single-head rows keep their query in registers** across the key loop (as before). Grouped rows reload theirs from shared scratch per key; a key pass per head measured 3x slower on Qwen2-0.5B.
 - [x] **Correctness.** Bit-exact with one chunk (existing table-launch test at capacity 4); new `test_split_context_decode_matches_eager_at_long_contexts` runs both variants at 0–1,000 keys against fp32. On all 7 checkpoints at 0–4,000 keys with random caches, error against fp32 equals the old body's at 33 of 40 points, is within 9% at the others, and argmax never changes. The phase-scratch fallback for scores was run forced.
 - [ ] **head_dim 256 keeps one head per row** (`DECODE_PACKED_HEAD_DIM`). Packing gemma-2b took 4,096-key decode from −0.6% to −17.6%, but a second variant pushed Qwen3.5-0.8B's register-saturated kernel into more spills (+1.4% at every context). Revisit with per-role register budgets (R1).
-- [ ] Still open from step 11: the online softmax (removes the FP32 score row and the 8,192-key cap), and a cost model for the 64-key chunks, the one-wave cap and the packing thresholds.
+- [ ] Still open from step 11: the online softmax (removes the FP32 score row and the 8,192-key cap), and a cost model for the 64-key chunks, the one-wave cap and the packing thresholds. *2026-11-07: the cost model is built (section above); the online softmax was not needed for speed.*
 
 Pipelined decode, 60-SM H200 slice, MegaBake old → new (graphed calls move the same way; generated prefill kernels are byte-identical):
 
@@ -207,12 +221,12 @@ Effort: S small, M medium, L large. Gains are estimates unless marked measured.
 | swapAB small-M GEMM (16/32/64), register direct store, bias epilogue | Done, one configuration per launch | 7 |
 | Interval folding (recompute instead of barrier), idle-phase skipping | Done | 11 (limits) |
 | Counting grid barrier (~0.7 µs), constant kernel arguments | Done | — |
-| Split-context decode attention: one statistics exchange, KV-group rows at long contexts (head_dim ≤ 128) | Done (2026-10-27) | 11 (online softmax, cost model) |
+| Split-context decode attention: coalesced scores, one statistics exchange, KV-group rows (head_dim ≤ 128), split cost model; any head_dim multiple of 8 ≤ 256, scale, sliding window, soft cap | Done (2026-10-27, 2026-11-07) | 11 (calibrated rates, 8,192-key cap, sinks, MLA) |
 | Graphed decode baseline, per-CTA profile | Done | — |
 | GEMM epilogue expressions, paired gate/up GEMM, one body per GEMM shape | Done (swapAB launches) | 1 |
 | Common-subexpression elimination on the captured graph | Done | 1 |
 | RoPE in decode attention | Done (split-context decode body) | 1 |
-| RMSNorm as GEMM prologue, q/k-norm in attention, RoPE in prefill attention | Missing | 1, 4 |
+| RMSNorm as GEMM prologue, q/k-norm in attention, RoPE in prefill attention | Missing. Decode with q/k-norm is correct, but the norm and the RoPE after it run as two separate intervals per layer (Qwen3-0.6B: 56 intervals, 179 µs, 10.5% of the kernel; gemma-3-270m 55 µs; OLMo-2-1B 44 µs; Llama-style models 0). Needs a per-head reduction prologue in decode attention | 1, 4 |
 | Tile/phase events | Built, not wired for full models | 10 |
 | Deterministic split-K | Built, off | 9, 16 |
 | L2 weight prefetch | Built, off (measured slower) | — |

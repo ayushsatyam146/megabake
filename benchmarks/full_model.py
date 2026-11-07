@@ -30,6 +30,9 @@ import torch
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    # This checkout's sources, not whatever ``megabake`` the environment
+    # installed (an editable install points at one tree only).
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from megabake import graphed, make_backend  # noqa: E402
 from benchmarks.measure import kernel_trace  # noqa: E402
@@ -43,7 +46,13 @@ from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION, StatefulSmolLM  #
 from megabake.ops.attention import kv_attention  # noqa: E402
 
 PROMPT = [1, 504, 3458, 314]
-VARIANTS = ("eager", "inductor", "inductor_cudagraphs", "inductor_graphed", "megabake", "megabake_graphed")
+VARIANTS = (
+    "eager", "inductor", "inductor_cudagraphs", "inductor_graphed", "inductor_autotune_graphed",
+    "megabake", "megabake_graphed",
+)
+# Inductor at its strongest for decode: autotuned kernels, captured in a CUDA
+# graph by hand (its own CUDA graphs skip steps that mutate the KV state).
+AUTOTUNE_MODE = "max-autotune-no-cudagraphs"
 
 
 def _load(name: str, revision: str | None, attention: str = "eager") -> torch.nn.Module:
@@ -212,7 +221,9 @@ def _decode_module(model, capacity: int) -> tuple[torch.nn.Module, list]:
     return stateful, stateful.state_shapes(capacity)
 
 
-def _static_kv_attention(source, key, value, key_cache, value_cache, valid_length):
+def _static_kv_attention(
+    source, key, value, key_cache, value_cache, valid_length, scale=0.0, window=0, softcap=0.0
+):
     """``megabake::kv_attention`` without host synchronization.
 
     The reference reads the valid length on the host to slice the cache, which
@@ -232,8 +243,13 @@ def _static_kv_attention(source, key, value, key_cache, value_cache, valid_lengt
         group_size = query.shape[1] // keys.shape[1]
         keys = keys.repeat_interleave(group_size, dim=1)
         values = values.repeat_interleave(group_size, dim=1)
-    scores = (query @ keys.transpose(-2, -1)).float() * source.shape[-1] ** -0.5
-    valid = torch.arange(key_cache.shape[1], device=source.device) < valid_length
+    scores = (query @ keys.transpose(-2, -1)).float() * (scale or source.shape[-1] ** -0.5)
+    if softcap:
+        scores = softcap * torch.tanh(scores / softcap)
+    positions = torch.arange(key_cache.shape[1], device=source.device)
+    valid = positions < valid_length
+    if window:
+        valid &= positions >= valid_length - window
     scores = scores.masked_fill(~valid, float("-inf"))
     probabilities = torch.softmax(scores, dim=-1).to(source.dtype)
     output = probabilities @ values
@@ -304,6 +320,7 @@ def bench_decode(model, args) -> dict:
         ),
         # Built per run below: the capture binds that run's state tensors.
         "inductor_graphed": None,
+        "inductor_autotune_graphed": None,
         "megabake": lambda: torch.compile(
             stateful, backend=_megabake("decode", args.out), fullgraph=True, dynamic=False
         ),
@@ -326,6 +343,10 @@ def bench_decode(model, args) -> dict:
             if name == "inductor_graphed":
                 build = lambda state=state: GraphedStep(  # noqa: E731
                     torch.compile(stateful, fullgraph=True, dynamic=False), token, state
+                )
+            if name == "inductor_autotune_graphed":
+                build = lambda state=state: GraphedStep(  # noqa: E731
+                    torch.compile(stateful, mode=AUTOTUNE_MODE, fullgraph=True, dynamic=False), token, state
                 )
             if name == "megabake_graphed":
                 build = lambda state=state: graphed(  # noqa: E731
@@ -387,6 +408,7 @@ def bench_decode_contexts(model, args) -> dict:
         ),
         # Built per variant below: the capture binds that variant's state tensors.
         "inductor_graphed": None,
+        "inductor_autotune_graphed": None,
         "megabake_graphed": None,
     }
     results: dict[str, object] = {"capacity": capacity, "batch": args.batch, "contexts": contexts}
@@ -405,6 +427,12 @@ def bench_decode_contexts(model, args) -> dict:
                 if name == "inductor_graphed":
                     function = GraphedStep(
                         torch.compile(stateful, fullgraph=True, dynamic=False), token, state
+                    )
+                elif name == "inductor_autotune_graphed":
+                    function = GraphedStep(
+                        torch.compile(stateful, mode=AUTOTUNE_MODE, fullgraph=True, dynamic=False),
+                        token,
+                        state,
                     )
                 elif name == "megabake_graphed":
                     function = graphed(

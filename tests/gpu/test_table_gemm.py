@@ -144,10 +144,10 @@ def test_split_context_decode_matches_eager_at_long_contexts(tmp_path, table_lau
     import copy
 
     from megabake import make_backend
-    from megabake.bodies.attention import (
+    from megabake.bodies.cuda.sm90.attention import (
         DECODE_PACKED_KEYS_PER_HEAD,
-        decode_chunks,
         decode_packed_heads,
+        decode_split_steps,
     )
 
     torch.manual_seed(11)
@@ -194,7 +194,9 @@ def test_split_context_decode_matches_eager_at_long_contexts(tmp_path, table_lau
             assert all(int(length.item()) == context + 1 for length in actual_state[2 * LAYERS :])
     # The longest context splits each row over several chunks, and the
     # contexts run both the one-head and the packed rows.
-    assert decode_chunks(3, backend.megabake_last_compiled.plan.launch.grid_size) > 1
+    workers = backend.megabake_last_compiled.plan.launch.grid_size
+    steps = decode_split_steps(3, workers, 3, 64, capacity)
+    assert any(first <= 1001 and count > 1 for first, count in steps)
     packed = decode_packed_heads(3, 64)
     assert packed == 3 and 200 < DECODE_PACKED_KEYS_PER_HEAD * packed <= 1000
 

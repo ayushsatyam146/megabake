@@ -124,22 +124,19 @@ def megabake_decode_attention(
             module, query, key, value, attention_mask,
             dropout=dropout, scaling=scaling, softcap=softcap, **kwargs,
         )
-    if softcap is not None or kwargs.get("s_aux") is not None:
-        raise NotImplementedError("decode attention with soft cap or sinks is not declared yet")
+    if kwargs.get("s_aux") is not None:
+        raise NotImplementedError("decode attention with sinks is not declared yet")
     key_cache, value_cache, valid_length = megabake_state[module.layer_idx]
-    window = getattr(module, "sliding_window", None)
-    if window is not None and key_cache.shape[1] > window:
-        raise NotImplementedError(
-            f"cache capacity {key_cache.shape[1]} exceeds the {window}-token sliding window"
-        )
+    # A sliding layer sees its last ``window`` keys of the linear cache. The
+    # attention interface passes the window (Mistral keeps it only in its
+    # config); older modules carry it as an attribute.
+    window = kwargs.get("sliding_window", getattr(module, "sliding_window", None)) or 0
     dim = query.shape[-1]
-    if scaling is not None and abs(scaling * dim**0.5 - 1.0) > 1e-6:
-        # kv_attention scales scores by dim**-0.5; fold any other scale into q.
-        query = query * (scaling * dim**0.5)
     batch, heads, length, _ = query.shape
     output = torch.ops.megabake.kv_attention(
         query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2),
         key_cache, value_cache, valid_length,
+        float(scaling or 0.0), int(window), float(softcap or 0.0),
     )
     return output.view(batch, heads, length, dim).transpose(1, 2).contiguous(), None
 
