@@ -174,8 +174,23 @@ def bench_prefill(model, args) -> dict:
         }
 
 
-def decode_module(model, capacity: int) -> tuple[torch.nn.Module, list]:
-    """The one-token decode wrapper and the shapes and dtypes of its state tensors."""
+def decode_module(model, capacity: int, batch: int = 1) -> tuple[torch.nn.Module, list]:
+    """The one-token decode wrapper and the shapes and dtypes of its state tensors.
+
+    With ``batch`` > 1 every per-sequence state tensor (KV caches, conv and
+    recurrent state) gets that leading dimension; the int32 valid lengths stay
+    ``[1]``, shared by the batch, since every sequence decodes in lockstep.
+    """
+    stateful, state_shapes = _decode_module(model, capacity)
+    if batch == 1:
+        return stateful, state_shapes
+    return stateful, [
+        [((batch, *shape[1:]) if len(shape) > 1 else shape, dtype) for shape, dtype in layer]
+        for layer in state_shapes
+    ]
+
+
+def _decode_module(model, capacity: int) -> tuple[torch.nn.Module, list]:
     if model.config.model_type == "llama":
         # Keep the hand-written Llama wrapper the tests and published numbers use.
         config = model.config
@@ -279,8 +294,8 @@ class GraphedStep:
 
 
 def bench_decode(model, args) -> dict:
-    stateful, state_shapes = decode_module(model, args.capacity)
-    token = torch.tensor([[504]], device="cuda")
+    stateful, state_shapes = decode_module(model, args.capacity, args.batch)
+    token = torch.full((args.batch, 1), 504, device="cuda")
     variants = {
         "eager": lambda: stateful,
         "inductor": lambda: torch.compile(stateful, fullgraph=True, dynamic=False),
@@ -297,7 +312,7 @@ def bench_decode(model, args) -> dict:
     calls = 1 + args.warmup + 2 * args.samples + 1
     if calls > args.capacity:
         raise SystemExit(f"--capacity must be at least {calls} for this many calls")
-    results: dict[str, object] = {"capacity": args.capacity}
+    results: dict[str, object] = {"capacity": args.capacity, "batch": args.batch}
     with torch.no_grad():
         for name, build in variants.items():
             if name not in args.variants:
@@ -359,8 +374,8 @@ def bench_decode_contexts(model, args) -> dict:
     """
     contexts = sorted(args.decode_contexts)
     capacity = contexts[-1] + 2 * args.samples + 8
-    stateful, state_shapes = decode_module(model, capacity)
-    token = torch.tensor([[504]], device="cuda")
+    stateful, state_shapes = decode_module(model, capacity, args.batch)
+    token = torch.full((args.batch, 1), 504, device="cuda")
     variants = {
         "eager": lambda: stateful,
         "inductor": lambda: torch.compile(stateful, fullgraph=True, dynamic=False),
@@ -374,7 +389,7 @@ def bench_decode_contexts(model, args) -> dict:
         "inductor_graphed": None,
         "megabake_graphed": None,
     }
-    results: dict[str, object] = {"capacity": capacity, "contexts": contexts}
+    results: dict[str, object] = {"capacity": capacity, "batch": args.batch, "contexts": contexts}
     with torch.no_grad():
         for name, build in variants.items():
             if name not in args.variants:
@@ -497,6 +512,7 @@ def main() -> None:
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--capacity", type=int, default=128, help="decode KV cache capacity")
+    parser.add_argument("--batch", type=int, default=1, help="decode batch size (sequences in lockstep)")
     parser.add_argument(
         "--decode-contexts",
         type=int,

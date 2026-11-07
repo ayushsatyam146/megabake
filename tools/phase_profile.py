@@ -174,6 +174,7 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
             {
                 **{key: row[key] / 1e3 for key in ("span", "critical", "mean_busy", "straggler_wait", "release")},
                 "busy_ctas": row["busy_ctas"],
+                "phase_indices": [phase.index for phase in group],
                 "phases": [f"{_category(phase)} tiles={len(phase.work_items)}" for phase in group],
             }
             for row, group in intervals
@@ -246,6 +247,107 @@ def profile(callable_, compiled, run, calls: int) -> dict:
     }
 
 
+def _interval_kind(plan, indices: list[int], categories: list[str]) -> str:
+    """A coarse op class for an interval, from its phases' categories. The
+    interval that holds the plan's last phase and a tensor-core GEMM is the
+    final projection (the LM head of a decoder)."""
+    text = " ".join(categories)
+    if "attention" in text:
+        return "attention"
+    if len(plan.phases) - 1 in indices and "tensor-core GEMM" in text:
+        return "final_gemm"
+    if "paired" in text:
+        return "norm+gate_up"
+    if "tensor-core GEMM" in text:
+        return "gemm"
+    return "other"
+
+
+def sol_accounting(compiled, cta: dict, machine, kv_valid_length: int) -> dict:
+    """Speed-of-light accounting per barrier interval (X0.1).
+
+    For each interval: bytes the plan must move, the time those bytes take at
+    the all-SM HBM bandwidth (``t_sol``) and at the bandwidth its busy CTAs
+    can reach (``t_cov``), and the measured span split into
+
+    - coverage: ``t_cov - t_sol``, lost to CTAs with no work in the interval;
+    - body: ``critical - t_cov``, the slowest CTA's work above what its share
+      of bandwidth allows (body inefficiency, pipeline fill, imbalance);
+    - sync: ``span - critical``, barrier release and start skew.
+    """
+    from megabake.accounting import plan_traffic
+
+    plan = compiled.plan
+    traffic = plan_traffic(plan, kv_valid_length)
+    rows = []
+    for interval in cta["all_intervals"]:
+        members = [traffic[index] for index in interval["phase_indices"]]
+        moved = sum(item.bytes_moved for item in members)
+        weights = sum(item.weight_bytes for item in members)
+        flops = sum(item.flops for item in members)
+        span = interval["span"] * 1e-6
+        critical = interval["critical"] * 1e-6
+        t_sol = machine.speed_of_light_s(moved, flops)
+        t_cov = max(moved / machine.read_bandwidth(interval["busy_ctas"]), t_sol)
+        rows.append({
+            "kind": _interval_kind(plan, interval["phase_indices"], interval["phases"]),
+            "span_us": interval["span"],
+            "bytes": moved,
+            "weight_bytes": weights,
+            "busy_ctas": interval["busy_ctas"],
+            "achieved_gb_s": moved / span / 1e9 if span else 0.0,
+            "t_sol_us": t_sol * 1e6,
+            "sol": t_sol / span if span else 0.0,
+            "coverage_loss_us": (t_cov - t_sol) * 1e6,
+            "body_loss_us": max(0.0, critical - t_cov) * 1e6,
+            "sync_loss_us": (span - critical) * 1e6,
+            "phases": interval["phases"],
+        })
+    by_kind: dict[str, dict] = {}
+    for row in rows:
+        entry = by_kind.setdefault(row["kind"], collections.Counter())
+        entry["intervals"] += 1
+        for key in ("span_us", "t_sol_us", "coverage_loss_us", "body_loss_us", "sync_loss_us", "bytes"):
+            entry[key] += row[key]
+    total = lambda key: sum(row[key] for row in rows)  # noqa: E731
+    span = total("span_us")
+    return {
+        "kv_valid_length": kv_valid_length,
+        "hbm_read_gb_s": machine.hbm_read_bytes_per_s / 1e9,
+        "bytes": total("bytes"),
+        "weight_bytes": total("weight_bytes"),
+        "span_us": span,
+        "t_sol_us": total("t_sol_us"),
+        "sol": total("t_sol_us") / span if span else 0.0,
+        "coverage_loss_us": total("coverage_loss_us"),
+        "body_loss_us": total("body_loss_us"),
+        "sync_loss_us": total("sync_loss_us"),
+        "by_kind": {
+            kind: {**dict(values), "sol": values["t_sol_us"] / values["span_us"] if values["span_us"] else 0.0}
+            for kind, values in sorted(by_kind.items(), key=lambda item: -item[1]["span_us"])
+        },
+        "intervals": rows,
+    }
+
+
+def _kernel_device_us(run, calls: int) -> float:
+    """Median device duration of the MegaBake kernel, from the CUDA profiler."""
+    from torch.profiler import ProfilerActivity, profile as torch_profile
+
+    with torch_profile(activities=[ProfilerActivity.CUDA]) as prof:
+        for _ in range(calls):
+            run()
+        torch.cuda.synchronize()
+    durations = sorted(
+        event.device_time for event in prof.events()
+        if "megabake" in event.name.lower() or "kernel_cutlass" in event.name.lower()
+    )
+    if not durations:
+        return float("nan")
+    longest = [value for value in durations if value >= 0.5 * durations[-1]]
+    return longest[len(longest) // 2]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model", default=SMOLLM_MODEL_NAME)
@@ -253,10 +355,17 @@ def main() -> None:
     parser.add_argument("--mode", choices=("prefill", "decode"), default="prefill")
     parser.add_argument("--attention", choices=("eager", "megabake"), default="eager")
     parser.add_argument("--capacity", type=int, default=128)
+    parser.add_argument(
+        "--context", type=int, default=0, help="decode: tokens already cached before the first call"
+    )
     parser.add_argument("--calls", type=int, default=9)
     parser.add_argument("--out", type=Path)
     parser.add_argument(
         "--cta", action="store_true", help="also split intervals into work and wait per CTA"
+    )
+    parser.add_argument(
+        "--sol", action="store_true",
+        help="with --cta: speed-of-light accounting per interval from the cached MachineModel",
     )
     parser.add_argument(
         "--skip-accuracy-gate",
@@ -281,10 +390,15 @@ def main() -> None:
             state = [torch.zeros(s, device="cuda", dtype=d) for layer in shapes for s, d in layer]
             token = torch.tensor([[504]], device="cuda")
             compiled_model = torch.compile(stateful, backend=backend, fullgraph=True, dynamic=False)
-            position = [0]
+            # As benchmarks/full_model.py --decode-contexts: setting every int32
+            # valid length (and the position) to L puts the call at context L.
+            for tensor in state:
+                if tensor.dtype == torch.int32 and tensor.numel() == 1:
+                    tensor.fill_(args.context)
+            position = [args.context]
 
-            if args.calls + 4 > args.capacity:
-                raise SystemExit("--capacity must exceed --calls + 4")
+            if args.context + 2 * args.calls + 4 > args.capacity:
+                raise SystemExit("--capacity must exceed --context + 2 * --calls + 4")
 
             def run():
                 position_ids = torch.tensor([[position[0]]], device="cuda")
@@ -305,6 +419,15 @@ def main() -> None:
         report = {"model": args.model, "mode": args.mode, **profile(callable_, compiled, run, args.calls)}
         if args.cta:
             report["cta"] = cta_profile(callable_, compiled, run, args.calls)
+            if args.sol:
+                from megabake.machine import machine_model
+
+                # The profiled calls attend over context .. context + 3 + 2·calls keys.
+                valid = args.context + 4 + args.calls if args.mode == "decode" else None
+                report["sol"] = sol_accounting(compiled, report["cta"], machine_model(), valid)
+                kernel_us = _kernel_device_us(run, args.calls)
+                report["sol"]["kernel_device_us"] = kernel_us
+                report["sol"]["interval_sum_vs_kernel"] = report["sol"]["span_us"] / kernel_us
     print(json.dumps(report, indent=2))
     if args.out is not None:
         args.out.write_text(json.dumps(report, indent=2) + "\n")
