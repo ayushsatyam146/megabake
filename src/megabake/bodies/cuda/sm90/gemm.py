@@ -123,7 +123,10 @@ def build_table_descriptors(
     )
     operands = 3
     if cutlass.const_expr(a2_address is not None):
-        tensors = (*tensors, _bf16_tensor(a2_address, (m, k, 1), (k, 1, m * k)))
+        tensors = (
+            *tensors,
+            _bf16_tensor(a2_address, (m, chunk, splits), (k, 1, chunk if splits > 1 else m * k)),
+        )
         operands = 4
     for operand in cutlass.range_constexpr(operands):
         pointer = table_descriptor(descriptors, gemm, operand, cute.AddressSpace.gmem)
@@ -356,13 +359,15 @@ class G0RangeBodyProvider:
                 token_tile = options.swap_ab_rows
                 if rows > token_tile:
                     return reject(f"swapAB GEMMs of this launch take at most {token_tile} rows")
+                tiles = -(-columns // 64)
                 splits = (
-                    split_k_count(
-                        -(-columns // 64), reduction_size // 64, target.multiprocessor_count
-                    )
+                    split_k_count(tiles, reduction_size // 64, target.multiprocessor_count)
                     if options.split_k and not fused
                     else 1
                 )
+                forced = _forced_splits(tiles, reduction_size // 64)
+                if forced is not None:
+                    splits = forced
                 return CandidateSet(
                     (
                         _g0_config(
@@ -418,6 +423,22 @@ def split_k_count(tiles: int, k_tiles: int, workers: int) -> int:
         ):
             best = splits
     return best
+
+
+def _forced_splits(tiles: int, k_tiles: int) -> int | None:
+    """Experiment knob: ``MEGABAKE_SPLIT_K_FORCE="tiles,k_tiles:splits;..."``
+    forces the split of GEMMs with that many output tiles and K tiles."""
+    spec = os.environ.get("MEGABAKE_SPLIT_K_FORCE")
+    if not spec:
+        return None
+    for entry in spec.split(";"):
+        shape, splits = entry.split(":")
+        if tuple(int(v) for v in shape.split(",")) == (tiles, k_tiles):
+            splits = int(splits)
+            if k_tiles % splits or k_tiles // splits < SPLIT_K_MIN_K_TILES:
+                raise ValueError(f"cannot split {k_tiles} K tiles {splits} ways")
+            return splits
+    return None
 
 
 def has_bias(body: BodyConfig) -> bool:
@@ -478,7 +499,7 @@ def _bias_epilogue_rejection(program) -> str | None:
 
 def split_k(body: BodyConfig) -> int:
     """K splits of a G0 GEMM body (1 without split-K)."""
-    match = re.search(r"_k(\d+)(?:_bias)?$", body.name)
+    match = re.search(r"_k(\d+)(?=_|$)", body.name)
     return int(match.group(1)) if match else 1
 
 

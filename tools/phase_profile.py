@@ -99,6 +99,7 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
         if not barriers[index] and index + 1 < len(phases):
             continue
         rows = {key: [] for key in keys}
+        busy_lists = []
         for stamps in samples:
             # 32-bit nanosecond stamps, unwrapped relative to CTA 0's start.
             reference = stamps[0][0 if previous is None else 2 + 2 * previous]
@@ -108,13 +109,18 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
             exits = [relative(row[2 + 2 * index]) for row in stamps]
             busy = [done - start for done, start in zip(dones, starts, strict=True)]
             critical = max(busy)
+            busy_lists.append(busy)
             rows["span"].append(max(exits) - min(starts))
             rows["critical"].append(critical)
             rows["mean_busy"].append(sum(busy) / len(busy))
             rows["straggler_wait"].append(sum(max(dones) - done for done in dones) / len(dones))
             rows["release"].append(max(0, min(exits) - max(dones)))
             rows["busy_ctas"].append(sum(value * 2 >= critical for value in busy))
-        intervals.append(({key: median(values) for key, values in rows.items()}, tuple(members)))
+        summary = {key: median(values) for key, values in rows.items()}
+        # Each CTA's busy time in the sample with the median critical work.
+        order = sorted(range(len(busy_lists)), key=lambda i: max(busy_lists[i]))
+        summary["busy_per_cta"] = busy_lists[order[len(order) // 2]]
+        intervals.append((summary, tuple(members)))
         previous, members = index, []
     # Per phase: the slowest CTA's time from the previous phase's exit (or the
     # interval start) to this phase's done stamp.
@@ -174,6 +180,7 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
             {
                 **{key: row[key] / 1e3 for key in ("span", "critical", "mean_busy", "straggler_wait", "release")},
                 "busy_ctas": row["busy_ctas"],
+                "busy_per_cta_us": [round(value / 1e3, 3) for value in row["busy_per_cta"]],
                 "phase_indices": [phase.index for phase in group],
                 "phases": [f"{_category(phase)} tiles={len(phase.work_items)}" for phase in group],
             }
@@ -417,6 +424,13 @@ def main() -> None:
         for _ in range(3):
             run()
         report = {"model": args.model, "mode": args.mode, **profile(callable_, compiled, run, args.calls)}
+        resources = getattr(compiled, "resources", None)
+        if resources is not None:
+            report["resources"] = {
+                "registers": resources.registers_per_thread,
+                "local_bytes": resources.local_memory_bytes_per_thread,
+                "code_bytes": resources.compiled_code_bytes,
+            }
         if args.cta:
             report["cta"] = cta_profile(callable_, compiled, run, args.calls)
             if args.sol:

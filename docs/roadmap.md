@@ -228,7 +228,7 @@ Effort: S small, M medium, L large. Gains are estimates unless marked measured.
 | RoPE in decode attention | Done (split-context decode body) | 1 |
 | RMSNorm as GEMM prologue, q/k-norm in attention, RoPE in prefill attention | Missing. Decode with q/k-norm is correct, but the norm and the RoPE after it run as two separate intervals per layer (Qwen3-0.6B: 56 intervals, 179 µs, 10.5% of the kernel; gemma-3-270m 55 µs; OLMo-2-1B 44 µs; Llama-style models 0). Needs a per-head reduction prologue in decode attention | 1, 4 |
 | Tile/phase events | Built, not wired for full models | 10 |
-| Deterministic split-K | Built, off | 9, 16 |
+| Deterministic split-K | Built, off. 2026-11-07: fixed-owner, element-major partials, released by an idle warp, warp-uniform waits; runs for fused and paired GEMMs. Slower than unsplit on every Llama-1B GEMM on the 60-SM slice (HBM already near saturation); see landscape notes §9 X2.2 | 9, 16 |
 | L2 weight prefetch | Built, off (measured slower) | — |
 | Shared-memory weight streaming across phases | Built, off (preloads measured −0.7% to +1.5%) | — |
 | Device cost model, per-GEMM tuning, plan search for full models | Missing | 7 |

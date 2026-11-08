@@ -11,6 +11,7 @@ from typing import Any
 from collections.abc import Mapping, Sequence
 
 from .bodies.cuda.sm90.gemm import (
+    TABLE_DESCRIPTORS_PER_GEMM,
     HopperWgmmaGemmPersistentKernel,
     epilogue_loads,
     epilogue_source,
@@ -23,7 +24,7 @@ from .bodies.cuda.sm90.gemm import (
     table_gemm_shared_bytes,
 )
 from .bodies.catalog import provider
-from .bodies.cuda.sm90.cutlass_gemm import STREAM_TAG_SLOT
+from .bodies.cuda.sm90.cutlass_gemm import STREAM_TAG_SLOT, gemm_stamp_address
 from .bodies.cuda.generic import emit_map_body
 from .bodies.interface import (
     BodyConfig,
@@ -799,6 +800,9 @@ def _emit_table_module(
     phase_units: dict[int, int] = {}
     # Tensor columns of each non-GEMM phase's row, which get resolved addresses.
     resolved_columns: dict[int, int] = {}
+    # GEMM phases: n slot columns from GEMM_PHASE_SLOT_COLUMN resolve
+    # (columns 0 and 1 are the GEMM row index and the epilogue kind).
+    gemm_resolved_columns: dict[int, int] = {}
     # Stateful attention phase -> address slot of its KV valid length.
     length_publishes: dict[int, int] = {}
     # Stateful attention phases whose interval ends in a grid barrier that no
@@ -968,8 +972,9 @@ def _emit_table_module(
                     -gemm_shapes[gemm_variant][1] // tile[1]
                 )
                 # FP32 partials of every split of every tile, one counter per tile.
+                # A paired tile holds both products' accumulators.
                 phase_scratch[phase.index] = (
-                    output_tiles * splits * tile[0] * tile[1],
+                    output_tiles * splits * tile[0] * tile[1] * (2 if paired else 1),
                     output_tiles,
                 )
             runner_key = ("g0_range", gemm_variant)
@@ -978,8 +983,22 @@ def _emit_table_module(
                 # Lines are written once every phase's epilogue kind is known.
                 runner_variants[runner_key] = (len(runner_variants), 0, [])
             runner_id = runner_variants[runner_key][0]
+            # After the GEMM row index: the epilogue kind, then the slots of
+            # C, the bias and the epilogue tensors (GEMM_PHASE_SLOT_COLUMN on).
+            # The slots resolve like other phases' slots, so the phase loop's
+            # L1 prefetch covers all of them: no dependent gemm_table load
+            # between the barrier and the GEMM body or before its epilogue.
+            gemm_resolved = (
+                gemm_slots[-1],
+                *((bias_slot - 1,) if bias_slot else ()),
+                *fused_slots,
+            )
+            gemm_resolved_columns[phase.index] = len(gemm_resolved)
             phase_rows.append(
-                (runner_id, int(phase.barrier is not None), 0, 0, 0, 0, gemm_index)
+                (
+                    runner_id, int(phase.barrier is not None), 0, 0, 0, 0,
+                    gemm_index, epilogue_kind, *gemm_resolved,
+                )
             )
             phase_tiles.append(len(phase.work_items) * splits)
             gemm_shape = gemm_shapes[gemm_variant]
@@ -1248,12 +1267,18 @@ def _emit_table_module(
             f"    splits={spec['splits']},\n"
             f"    bias_features={spec['bias_features']},\n"
             f"    bias_along_m={spec['swap_ab']!r},\n"
-            f"    direct_store={spec['swap_ab'] and spec['splits'] == 1!r},\n"
+            f"    direct_store={spec['swap_ab']!r},\n"
             + (f"    epilogues=({epilogues}),\n" if kinds else "")
             + ("    paired=True,\n" if spec["paired"] else "")
             + (
                 f"    stream_stages={WEIGHT_STREAM_STAGES},\n"
                 if gemm_variant in streamed_variants
+                else ""
+            )
+            + (
+                f"    stamp_address={gemm_stamp_address()},\n"
+                f"    stamp_tag={gemm_variant + 1},\n"
+                if gemm_stamp_address()
                 else ""
             )
             + ")"
@@ -1273,7 +1298,7 @@ def _emit_table_module(
         bias_state = (
             [
                 "                None," if spec["splits"] == 1 else "",
-                "                addresses[gemm_table[phase_table[phase, 6], 4] - 1],",
+                f"                _slot_address(addresses, phase, {GEMM_PHASE_SLOT_COLUMN + 1}),",
             ]
             if spec["bias"]
             else []
@@ -1285,12 +1310,15 @@ def _emit_table_module(
                 # A closure: the GEMM reads the kind and builds the tensors
                 # after its mainloop, so they hold no registers across it.
                 "                epilogue_state=lambda: (",
-                f"                    gemm_table[phase_table[phase, 6], {GEMM_EPILOGUE_KIND_COLUMN}],",
+                f"                    phase_table[phase, {6 + GEMM_PHASE_KIND_COLUMN}],",
                 "                    (",
                 *(
                     "                        ("
                     + "".join(
-                        _gemm_slot_tensor_code(GEMM_EPILOGUE_COLUMN + position, layout) + ", "
+                        _slot_tensor_code(
+                            GEMM_PHASE_SLOT_COLUMN + (2 if spec["bias"] else 1) + position, layout
+                        )
+                        + ", "
                         for position, layout in enumerate(layouts)
                     )
                     + "),"
@@ -1316,10 +1344,9 @@ def _emit_table_module(
                 *(line for line in bias_state if line),
                 *(
                     [
-                        "                c_address=addresses["
-                        "gemm_table[phase_table[phase, 6], 3]],"
+                        f"                c_address=_slot_address(addresses, phase, {GEMM_PHASE_SLOT_COLUMN}),"
                     ]
-                    if spec["swap_ab"] and spec["splits"] == 1
+                    if spec["swap_ab"]
                     else []
                 ),
                 *epilogue_state,
@@ -1371,8 +1398,14 @@ def _emit_table_module(
     # Resolved slot addresses: the slot behind each phase's tensor column
     # (GEMM rows hold their GEMM row there instead and resolve nothing).
     slot_width = max(width - 6, 1)
+    def resolves(index: int, column: int) -> bool:
+        if index in gemm_resolved_columns:
+            first = GEMM_PHASE_SLOT_COLUMN
+            return first <= column < first + gemm_resolved_columns[index]
+        return column < resolved_columns.get(index, 0)
+
     resolved = [
-        row[6 + column] if column < resolved_columns.get(index, 0) else None
+        row[6 + column] if resolves(index, column) else None
         for index, row in enumerate(phase_rows)
         for column in range(slot_width)
     ]
@@ -1588,12 +1621,18 @@ from megabake.runtime import (
     counting_grid_barrier,
     counting_grid_wait,
     prefetch_l1,
+    prefetch_tensormap,
     trap_if,
 )
 {gemm_import}
-{_GEMM_SLOT_SOURCE if any(epilogue_definitions) else ""}
 {chr(10).join(epilogue_definitions)}
 {chr(10).join(gemm_definitions)}
+
+
+@cute.jit
+def _slot_address(addresses: cute.Tensor, phase: cutlass.Int32, column: cutlass.Constexpr):
+    # A phase's resolved slot address (see _slot).
+    return addresses[{len(tensor_arguments)} + phase * {slot_width} + column]
 
 
 @cute.jit
@@ -1664,7 +1703,7 @@ def megabake_kernel(
         variant = cute.arch.make_warp_uniform(phase_table[phase, 0])
         _rotation = cute.arch.make_warp_uniform(phase_table[phase, 2])
         _units = cute.arch.make_warp_uniform(phase_table[phase, {width}])
-        _rotated = (_block + workers - _rotation) % workers
+{_cta_timer_stamp(f"{1 + 2 * len(plan.phases)} + phase", "        ") if 3 * len(plan.phases) + 1 <= CTA_TIMER_STRIDE else ""}        _rotated = (_block + workers - _rotation) % workers
         _workers = workers
         if _rotation < 0:
             # A recompute phase: this CTA runs every tile itself.
@@ -1675,7 +1714,7 @@ def megabake_kernel(
         if phase_table[phase, 2] < 0:
             # Later TMA reads in this interval see the generic-proxy writes.
             cute.arch.fence_proxy("async.global")
-{_cta_timer_stamp("1 + 2 * phase", "        ", synchronize=True)}        if phase_table[phase, 1] != 0:
+{_descriptor_prefetch(runner_variants, paired_variants, len(plan.phases))}{_cta_timer_stamp("1 + 2 * phase", "        ", synchronize=True)}        if phase_table[phase, 1] != 0:
 {phase_barrier}{_phase_timer_stamp("phase", "            ")}            # Every reader of this interval's KV valid length has finished.
             if phase_table[phase, 3] != 0:
                 if _block == 0:
@@ -1784,41 +1823,13 @@ def launch(
 GEMM_SECOND_A_COLUMN = 5
 GEMM_EPILOGUE_KIND_COLUMN = 6
 GEMM_EPILOGUE_COLUMN = 7
-
-_GEMM_SLOT_SOURCE = """
-@cute.jit
-def _gemm_slot(
-    addresses: cute.Tensor,
-    gemm_table: cute.Tensor,
-    gemm: cutlass.Int32,
-    column: cutlass.Constexpr,
-    dtype: cutlass.Constexpr,
-    layout: cutlass.Constexpr,
-    alignment: cutlass.Constexpr,
-):
-    # A fused GEMM epilogue's tensor, from its GEMM row's slot column.
-    address = addresses[gemm_table[gemm, column]]
-    if cutlass.const_expr(dtype is cutlass.Boolean):
-        storage = cute.make_tensor(
-            cute.make_ptr(
-                cutlass.Int8, address, cute.AddressSpace.gmem, assumed_align=alignment
-            ),
-            layout,
-        )
-        return _Tensor(storage, dtype=cutlass.Boolean)
-    return cute.make_tensor(
-        cute.make_ptr(dtype, address, cute.AddressSpace.gmem, assumed_align=alignment),
-        layout,
-    )
-"""
+# A GEMM phase's slot region (phase table columns from 6): the GEMM row index,
+# the epilogue kind, then the resolved slots of C, the bias and the epilogue
+# tensors.
+GEMM_PHASE_KIND_COLUMN = 1
+GEMM_PHASE_SLOT_COLUMN = 2
 
 
-def _gemm_slot_tensor_code(column: int, layout: Any) -> str:
-    return _slot_tensor_code(column, layout).replace(
-        "_slot(addresses, phase_table, phase,",
-        "_gemm_slot(addresses, gemm_table, phase_table[phase, 6],",
-        1,
-    )
 
 
 def _read_only_input(plan: KernelPlan, argument: TensorArgument) -> bool:
@@ -1925,6 +1936,38 @@ def _weight_stream_source(stream_row: str, variants: Sequence[int]) -> str:
         f"{dispatch}"
         "            counting_grid_wait(ready, workers, _ordinal + phase_table[phase, 1])\n"
     )
+
+
+def _descriptor_prefetch(runner_variants, paired_variants, phases: int) -> str:
+    """Before this phase's barrier, thread 0 prefetches the next phase's TMA
+    weight and activation descriptors when it is a table GEMM, so its first
+    TMA load does not fetch them from global memory after the barrier."""
+    gemm_runners = {
+        runner_id: variant in paired_variants
+        for key, (runner_id, _, _) in runner_variants.items()
+        if key[0] == "g0_range"
+        for variant in (key[1],)
+    }
+    if not gemm_runners:
+        return ""
+    stride = TABLE_DESCRIPTORS_PER_GEMM * 16
+    lines = [
+        "        if _thread == 0:",
+        f"            if phase + 1 < {phases}:",
+        "                _next = phase_table[phase + 1, 0]",
+    ]
+    for runner_id, paired in sorted(gemm_runners.items()):
+        operands = (0, 1, 3) if paired else (0, 1)
+        lines.append(f"                if _next == {runner_id}:")
+        lines.append(
+            "                    _descriptors = tma_descriptors.iterator.toint()"
+            f" + cutlass.Int64(phase_table[phase + 1, 6]) * {stride * 8}"
+        )
+        for operand in operands:
+            lines.append(
+                f"                    prefetch_tensormap(_descriptors + {operand * 128})"
+            )
+    return "\n".join(lines) + "\n"
 
 
 def _cta_timer_stamp(offset: str, indent: str, *, synchronize: bool = False) -> str:

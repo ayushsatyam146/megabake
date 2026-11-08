@@ -122,6 +122,46 @@ Constraints are same as dense_gemm.py:
 # MegaBake: the slot of the GEMM shared storage's split_arrival that holds
 # the streamed GEMM's tag; the next slot holds its streamed K tiles.
 STREAM_TAG_SLOT = 2
+# Split-K: the count of published non-owner partials (see _reduce_splits).
+SPLIT_PUBLISHED_SLOT = 1
+
+# Diagnostics, off unless MEGABAKE_GEMM_STAMPS=1 (tools/gemm_stages.py): every
+# variant writes globaltimer stamps per (CTA, work item) into one global Int32
+# buffer; the last phase to run each slot leaves its stamps there.
+GEMM_STAMP_CTAS = 160
+GEMM_STAMP_ITEMS = 24
+GEMM_STAMP_FIELDS = 12
+GEMM_STAMP_VARIANTS = 12
+_STAMP_BUFFER = None
+
+
+def gemm_stamp_address() -> int:
+    """The stamp buffer's address (0 without MEGABAKE_GEMM_STAMPS=1)."""
+    global _STAMP_BUFFER
+    import os
+
+    if os.environ.get("MEGABAKE_GEMM_STAMPS") != "1":
+        return 0
+    if _STAMP_BUFFER is None:
+        import torch
+
+        _STAMP_BUFFER = torch.zeros(
+            GEMM_STAMP_VARIANTS * GEMM_STAMP_CTAS * GEMM_STAMP_ITEMS * GEMM_STAMP_FIELDS,
+            dtype=torch.int32,
+            device="cuda",
+        )
+    return _STAMP_BUFFER.data_ptr()
+
+
+def gemm_stamps():
+    """(variant tags, CTAs, items, fields) stamps; fields: 0 producer item
+    start, 1 producer last issue, 2 consumer item start, 3 first stage ready,
+    4 mainloop done, 5 reduction done, 6 store done, 7 variant tag, 8 body
+    entry (item 0), 9 after the pipeline-init CTA sync (item 0), 10 producer
+    issued the item's first TMA load, 11 consumer leaves the body (item 0)."""
+    return _STAMP_BUFFER.view(
+        GEMM_STAMP_VARIANTS, GEMM_STAMP_CTAS, GEMM_STAMP_ITEMS, GEMM_STAMP_FIELDS
+    )
 
 
 @contextlib.contextmanager
@@ -217,6 +257,8 @@ class HopperWgmmaGemmPersistentKernel:
         epilogues: tuple = (),
         paired: bool = False,
         stream_stages: int = 0,
+        stamp_address: int = 0,
+        stamp_tag: int = 0,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -290,8 +332,7 @@ class HopperWgmmaGemmPersistentKernel:
         # phase's own C address. That skips the shared-memory staging, the TMA
         # store and the wait for its completion before the CTA can arrive at
         # the next barrier; the barrier then orders the plain stores.
-        if direct_store and splits > 1:
-            raise ValueError("direct-store epilogues run single-split GEMMs only")
+        # With split-K, the tile's owner (its last split) stores it directly.
         self.direct_store = direct_store
         # MegaBake: fused epilogues, each epilogue(accumulator, accumulator_1,
         # o0, o1, tensors) -> C value, evaluated per output element of a
@@ -319,6 +360,8 @@ class HopperWgmmaGemmPersistentKernel:
         # no mbarriers and loads only B for those K tiles. A shared-memory tag
         # names the GEMM whose stages a CTA loaded.
         self.stream_stages = stream_stages
+        self.stamp_address = stamp_address
+        self.stamp_tag = stamp_tag
 
         self.ab_stage = None
         self.epi_stage = None
@@ -336,6 +379,15 @@ class HopperWgmmaGemmPersistentKernel:
         )
         self.epilog_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=self.num_mma_threads
+        )
+        # MegaBake: split-K partials are released by an idle DMA warp, so the
+        # GPU-scope release fence never stalls the WGMMA warpgroup (see
+        # _reduce_splits).
+        self.release_warp_id = self.load_warp_id + 1
+        # An owner's MMA threads wait here until the release warp has seen
+        # every other split arrive. Both sides block, so generations never mix.
+        self.split_ready_barrier = pipeline.NamedBarrier(
+            barrier_id=2, num_threads=self.num_mma_threads + 32
         )
 
     def _setup_attributes(self):
@@ -943,6 +995,9 @@ class HopperWgmmaGemmPersistentKernel:
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
+        if cutlass.const_expr(self.stamp_address != 0):
+            if tidx == 0:
+                self._stamp(cutlass.Int32(0), 8)
 
         # MegaBake: phases sharing a barrier interval start their tiles on
         # different CTAs, so the scheduler sees a rotated block index.
@@ -1000,6 +1055,12 @@ class HopperWgmmaGemmPersistentKernel:
                 if storage.split_arrival[STREAM_TAG_SLOT] != stream_tag:
                     mainloop_pipeline.sync_object_full.mbarrier_init()
                     mainloop_pipeline.sync_object_empty.mbarrier_init()
+
+        if cutlass.const_expr(self.splits > 1):
+            # Split-K: non-owner items whose partials the MMA threads stored
+            # (SPLIT_PUBLISHED_SLOT); pipeline_init_wait orders the reset.
+            if tidx == 0:
+                storage.split_arrival[SPLIT_PUBLISHED_SLOT] = cutlass.Int32(0)
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
@@ -1092,6 +1153,9 @@ class HopperWgmmaGemmPersistentKernel:
 
         # Cluster wait for barrier init
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+        if cutlass.const_expr(self.stamp_address != 0):
+            if tidx == 0:
+                self._stamp(cutlass.Int32(0), 9)
 
         is_dma_warp_group = warp_group_idx < self.num_dma_warp_groups
         if cutlass.const_expr(self.reallocate_registers):
@@ -1123,7 +1187,11 @@ class HopperWgmmaGemmPersistentKernel:
                 if storage.split_arrival[STREAM_TAG_SLOT] == stream_tag:
                     streamed_k_tiles = cutlass.Int32(storage.split_arrival[STREAM_TAG_SLOT + 1])
 
+            stamp_item = cutlass.Int32(0)
             while work_tile.is_valid_tile:
+                if cutlass.const_expr(self.stamp_address != 0):
+                    if tidx == 0:
+                        self._stamp(stamp_item, 0)
                 tile_coord_mnl = work_tile.tile_idx
                 tAgA_mkl = tAgA[(None, tile_coord_mnl[0], None, tile_coord_mnl[2])]
                 tBgB_nkl = tBgB[(None, tile_coord_mnl[1], None, tile_coord_mnl[2])]
@@ -1184,14 +1252,72 @@ class HopperWgmmaGemmPersistentKernel:
 
                     # Mainloop pipeline's producer commit is a NOP
                     mainloop_pipeline.producer_commit(mainloop_producer_state)
+                    if cutlass.const_expr(self.stamp_address != 0):
+                        if tidx == 0 and k_tile == 0:
+                            self._stamp(stamp_item, 10)
                     mainloop_producer_state.advance()
 
+                if cutlass.const_expr(self.stamp_address != 0):
+                    if tidx == 0:
+                        self._stamp(stamp_item, 1)
+                    stamp_item = stamp_item + 1
                 if cutlass.const_expr(streaming):
                     streamed_k_tiles = cutlass.Int32(0)
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
             mainloop_pipeline.producer_tail(mainloop_producer_state)
+
+        if cutlass.const_expr(self.splits > 1):
+            if warp_idx == self.release_warp_id:
+                # Every wait below is warp-uniform (all lanes poll, the warp
+                # votes): a per-lane loop anywhere in the kernel makes ptxas
+                # serialize every wgmma (C7519, tools/wgmma_serialization.py).
+                release_sched = utils.StaticPersistentTileScheduler.create(
+                    tile_sched_params, schedule_block, schedule_grid_dim
+                )
+                release_tile = release_sched.initial_work_tile_info()
+                partials, counters, partial_base, counter_base = split_state
+                n_tiles = cute.size(gC_mnl, mode=[3])
+                published = storage.split_arrival.data_ptr() + SPLIT_PUBLISHED_SLOT
+                released = cutlass.Int32(0)
+                while release_tile.is_valid_tile:
+                    coordinate = release_tile.tile_idx
+                    counter = (
+                        counters.iterator + counter_base + coordinate[0] * n_tiles + coordinate[1]
+                    )
+                    if coordinate[2] != self.splits - 1:
+                        # Acquire the MMA threads' partial stores (CTA scope),
+                        # then release them at GPU scope.
+                        released = released + 1
+                        seen = cute.arch.load(published, cutlass.Int32, sem="acquire", scope="cta")
+                        while cute.arch.vote_any_sync(seen < released):
+                            seen = cute.arch.load(
+                                published, cutlass.Int32, sem="acquire", scope="cta"
+                            )
+                        with cute.arch.elect_one():
+                            cute.arch.red(
+                                counter,
+                                cutlass.Int32(1),
+                                op="add",
+                                dtype="s32",
+                                sem="release",
+                                scope="gpu",
+                            )
+                    else:
+                        # The owner: wait for the other splits' partials.
+                        seen = cute.arch.load(counter, cutlass.Int32, sem="acquire", scope="gpu")
+                        while cute.arch.vote_any_sync(seen < self.splits - 1):
+                            seen = cute.arch.load(
+                                counter, cutlass.Int32, sem="acquire", scope="gpu"
+                            )
+                        # Ready for the next phase that uses this counter
+                        # (after a grid barrier).
+                        with cute.arch.elect_one():
+                            cute.arch.store(counter, cutlass.Int32(0))
+                        self.split_ready_barrier.arrive_and_wait()
+                    release_sched.advance_to_next_work()
+                    release_tile = release_sched.get_current_work()
 
         # MMA warp group
         if not is_dma_warp_group:
@@ -1283,9 +1409,18 @@ class HopperWgmmaGemmPersistentKernel:
                     (None, None, None),
                 )
 
+            stamp_item = cutlass.Int32(0)
             while work_tile.is_valid_tile:
+                if cutlass.const_expr(self.stamp_address != 0):
+                    if tidx == self.num_dma_warp_groups * self.num_threads_per_warp_group:
+                        self._stamp(stamp_item, 2)
                 tile_coord_mnl = work_tile.tile_idx
-                if cutlass.const_expr(self.direct_store):
+                if cutlass.const_expr(self.direct_store and self.splits > 1):
+                    # The split index is not a C coordinate; set after the reduction.
+                    gC_mnl_slice = gC_direct[
+                        (None, None, tile_coord_mnl[0], tile_coord_mnl[1], 0)
+                    ]
+                elif cutlass.const_expr(self.direct_store):
                     gC_mnl_slice = gC_direct[(None, None, *tile_coord_mnl)]
                 else:
                     gC_mnl_slice = gC_mnl[(None, None, *tile_coord_mnl)]
@@ -1300,6 +1435,9 @@ class HopperWgmmaGemmPersistentKernel:
                 for k_tile in range(prologue_mma_cnt):
                     # Wait for TMA copies to complete
                     mainloop_pipeline.consumer_wait(mainloop_consumer_read_state)
+                    if cutlass.const_expr(self.stamp_address != 0):
+                        if tidx == self.num_dma_warp_groups * self.num_threads_per_warp_group:
+                            self._stamp(stamp_item, 3)
                     # WGMMA
                     for k_block_idx in cutlass.range_constexpr(num_k_blocks):
                         k_block_coord = (
@@ -1351,6 +1489,9 @@ class HopperWgmmaGemmPersistentKernel:
                     mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
                     mainloop_consumer_release_state.advance()
 
+                if cutlass.const_expr(self.stamp_address != 0):
+                    if tidx == self.num_dma_warp_groups * self.num_threads_per_warp_group:
+                        self._stamp(stamp_item, 4)
                 run_epilogue = True
                 if cutlass.const_expr(self.splits > 1):
                     run_epilogue = self._reduce_splits(
@@ -1362,20 +1503,25 @@ class HopperWgmmaGemmPersistentKernel:
                         split_state,
                     )
                     # Every split's result lands in C's single L slice.
-                    gC_mnl_slice = gC_mnl[
-                        (None, None, tile_coord_mnl[0], tile_coord_mnl[1], 0)
-                    ]
+                    if cutlass.const_expr(not self.direct_store):
+                        gC_mnl_slice = gC_mnl[
+                            (None, None, tile_coord_mnl[0], tile_coord_mnl[1], 0)
+                        ]
 
+                if cutlass.const_expr(self.stamp_address != 0):
+                    if tidx == self.num_dma_warp_groups * self.num_threads_per_warp_group:
+                        self._stamp(stamp_item, 5)
                 if cutlass.const_expr(self.paired):
-                    self._store_paired_tile(
-                        tRS_rAcc,
-                        thr_copy_r2s,
-                        size_tRS_rD,
-                        tile_coord_mnl,
-                        c_address,
-                        c_extent,
-                        epilogue_state,
-                    )
+                    if run_epilogue:
+                        self._store_paired_tile(
+                            tRS_rAcc,
+                            thr_copy_r2s,
+                            size_tRS_rD,
+                            tile_coord_mnl,
+                            c_address,
+                            c_extent,
+                            epilogue_state,
+                        )
                 else:
                     if run_epilogue:
                         self._store_tile(
@@ -1401,9 +1547,16 @@ class HopperWgmmaGemmPersistentKernel:
                             c_address,
                         )
 
+                if cutlass.const_expr(self.stamp_address != 0):
+                    if tidx == self.num_dma_warp_groups * self.num_threads_per_warp_group:
+                        self._stamp(stamp_item, 6)
+                    stamp_item = stamp_item + 1
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
+            if cutlass.const_expr(self.stamp_address != 0):
+                if tidx == self.num_dma_warp_groups * self.num_threads_per_warp_group:
+                    self._stamp(cutlass.Int32(0), 11)
             if cutlass.const_expr(not self.direct_store):
                 tma_store_pipeline.producer_tail()
                 # MegaBake: the tail only waits until shared memory has been
@@ -1415,6 +1568,30 @@ class HopperWgmmaGemmPersistentKernel:
                     cute.arch.fence_proxy("async.global")
 
     @cute.jit
+    def _stamp(self, item, field):
+        """Write one diagnostic stamp for this CTA's work item (one thread)."""
+        if cutlass.const_expr(self.stamp_address != 0):
+            slot = (
+                (self.stamp_tag % GEMM_STAMP_VARIANTS * GEMM_STAMP_CTAS + cute.arch.block_idx()[2])
+                * GEMM_STAMP_ITEMS
+                + cutlass.min(item, cutlass.Int32(GEMM_STAMP_ITEMS - 1))
+            ) * GEMM_STAMP_FIELDS
+            stamps = cute.make_tensor(
+                cute.make_ptr(
+                    cutlass.Int32,
+                    cutlass.Int64(self.stamp_address),
+                    cute.AddressSpace.gmem,
+                    assumed_align=4,
+                ),
+                cute.make_layout(
+                    GEMM_STAMP_VARIANTS * GEMM_STAMP_CTAS * GEMM_STAMP_ITEMS * GEMM_STAMP_FIELDS
+                ),
+            )
+            stamps[slot + field] = cute.arch.globaltimer_lo().to(cutlass.Int32)
+            if field == 8:
+                stamps[slot + 7] = cutlass.Int32(self.stamp_tag)
+
+    @cute.jit
     def _reduce_splits(
         self,
         accumulators,
@@ -1424,52 +1601,58 @@ class HopperWgmmaGemmPersistentKernel:
         arrival_flag,
         split_state,
     ):
-        """Publish this split's accumulators; True for the tile's last split,
-        whose accumulators then hold the sum of every split in split order."""
+        """Fixed-owner split-K. The tile's last split (the latest work item in
+        every CTA's static order: L is the scheduler's slowest mode) owns it.
+        Other splits store FP32 partials (element-major, so a warp's lanes
+        write consecutive words) and hand them to the release warp, which
+        releases them at GPU scope; the MMA threads never wait on global
+        memory for them. The owner keeps its accumulators, waits on the
+        release warp (which has acquired the other splits' arrivals), and
+        adds their partials in split order. True for the owner, whose
+        accumulators then hold the tile's sum. Every wait is on a work item
+        with a smaller linear index, so the lowest unfinished item can always
+        proceed."""
         partials, counters, partial_base, counter_base = split_state
         count = cute.size(accumulators)
         tile = tile_coord_mnl[0] * n_tiles + tile_coord_mnl[1]
         tile_elements = count * self.num_mma_threads
-        own = partial_base + (tile * self.splits + tile_coord_mnl[2]) * tile_elements
-        for index in cutlass.range_constexpr(count):
-            cute.arch.store(
-                partials.iterator + own + mma_thread * count + index,
-                accumulators[index],
-                cop="cg",
-            )
-        cute.arch.fence_acq_rel_gpu()
-        self.epilog_sync_barrier.arrive_and_wait()
-        if mma_thread == 0:
-            arrived = cute.arch.atomic_add(
-                counters.iterator + counter_base + tile,
-                cutlass.Int32(1),
-                sem="acq_rel",
-                scope="gpu",
-            )
-            cute.arch.store(arrival_flag, arrived)
-        self.epilog_sync_barrier.arrive_and_wait()
-        last = cute.arch.load(arrival_flag, cutlass.Int32) == self.splits - 1
-        if last:
-            cute.arch.fence_acq_rel_gpu()
-            first = partial_base + tile * self.splits * tile_elements + mma_thread * count
+        split = tile_coord_mnl[2]
+        owner = split == self.splits - 1
+        if owner:
+            self.split_ready_barrier.arrive_and_wait()
+            first = partial_base + tile * self.splits * tile_elements + mma_thread
             for index in cutlass.range_constexpr(count):
                 total = cutlass.Float32(0.0)
-                for split in cutlass.range_constexpr(self.splits):
+                for other in cutlass.range_constexpr(self.splits - 1):
                     total = total + cute.arch.load(
-                        partials.iterator + first + split * tile_elements + index,
+                        partials.iterator
+                        + first
+                        + other * tile_elements
+                        + index * self.num_mma_threads,
                         cutlass.Float32,
                         cop="cg",
                     )
-                accumulators[index] = total
-            if mma_thread == 0:
-                # Ready for the next phase that uses this counter.
-                cute.arch.atomic_exch(
-                    counters.iterator + counter_base + tile,
-                    cutlass.Int32(0),
-                    sem="relaxed",
-                    scope="gpu",
+                accumulators[index] = total + accumulators[index]
+        else:
+            own = partial_base + (tile * self.splits + split) * tile_elements
+            for index in cutlass.range_constexpr(count):
+                cute.arch.store(
+                    partials.iterator + own + index * self.num_mma_threads + mma_thread,
+                    accumulators[index],
+                    cop="cg",
                 )
-        return last
+            # Every MMA thread's stores precede one CTA-scope release; the
+            # release warp acquires it and releases at GPU scope.
+            self.epilog_sync_barrier.arrive_and_wait()
+            if mma_thread // 32 == 0:
+                with cute.arch.elect_one():
+                    cute.arch.atomic_add(
+                        arrival_flag + SPLIT_PUBLISHED_SLOT,
+                        cutlass.Int32(1),
+                        sem="release",
+                        scope="cta",
+                    )
+        return owner
 
     @cute.jit
     def _store_tile(

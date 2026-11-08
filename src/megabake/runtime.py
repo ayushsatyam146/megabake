@@ -213,6 +213,22 @@ def prefetch_l1(pointer, *, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def prefetch_tensormap(address, *, loc=None, ip=None):
+    """Prefetch the TMA descriptor at a global ``address`` (Int64), so a
+    later TMA copy does not fetch it on its critical path."""
+    llvm.inline_asm(
+        res=None,
+        operands_=[address.ir_value(loc=loc, ip=ip)],
+        asm_string="prefetch.tensormap [$0];",
+        constraints="l",
+        has_side_effects=True,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 @cute.jit
 def cooperative_worker_loop(
     ready: cute.Tensor,
