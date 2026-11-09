@@ -36,6 +36,7 @@
 
 from collections.abc import Sequence
 import contextlib
+import os
 from typing import Optional, Tuple, Type
 import math
 from math import prod
@@ -122,6 +123,9 @@ Constraints are same as dense_gemm.py:
 # MegaBake: the slot of the GEMM shared storage's split_arrival that holds
 # the streamed GEMM's tag; the next slot holds its streamed K tiles.
 STREAM_TAG_SLOT = 2
+# Ring mode (ring_pages): the consumers' (page, lap) cursor, in the same
+# slots streaming would use (the two modes exclude each other).
+RING_CURSOR_SLOT = 2
 # Split-K: the count of published non-owner partials (see _reduce_splits).
 SPLIT_PUBLISHED_SLOT = 1
 
@@ -259,6 +263,7 @@ class HopperWgmmaGemmPersistentKernel:
         stream_stages: int = 0,
         stamp_address: int = 0,
         stamp_tag: int = 0,
+        ring_pages: int = 0,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -362,6 +367,19 @@ class HopperWgmmaGemmPersistentKernel:
         self.stream_stages = stream_stages
         self.stamp_address = stamp_address
         self.stamp_tag = stamp_tag
+        # MegaBake X1.1/X1.2: a persistent ring of ``ring_pages`` weight pages
+        # (64 rows x one K tile of A each) shared by every variant of the
+        # launch, with one B slot and one full/empty mbarrier pair per page.
+        # The launch's producer warp loads A into it ahead of the phases
+        # (produce_table); in the phase, the DMA warp loads only B and the MMA
+        # warpgroup consumes pages from a cursor kept in shared memory
+        # (RING_CURSOR_SLOT), so the ring's state lives for the whole kernel.
+        # A stage takes one page, a paired stage two (an even page and the
+        # next); a paired stage skips an odd page. Every page passes through
+        # one full and one empty phase per lap, skipped pages included.
+        if ring_pages and (ring_pages % 2 or splits > 1 or stream_stages):
+            raise ValueError("ring pages must be even, without split-K or streaming")
+        self.ring_pages = ring_pages
 
         self.ab_stage = None
         self.epi_stage = None
@@ -449,6 +467,12 @@ class HopperWgmmaGemmPersistentKernel:
             self.smem_capacity,
             self.occupancy,
         )
+        # B stages and mbarrier pairs; they differ from the A stages only in
+        # ring mode, where a paired A stage spans two pages.
+        self.b_stage = self.ab_stage
+        if self.ring_pages:
+            self.ab_stage = self.ring_pages // 2 if self.paired else self.ring_pages
+            self.b_stage = self.ring_pages
 
         (
             self.a_smem_layout_staged,
@@ -465,6 +489,7 @@ class HopperWgmmaGemmPersistentKernel:
             self.c_dtype,
             self.c_layout,
             self.epi_stage,
+            self.b_stage,
         )
         # TMA loads A in tiles of a_tma_tile into a_tma_smem_layout_staged,
         # and the tile scheduler walks schedule_tile_mnk tiles of C.
@@ -573,7 +598,7 @@ class HopperWgmmaGemmPersistentKernel:
         @cute.struct
         class SharedStorage:
             mainloop_pipeline_array_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.ab_stage * 2
+                cutlass.Int64, self.b_stage * 2
             ]
             # MegaBake: the split-K arrival count, shared by the MMA threads
             # (slot 0), and the streamed GEMM's tag and K tiles (slots 2 and
@@ -602,7 +627,7 @@ class HopperWgmmaGemmPersistentKernel:
         self.shared_storage = SharedStorage
         # Static element counts for union_shared_storage.
         self.storage_sizes = (
-            self.ab_stage,
+            self.b_stage,
             cute.cosize(self.a_smem_layout_staged),
             cute.cosize(self.b_smem_layout_staged),
             cute.cosize(self.epi_smem_layout_staged),
@@ -866,6 +891,191 @@ class HopperWgmmaGemmPersistentKernel:
             storage.split_arrival[STREAM_TAG_SLOT + 1] = k_tiles
             storage.split_arrival[STREAM_TAG_SLOT] = stream_tag
 
+    # ------------------------------------------------------------------
+    # Ring mode (X1.1/X1.2)
+
+    @cute.jit
+    def ring_init(self, storage, stall_base=None):
+        """One thread, once per launch, before any ring user starts: every
+        page's full (one arrival: the producer) and empty (one per MMA warp)
+        mbarrier, the consumer cursor at page 0 of lap 0, and the stall
+        region's address (X0.3) in the split slots ring mode leaves free."""
+        if cutlass.const_expr(stall_base is not None):
+            storage.split_arrival[0] = (stall_base & cutlass.Int64(0xFFFFFFFF)).to(cutlass.Int32)
+            storage.split_arrival[1] = (stall_base >> 32).to(cutlass.Int32)
+        bars = storage.mainloop_pipeline_array_ptr.data_ptr()
+        for page in cutlass.range_constexpr(self.ring_pages):
+            cute.arch.mbarrier_init(bars + page, 1)
+            cute.arch.mbarrier_init(
+                bars + self.ring_pages + page, self.num_mma_warp_groups * self.num_warps_per_warp_group
+            )
+        storage.split_arrival[RING_CURSOR_SLOT] = cutlass.Int32(0)
+        storage.split_arrival[RING_CURSOR_SLOT + 1] = cutlass.Int32(0)
+        cute.arch.mbarrier_init_fence()
+
+    @cute.jit
+    def _ring_mma_stage(
+        self, tiled_mma, accumulators, tCrA, tCrB, num_k_blocks: cutlass.Constexpr, full, page, lap,
+        stall_base,
+    ):
+        """Wait for a stage's pages and issue its WGMMAs; return the cursor
+        after the stage. The waits are plain hardware waits: a checked wait's
+        vote and branch, with WGMMAs in flight, cost a WGMMA wait per stage
+        (SmolLM-135M decode +4.7%). A stall here still reports through the
+        producer's and B loader's checked waits and the other CTAs' barriers."""
+        cute.arch.mbarrier_wait(full + page, lap)
+        a_index = page
+        if cutlass.const_expr(self.paired):
+            cute.arch.mbarrier_wait(full + page + 1, lap)
+            a_index = page // 2
+        for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+            cute.gemm(
+                tiled_mma,
+                accumulators,
+                tCrA[(None, None, k_block_idx, a_index)],
+                tCrB[(None, None, k_block_idx, page)],
+                accumulators,
+            )
+        cute.nvgpu.warpgroup.commit_group()
+        return self._ring_advance(page, lap, 2 if self.paired else 1)
+
+    @cute.jit
+    def _ring_stall_base(self, storage):
+        low = storage.split_arrival[0].to(cutlass.Int64) & cutlass.Int64(0xFFFFFFFF)
+        return low | (storage.split_arrival[1].to(cutlass.Int64) << 32)
+
+    @cute.jit
+    def _ring_wait(self, bar, parity, kind: cutlass.Constexpr, page, stall_base):
+        """A warp-wide wait on a ring mbarrier, with stall diagnostics."""
+        from megabake.runtime import checked_mbarrier_wait, stall_timeout_ns
+
+        checked_mbarrier_wait(bar, parity, stall_base, kind, page, stall_timeout_ns())
+
+    @cute.jit
+    def _ring_release(self, empty, page):
+        """Every MMA warp releases a stage's pages (one arrival per warp).
+        Test hook: MEGABAKE_STALL_INJECT_RING=1 (read when the kernel is
+        traced) never releases page 0, so the producer stalls on it (X0.3)."""
+        if cutlass.const_expr(os.environ.get("MEGABAKE_STALL_INJECT_RING") == "1"):
+            if page != 0:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(empty + page)
+        else:
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(empty + page)
+        if cutlass.const_expr(self.paired):
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(empty + page + 1)
+
+    @cute.jit
+    def _ring_advance(self, page, lap, step: cutlass.Constexpr):
+        """The cursor ``step`` pages on, without a branch: a branch in a loop
+        with WGMMAs in flight makes ptxas wait for them every iteration."""
+        wrapped = (page + step) // self.ring_pages
+        return page + step - wrapped * self.ring_pages, lap ^ wrapped
+
+    @cute.jit
+    def _ring_align(self, page, lap):
+        """Paired stages start on even pages. A paired stage takes two pages
+        and the ring is even, so only a phase's first stage can find the
+        cursor odd; the skipped page still passes through one phase."""
+        return self._ring_advance(page, lap, 1) if page % 2 == 1 else (page, lap)
+
+    @cute.jit
+    def _ring_stage_bytes(self, a_smem_layout_staged, b_smem_layout_staged):
+        """Bytes one stage's full mbarrier expects: its A pages and one B slot."""
+        return cute.size_in_bytes(
+            self.a_dtype, cute.slice_(a_smem_layout_staged, (None, None, 0))
+        ) + cute.size_in_bytes(self.b_dtype, cute.slice_(b_smem_layout_staged, (None, None, 0)))
+
+    @cute.jit
+    def produce_table(self, prepared, storage, tma_descs, rotated_block, page, lap):
+        """The producer warp's part of one table GEMM phase: load A of every
+        K tile of this CTA's tiles into ring pages, waiting only for free
+        pages, and return the cursor after them. Every lane runs it."""
+        tensor_bindings, _, tile_sched_params = prepared
+        (
+            tma_atom_a,
+            mA_mkl,
+            _,
+            _,
+            _,
+            cta_layout_mnk,
+            a_smem_layout_staged,
+            b_smem_layout_staged,
+        ) = tensor_bindings
+        desc_a, _, _, desc_a2 = tma_descs
+        a_tma_smem_layout_staged = a_smem_layout_staged
+        if cutlass.const_expr(self.paired):
+            a_tma_smem_layout_staged = self._paired_a_smem_layout_staged()
+        sA_tma = storage.sA.get_tensor(
+            a_tma_smem_layout_staged.outer, swizzle=a_tma_smem_layout_staged.inner
+        )
+        gA_mkl = cute.local_tile(mA_mkl, self.a_tma_tile, (None, None, None))
+        tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
+            tma_atom_a,
+            0,
+            cute.make_layout(cute.slice_(cta_layout_mnk, (0, None, 0)).shape),
+            cute.group_modes(sA_tma, 0, 2),
+            cute.group_modes(gA_mkl, 0, 2),
+        )
+        block_x, block_y, _ = cute.arch.block_idx()
+        tile_sched = utils.StaticPersistentTileScheduler.create(
+            tile_sched_params, (block_x, block_y, rotated_block), cute.arch.grid_dim()
+        )
+        work_tile = tile_sched.initial_work_tile_info()
+        k_tile_cnt = cute.size(gA_mkl, mode=[3])
+        stage_bytes = self._ring_stage_bytes(a_smem_layout_staged, b_smem_layout_staged)
+        bars = storage.mainloop_pipeline_array_ptr.data_ptr()
+        empty = bars + self.ring_pages
+        stall_base = self._ring_stall_base(storage)
+
+        cute.nvgpu.cpasync.fence_tma_desc_acquire(desc_a)
+        if cutlass.const_expr(self.paired):
+            cute.nvgpu.cpasync.fence_tma_desc_acquire(desc_a2)
+        if cutlass.const_expr(self.paired):
+            if work_tile.is_valid_tile:
+                if page % 2 == 1:
+                    # Skip an odd page: pass it through one phase.
+                    self._ring_wait(empty + page, lap ^ 1, 4, page, stall_base)
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive(bars + page)
+                    page, lap = self._ring_advance(page, lap, 1)
+        while work_tile.is_valid_tile:
+            tile_coord_mnl = work_tile.tile_idx
+            tAgA_mkl = tAgA[(None, tile_coord_mnl[0], None, tile_coord_mnl[2])]
+            for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+                self._ring_wait(empty + page, lap ^ 1, 4, page, stall_base)
+                if cutlass.const_expr(self.paired):
+                    self._ring_wait(empty + page + 1, lap ^ 1, 4, page + 1, stall_base)
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(bars + page, stage_bytes)
+                    if cutlass.const_expr(self.paired):
+                        cute.arch.mbarrier_arrive(bars + page + 1)
+                cute.copy(
+                    tma_atom_a,
+                    tAgA_mkl[(None, k_tile)],
+                    tAsA[(None, page)],
+                    tma_bar_ptr=bars + page,
+                    mcast_mask=0,
+                    tma_desc_ptr=desc_a,
+                )
+                if cutlass.const_expr(self.paired):
+                    cute.copy(
+                        tma_atom_a,
+                        tAgA_mkl[(None, k_tile)],
+                        tAsA[(None, page + 1)],
+                        tma_bar_ptr=bars + page,
+                        mcast_mask=0,
+                        tma_desc_ptr=desc_a2,
+                    )
+                    page, lap = self._ring_advance(page, lap, 2)
+                else:
+                    page, lap = self._ring_advance(page, lap, 1)
+            tile_sched.advance_to_next_work()
+            work_tile = tile_sched.get_current_work()
+        return page, lap
+
     def _streamed_k_tiles(self, k_tile_cnt):
         """K tiles whose A ``preload_table`` loads for a tile of ``k_tile_cnt``."""
         return cutlass.min(k_tile_cnt, min(self.ab_stage, self.stream_stages))
@@ -1048,8 +1258,21 @@ class HopperWgmmaGemmPersistentKernel:
             a_smem_layout_staged,
             b_smem_layout_staged,
             cta_layout_mnk,
-            initialize=not streaming,
+            initialize=not streaming and not self.ring_pages,
         )
+        # Ring mode: where this phase's stages start. The previous GEMM
+        # phase's MMA threads wrote it before the CTA synchronization that
+        # ends every phase; this phase's write comes after pipeline_init_wait.
+        ring_page = cutlass.Int32(0)
+        ring_lap = cutlass.Int32(0)
+        if cutlass.const_expr(self.ring_pages):
+            ring_page = storage.split_arrival[RING_CURSOR_SLOT]
+            ring_lap = storage.split_arrival[RING_CURSOR_SLOT + 1]
+        ring_full = storage.mainloop_pipeline_array_ptr.data_ptr()
+        ring_empty = ring_full + self.ring_pages
+        ring_stall = cutlass.Int64(0)
+        if cutlass.const_expr(self.ring_pages):
+            ring_stall = self._ring_stall_base(storage)
         if cutlass.const_expr(streaming):
             if warp_idx == 0:
                 if storage.split_arrival[STREAM_TAG_SLOT] != stream_tag:
@@ -1181,92 +1404,129 @@ class HopperWgmmaGemmPersistentKernel:
             # writes before this thread's async-proxy TMA loads.
             cute.arch.fence_proxy("async.global")
 
-            # MegaBake: K tiles of the first tile whose A preload_table loaded.
-            if cutlass.const_expr(streaming):
-                streamed_k_tiles = cutlass.Int32(0)
-                if storage.split_arrival[STREAM_TAG_SLOT] == stream_tag:
-                    streamed_k_tiles = cutlass.Int32(storage.split_arrival[STREAM_TAG_SLOT + 1])
-
-            stamp_item = cutlass.Int32(0)
-            while work_tile.is_valid_tile:
-                if cutlass.const_expr(self.stamp_address != 0):
-                    if tidx == 0:
-                        self._stamp(stamp_item, 0)
-                tile_coord_mnl = work_tile.tile_idx
-                tAgA_mkl = tAgA[(None, tile_coord_mnl[0], None, tile_coord_mnl[2])]
-                tBgB_nkl = tBgB[(None, tile_coord_mnl[1], None, tile_coord_mnl[2])]
-
-                mainloop_producer_state.reset_count()
-
-                for k_tile in range(k_tile_cnt):
-                    load_a = True
-                    if cutlass.const_expr(streaming):
-                        load_a = k_tile >= streamed_k_tiles
-                    if load_a:
-                        # Conditionally wait for AB buffer empty
-                        mainloop_pipeline.producer_acquire(mainloop_producer_state)
-                    # Slice to global/shared memref to current k_tile
-                    tAgA_k = tAgA_mkl[(None, mainloop_producer_state.count)]
-                    a_stage = mainloop_producer_state.index
-                    if cutlass.const_expr(self.paired):
-                        a_stage = mainloop_producer_state.index * 2
-                    tAsA_pipe = tAsA[(None, a_stage)]
-
-                    tBgB_k = tBgB_nkl[(None, mainloop_producer_state.count)]
-                    tBsB_pipe = tBsB[(None, mainloop_producer_state.index)]
-
-                    if load_a:
-                        # TMA load A/B
+            if cutlass.const_expr(self.ring_pages):
+                # The producer warp loads A; this warp loads B into each
+                # stage's slot once the page is free, after the phase began.
+                page, lap = ring_page, ring_lap
+                if cutlass.const_expr(self.paired):
+                    page, lap = self._ring_align(page, lap)
+                stamp_item = cutlass.Int32(0)
+                while work_tile.is_valid_tile:
+                    if cutlass.const_expr(self.stamp_address != 0):
+                        if tidx == 0:
+                            self._stamp(stamp_item, 0)
+                    tile_coord_mnl = work_tile.tile_idx
+                    tBgB_nkl = tBgB[(None, tile_coord_mnl[1], None, tile_coord_mnl[2])]
+                    for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+                        cute.arch.mbarrier_wait(ring_empty + page, lap ^ 1)
                         cute.copy(
-                            tma_atom_a,
-                            tAgA_k,
-                            tAsA_pipe,
-                            tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                                mainloop_producer_state
-                            ),
-                            mcast_mask=a_mcast_mask,
-                            tma_desc_ptr=desc_a,
+                            tma_atom_b,
+                            tBgB_nkl[(None, k_tile)],
+                            tBsB[(None, page)],
+                            tma_bar_ptr=ring_full + page,
+                            mcast_mask=b_mcast_mask,
+                            tma_desc_ptr=desc_b,
                         )
+                        if cutlass.const_expr(self.stamp_address != 0):
+                            if tidx == 0 and k_tile == 0:
+                                self._stamp(stamp_item, 10)
                         if cutlass.const_expr(self.paired):
-                            # The second A's rows of this tile, into rows 64-127.
+                            page, lap = self._ring_advance(page, lap, 2)
+                        else:
+                            page, lap = self._ring_advance(page, lap, 1)
+                    if cutlass.const_expr(self.stamp_address != 0):
+                        if tidx == 0:
+                            self._stamp(stamp_item, 1)
+                        stamp_item = stamp_item + 1
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
+            else:
+                # MegaBake: K tiles of the first tile whose A preload_table loaded.
+                if cutlass.const_expr(streaming):
+                    streamed_k_tiles = cutlass.Int32(0)
+                    if storage.split_arrival[STREAM_TAG_SLOT] == stream_tag:
+                        streamed_k_tiles = cutlass.Int32(storage.split_arrival[STREAM_TAG_SLOT + 1])
+
+                stamp_item = cutlass.Int32(0)
+                while work_tile.is_valid_tile:
+                    if cutlass.const_expr(self.stamp_address != 0):
+                        if tidx == 0:
+                            self._stamp(stamp_item, 0)
+                    tile_coord_mnl = work_tile.tile_idx
+                    tAgA_mkl = tAgA[(None, tile_coord_mnl[0], None, tile_coord_mnl[2])]
+                    tBgB_nkl = tBgB[(None, tile_coord_mnl[1], None, tile_coord_mnl[2])]
+
+                    mainloop_producer_state.reset_count()
+
+                    for k_tile in range(k_tile_cnt):
+                        load_a = True
+                        if cutlass.const_expr(streaming):
+                            load_a = k_tile >= streamed_k_tiles
+                        if load_a:
+                            # Conditionally wait for AB buffer empty
+                            mainloop_pipeline.producer_acquire(mainloop_producer_state)
+                        # Slice to global/shared memref to current k_tile
+                        tAgA_k = tAgA_mkl[(None, mainloop_producer_state.count)]
+                        a_stage = mainloop_producer_state.index
+                        if cutlass.const_expr(self.paired):
+                            a_stage = mainloop_producer_state.index * 2
+                        tAsA_pipe = tAsA[(None, a_stage)]
+
+                        tBgB_k = tBgB_nkl[(None, mainloop_producer_state.count)]
+                        tBsB_pipe = tBsB[(None, mainloop_producer_state.index)]
+
+                        if load_a:
+                            # TMA load A/B
                             cute.copy(
                                 tma_atom_a,
                                 tAgA_k,
-                                tAsA[(None, a_stage + 1)],
+                                tAsA_pipe,
                                 tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
                                     mainloop_producer_state
                                 ),
                                 mcast_mask=a_mcast_mask,
-                                tma_desc_ptr=desc_a2,
+                                tma_desc_ptr=desc_a,
                             )
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB_k,
-                        tBsB_pipe,
-                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                            mainloop_producer_state
-                        ),
-                        mcast_mask=b_mcast_mask,
-                        tma_desc_ptr=desc_b,
-                    )
+                            if cutlass.const_expr(self.paired):
+                                # The second A's rows of this tile, into rows 64-127.
+                                cute.copy(
+                                    tma_atom_a,
+                                    tAgA_k,
+                                    tAsA[(None, a_stage + 1)],
+                                    tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                        mainloop_producer_state
+                                    ),
+                                    mcast_mask=a_mcast_mask,
+                                    tma_desc_ptr=desc_a2,
+                                )
+                        cute.copy(
+                            tma_atom_b,
+                            tBgB_k,
+                            tBsB_pipe,
+                            tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
+                                mainloop_producer_state
+                            ),
+                            mcast_mask=b_mcast_mask,
+                            tma_desc_ptr=desc_b,
+                        )
 
-                    # Mainloop pipeline's producer commit is a NOP
-                    mainloop_pipeline.producer_commit(mainloop_producer_state)
+                        # Mainloop pipeline's producer commit is a NOP
+                        mainloop_pipeline.producer_commit(mainloop_producer_state)
+                        if cutlass.const_expr(self.stamp_address != 0):
+                            if tidx == 0 and k_tile == 0:
+                                self._stamp(stamp_item, 10)
+                        mainloop_producer_state.advance()
+
                     if cutlass.const_expr(self.stamp_address != 0):
-                        if tidx == 0 and k_tile == 0:
-                            self._stamp(stamp_item, 10)
-                    mainloop_producer_state.advance()
+                        if tidx == 0:
+                            self._stamp(stamp_item, 1)
+                        stamp_item = stamp_item + 1
+                    if cutlass.const_expr(streaming):
+                        streamed_k_tiles = cutlass.Int32(0)
+                    tile_sched.advance_to_next_work()
+                    work_tile = tile_sched.get_current_work()
 
-                if cutlass.const_expr(self.stamp_address != 0):
-                    if tidx == 0:
-                        self._stamp(stamp_item, 1)
-                    stamp_item = stamp_item + 1
-                if cutlass.const_expr(streaming):
-                    streamed_k_tiles = cutlass.Int32(0)
-                tile_sched.advance_to_next_work()
-                work_tile = tile_sched.get_current_work()
-
-            mainloop_pipeline.producer_tail(mainloop_producer_state)
+                mainloop_pipeline.producer_tail(mainloop_producer_state)
 
         if cutlass.const_expr(self.splits > 1):
             if warp_idx == self.release_warp_id:
@@ -1410,6 +1670,14 @@ class HopperWgmmaGemmPersistentKernel:
                 )
 
             stamp_item = cutlass.Int32(0)
+            page, lap = ring_page, ring_lap
+            if cutlass.const_expr(self.ring_pages and self.paired):
+                if work_tile.is_valid_tile:
+                    if page % 2 == 1:
+                        cute.arch.mbarrier_wait(ring_full + page, lap)
+                        with cute.arch.elect_one():
+                            cute.arch.mbarrier_arrive(ring_empty + page)
+                        page, lap = self._ring_advance(page, lap, 1)
             while work_tile.is_valid_tile:
                 if cutlass.const_expr(self.stamp_address != 0):
                     if tidx == self.num_dma_warp_groups * self.num_threads_per_warp_group:
@@ -1425,69 +1693,94 @@ class HopperWgmmaGemmPersistentKernel:
                 else:
                     gC_mnl_slice = gC_mnl[(None, None, *tile_coord_mnl)]
 
-                # MAINLOOP
-                mainloop_consumer_read_state.reset_count()
-                mainloop_consumer_release_state.reset_count()
-                accumulators.fill(0.0)
-                tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-                cute.nvgpu.warpgroup.fence()
-
-                for k_tile in range(prologue_mma_cnt):
-                    # Wait for TMA copies to complete
-                    mainloop_pipeline.consumer_wait(mainloop_consumer_read_state)
-                    if cutlass.const_expr(self.stamp_address != 0):
-                        if tidx == self.num_dma_warp_groups * self.num_threads_per_warp_group:
-                            self._stamp(stamp_item, 3)
-                    # WGMMA
-                    for k_block_idx in cutlass.range_constexpr(num_k_blocks):
-                        k_block_coord = (
-                            None,
-                            None,
-                            k_block_idx,
-                            mainloop_consumer_read_state.index,
+                if cutlass.const_expr(self.ring_pages):
+                    # MAINLOOP over ring pages; each stage's pages are released
+                    # one stage late, once its WGMMAs are done.
+                    accumulators.fill(0.0)
+                    tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+                    cute.nvgpu.warpgroup.fence()
+                    # The first K tile, then the rest, which release the
+                    # previous stage once its WGMMAs are done (no branch).
+                    previous = page
+                    page, lap = self._ring_mma_stage(
+                        tiled_mma, accumulators, tCrA, tCrB, num_k_blocks, ring_full, page, lap,
+                        ring_stall,
+                    )
+                    for k_tile in cutlass.range(1, k_tile_cnt, unroll=1):
+                        current = page
+                        page, lap = self._ring_mma_stage(
+                            tiled_mma, accumulators, tCrA, tCrB, num_k_blocks, ring_full, page, lap,
+                            ring_stall,
                         )
-                        cute.gemm(
-                            tiled_mma,
-                            accumulators,
-                            tCrA[k_block_coord],
-                            tCrB[k_block_coord],
-                            accumulators,
-                        )
+                        cute.nvgpu.warpgroup.wait_group(1)
+                        self._ring_release(ring_empty, previous)
+                        previous = current
+                    cute.nvgpu.warpgroup.wait_group(0)
+                    self._ring_release(ring_empty, previous)
+                else:
+                    # MAINLOOP
+                    mainloop_consumer_read_state.reset_count()
+                    mainloop_consumer_release_state.reset_count()
+                    accumulators.fill(0.0)
+                    tiled_mma.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
+                    cute.nvgpu.warpgroup.fence()
 
-                    cute.nvgpu.warpgroup.commit_group()
-                    mainloop_consumer_read_state.advance()
+                    for k_tile in range(prologue_mma_cnt):
+                        # Wait for TMA copies to complete
+                        mainloop_pipeline.consumer_wait(mainloop_consumer_read_state)
+                        if cutlass.const_expr(self.stamp_address != 0):
+                            if tidx == self.num_dma_warp_groups * self.num_threads_per_warp_group:
+                                self._stamp(stamp_item, 3)
+                        # WGMMA
+                        for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                            k_block_coord = (
+                                None,
+                                None,
+                                k_block_idx,
+                                mainloop_consumer_read_state.index,
+                            )
+                            cute.gemm(
+                                tiled_mma,
+                                accumulators,
+                                tCrA[k_block_coord],
+                                tCrB[k_block_coord],
+                                accumulators,
+                            )
 
-                for k_tile in range(prologue_mma_cnt, k_tile_cnt):
-                    # Wait for TMA copies to complete
-                    mainloop_pipeline.consumer_wait(mainloop_consumer_read_state)
-                    # WGMMA
-                    for k_block_idx in cutlass.range_constexpr(num_k_blocks):
-                        k_block_coord = (
-                            None,
-                            None,
-                            k_block_idx,
-                            mainloop_consumer_read_state.index,
-                        )
-                        cute.gemm(
-                            tiled_mma,
-                            accumulators,
-                            tCrA[k_block_coord],
-                            tCrB[k_block_coord],
-                            accumulators,
-                        )
+                        cute.nvgpu.warpgroup.commit_group()
+                        mainloop_consumer_read_state.advance()
 
-                    cute.nvgpu.warpgroup.commit_group()
-                    # Wait on the wgmma barrier for WGMMA to complete
-                    cute.nvgpu.warpgroup.wait_group(k_pipe_mmas)
+                    for k_tile in range(prologue_mma_cnt, k_tile_cnt):
+                        # Wait for TMA copies to complete
+                        mainloop_pipeline.consumer_wait(mainloop_consumer_read_state)
+                        # WGMMA
+                        for k_block_idx in cutlass.range_constexpr(num_k_blocks):
+                            k_block_coord = (
+                                None,
+                                None,
+                                k_block_idx,
+                                mainloop_consumer_read_state.index,
+                            )
+                            cute.gemm(
+                                tiled_mma,
+                                accumulators,
+                                tCrA[k_block_coord],
+                                tCrB[k_block_coord],
+                                accumulators,
+                            )
 
-                    mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
-                    mainloop_consumer_release_state.advance()
-                    mainloop_consumer_read_state.advance()
+                        cute.nvgpu.warpgroup.commit_group()
+                        # Wait on the wgmma barrier for WGMMA to complete
+                        cute.nvgpu.warpgroup.wait_group(k_pipe_mmas)
 
-                cute.nvgpu.warpgroup.wait_group(0)
-                for k_tile in range(prologue_mma_cnt):
-                    mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
-                    mainloop_consumer_release_state.advance()
+                        mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
+                        mainloop_consumer_release_state.advance()
+                        mainloop_consumer_read_state.advance()
+
+                    cute.nvgpu.warpgroup.wait_group(0)
+                    for k_tile in range(prologue_mma_cnt):
+                        mainloop_pipeline.consumer_release(mainloop_consumer_release_state)
+                        mainloop_consumer_release_state.advance()
 
                 if cutlass.const_expr(self.stamp_address != 0):
                     if tidx == self.num_dma_warp_groups * self.num_threads_per_warp_group:
@@ -1554,6 +1847,11 @@ class HopperWgmmaGemmPersistentKernel:
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
+            if cutlass.const_expr(self.ring_pages):
+                # The next GEMM phase's stages start here.
+                if tidx == self.num_dma_warp_groups * self.num_threads_per_warp_group:
+                    storage.split_arrival[RING_CURSOR_SLOT] = page
+                    storage.split_arrival[RING_CURSOR_SLOT + 1] = lap
             if cutlass.const_expr(self.stamp_address != 0):
                 if tidx == self.num_dma_warp_groups * self.num_threads_per_warp_group:
                     self._stamp(cutlass.Int32(0), 11)
@@ -1967,6 +2265,7 @@ class HopperWgmmaGemmPersistentKernel:
         c_dtype: type[cutlass.Numeric],
         c_layout: utils.LayoutEnum,
         epi_stage: int,
+        b_stage: int | None = None,
     ) -> tuple[cute.ComposedLayout, cute.ComposedLayout, cute.ComposedLayout]:
         """Create shared memory layouts for A, B, and C tensors.
 
@@ -2030,7 +2329,7 @@ class HopperWgmmaGemmPersistentKernel:
         )
         b_smem_layout_staged = cute.tile_to_shape(
             b_smem_layout_atom,
-            cute.append(b_smem_shape, ab_stage),
+            cute.append(b_smem_shape, ab_stage if b_stage is None else b_stage),
             order=(0, 1, 2) if b_is_k_major else (1, 0, 2),
         )
 

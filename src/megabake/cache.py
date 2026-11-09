@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields, is_dataclass
 import hashlib
+import os
 import json
 import platform
 import threading
@@ -13,7 +14,14 @@ import torch
 
 from .graph import ComputeGraph
 from .plan import BodySelectionPlan, KernelPlan
-from .runtime import PHASE_TIMER_SLOTS, WEIGHT_STREAM_STAGES
+from .runtime import (
+    PHASE_TIMER_SLOTS,
+    WEIGHT_STREAM_STAGES,
+    producer_ring_pages,
+    producer_warp_enabled,
+    stall_inject_phase,
+    stall_timeout_ns,
+)
 
 if TYPE_CHECKING:
     from .frontend import CaptureContext
@@ -74,6 +82,12 @@ def make_plan_key(
         # Timed kernels write stamps past the barrier state of an untimed buffer.
         "phase_timer_slots": PHASE_TIMER_SLOTS,
         "weight_stream_stages": WEIGHT_STREAM_STAGES,
+        # Stall checks (X0.3) are compiled in or out when the kernel is generated.
+        "stall_timeout_ns": stall_timeout_ns(),
+        "stall_inject": stall_inject_phase(),
+        "producer_warp": producer_warp_enabled(),
+        "ring_pages": producer_ring_pages(),
+        "stall_inject_ring": os.environ.get("MEGABAKE_STALL_INJECT_RING"),
     }
     encoded = json.dumps(
         _canonical(payload), sort_keys=True, separators=(",", ":"), allow_nan=False

@@ -50,8 +50,14 @@ from .runtime import (
     DYNAMIC_ADDRESS_RING,
     GRID_TIMER_SLOTS,
     PHASE_TIMER_SLOTS,
+    PRODUCER_START_BARRIER,
+    STALL_COUNTER_SLOTS,
     WEIGHT_STREAM_STAGES,
     call_counter_offset,
+    producer_ring_pages,
+    producer_warp_enabled,
+    stall_inject_phase,
+    stall_timeout_ns,
 )
 from .schedule import EventSchedule
 
@@ -141,6 +147,13 @@ class LaunchMetadata:
     # row hold its float and counter offsets.
     phase_float_elements: int = 0
     phase_counter_count: int = 0
+    # Producer warp (X1.1): one extra warpgroup after threads_per_block,
+    # outside every CTA-wide barrier, whose first warp produces.
+    producer_warp: bool = False
+
+    @property
+    def launch_threads(self) -> int:
+        return self.threads_per_block + (128 if self.producer_warp else 0)
 
 
 @dataclass(frozen=True)
@@ -1207,8 +1220,10 @@ def _emit_table_module(
 
     # Phases of one barrier interval run concurrently, so each takes its own
     # phase-scratch region; later intervals reuse the regions.
-    float_elements = counter_count = 0
-    float_offset = counter_offset = 0
+    # Counter slots 0 and 1 hold the stall region's address (X0.3).
+    float_elements = 0
+    counter_count = STALL_COUNTER_SLOTS
+    float_offset, counter_offset = 0, STALL_COUNTER_SLOTS
     for index, phase in enumerate(plan.phases):
         floats, counters = phase_scratch.get(phase.index, (0, 0))
         if floats or counters:
@@ -1219,7 +1234,7 @@ def _emit_table_module(
             float_elements = max(float_elements, float_offset)
             counter_count = max(counter_count, counter_offset)
         if phase.barrier is not None:
-            float_offset = counter_offset = 0
+            float_offset, counter_offset = 0, STALL_COUNTER_SLOTS
 
     # Every body starts its tiles at CTA 0. Phases in one barrier interval run
     # concurrently, so each starts where the previous phase's tiles ended.
@@ -1250,6 +1265,41 @@ def _emit_table_module(
         for gemm in (entry - 1 for entry in row[0::3] if entry)
     }
     streaming = bool(streamed_variants)
+    # X1.1/X1.2: a producer warp loads every GEMM's weights into one
+    # persistent page ring (HopperWgmmaGemmPersistentKernel.ring_pages). It
+    # needs swapAB decode GEMMs whose stages are 64-row weight pages and
+    # 16-row activation slots, without split-K; weight streaming is the
+    # older, mutually exclusive way to load ahead. The producer is a whole
+    # warpgroup: ptxas budgets registers per warpgroup, so one extra warp
+    # would cap every thread at 168 registers; setmaxnreg moves them to the
+    # body warpgroups instead (_split_roles).
+    producer = (
+        has_gemm
+        and not streaming
+        and producer_warp_enabled()
+        and plan.launch.threads_per_block % 128 == 0
+        and plan.launch.threads_per_block <= 256
+        and all(
+            spec["splits"] == 1
+            and spec["swap_ab"]
+            and gemm_kernel_tiles[variant] == ((128, 16) if spec["paired"] else (64, 16))
+            for variant, spec in gemm_variant_specs.items()
+        )
+    )
+    ring_pages = 0
+    if producer:
+        # As many pages as shared memory holds next to the generic bodies'
+        # scratch, up to MEGABAKE_RING_PAGES (X1.0: the gain saturates at
+        # 20-24 pages of 8 KiB); below 8 pages the producer cannot run ahead.
+        target = plan.selection.target
+        budget = target.max_shared_memory_per_cta if target is not None else 227 * 1024
+        free = budget - _generic_scratch_bytes(
+            _representative_scratch_plan(plan, representative_phases), scratch_elements
+        ) - 1024 - 1024 - 4 * 64 * 16 * 2
+        ring_pages = min(producer_ring_pages(), free // ((64 * 64 + 16 * 64) * 2)) // 2 * 2
+        if ring_pages < 8:
+            producer, ring_pages = False, 0
+    launch_threads = plan.launch.threads_per_block + (128 if producer else 0)
     for gemm_variant, spec in gemm_variant_specs.items():
         kinds = variant_epilogues.get(gemm_variant, [])
         epilogues = "".join(
@@ -1270,6 +1320,7 @@ def _emit_table_module(
             f"    direct_store={spec['swap_ab']!r},\n"
             + (f"    epilogues=({epilogues}),\n" if kinds else "")
             + ("    paired=True,\n" if spec["paired"] else "")
+            + (f"    ring_pages={ring_pages},\n" if ring_pages else "")
             + (
                 f"    stream_stages={WEIGHT_STREAM_STAGES},\n"
                 if gemm_variant in streamed_variants
@@ -1445,7 +1496,11 @@ def _emit_table_module(
         # union of every variant's buffers.
         shared_memory_bytes = (
             (
-                table_gemm_shared_bytes(
+                # Ring: mbarriers in the first KiB, then the A pages, B slots
+                # and the epilogue's four 64x16 BF16 stages.
+                1024 + ring_pages * (64 * 64 + 16 * 64) * 2 + 4 * 64 * 16 * 2
+                if ring_pages
+                else table_gemm_shared_bytes(
                     tuple(gemm_kernel_tiles.values()), next(iter(gemm_scratch_bytes))
                 )
                 if paired_variants
@@ -1476,6 +1531,18 @@ def _emit_table_module(
     # copies the addresses into the device table before the first barrier.
     # A stamp of -1 marks a CUDA graph's ring, whose addresses fit every call.
     ring_words = len(dynamic_slots) + 1
+    stall_timeout = stall_timeout_ns()
+    stall_inject = stall_inject_phase()
+    if stall_inject is not None:
+        # The k-th phase barrier -> the phase that closes with it.
+        stall_inject = [phase.index for phase in plan.phases if phase.barrier is not None][stall_inject]
+    stall_publish = (
+        "    if _block == 0:\n"
+        "        if _thread == 0:\n"
+        "            publish_stall_base(phase_counters, _stall_base)\n"
+        if stall_timeout > 0
+        else ""
+    )
     dynamic_writes = (
         "        _dynamic = cute.make_tensor(\n"
         "            cute.make_ptr(\n"
@@ -1538,7 +1605,7 @@ def _emit_table_module(
             + "".join(f"_gemm_{variant}, " for variant in range(len(gemm_shapes)))
             + "))\n"
             "    )\n"
-            if paired_variants
+            if paired_variants or ring_pages
             else "    _gemm_scratch = cutlass.utils.SmemAllocator().allocate(_gemm_0.shared_storage)\n"
         )
         if has_gemm
@@ -1580,7 +1647,17 @@ def _emit_table_module(
             if streaming
             else ""
         )
-        + "    counting_grid_barrier(ready, workers, _ordinal + cutlass.Int32(1))\n"
+        + (
+            "    if _thread == 0:\n        _gemm_0.ring_init(_gemm_scratch, _stall_base)\n" if ring_pages else ""
+        )
+        + f"    {_grid_barrier('_ordinal + cutlass.Int32(1)', 'cutlass.Int32(-1)', stall_timeout)}\n"
+        + (
+            # Descriptors are published: release the producer warp.
+            f"    cute.arch.barrier_arrive(barrier_id={PRODUCER_START_BARRIER}, "
+            f"number_of_threads={plan.launch.threads_per_block + 32})\n"
+            if producer
+            else ""
+        )
         if has_gemm
         else ""
     )
@@ -1593,10 +1670,10 @@ def _emit_table_module(
     )
     launch_smem = "" if has_gemm else f"        smem={shared_memory_bytes},\n"
     phase_barrier = (
-        "            counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])\n"
+        f"            {_grid_barrier('_ordinal + phase_table[phase, 1]', 'phase', stall_timeout, stall_inject)}\n"
         if not streaming
         else _weight_stream_source(
-            f"phase_table[phase, {width + 1}]", sorted(streamed_variants)
+            f"phase_table[phase, {width + 1}]", sorted(streamed_variants), stall_timeout
         )
     )
     phase_table_width = len(phase_table[0])
@@ -1617,10 +1694,15 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.tensor import _Tensor
 
 from megabake.runtime import (
+    checked_grid_barrier,
+    checked_grid_wait,
     counting_grid_arrive,
     counting_grid_barrier,
     counting_grid_wait,
+    poll_at_least,
     prefetch_l1,
+    publish_stall_base,
+    stall_base_from_counters,
     prefetch_tensormap,
     trap_if,
 )
@@ -1682,13 +1764,14 @@ def megabake_kernel(
     # advances it after that barrier, for the next launch on this stream.
     _call = ready[workers + {call_counter_offset()}]
     _ordinal = _call * cutlass.Int32({barrier_epochs})
-{scratch_prelude}
-{gemm_scratch}
+    # Stall records (X0.3) go to the pinned tail of the dynamic-address ring.
+    _stall_base = dynamic_addresses + cutlass.Int64({DYNAMIC_ADDRESS_RING * ring_words * 8})
+{_prelude_allocations(scratch_prelude) + gemm_scratch + _ROLE_SPLIT + _prelude_rest(scratch_prelude) if producer else scratch_prelude + chr(10) + gemm_scratch}
 {"".join(body_definitions)}
     # Publish this call's boundary addresses before any phase reads them.
     if _block == 0:
 {dynamic_writes}
-    counting_grid_barrier(ready, workers, _ordinal)
+{stall_publish}    {_grid_barrier('_ordinal', 'cutlass.Int32(-1)', stall_timeout)}
     if _block == 0:
         if _thread == 0:
             ready[workers + {call_counter_offset()}] = _call + cutlass.Int32(1)
@@ -1760,11 +1843,26 @@ def launch(
         phase_counters,
 {gemm_kernel_call}    ).launch(
         grid=[1, 1, workers],
-        block=[{plan.launch.threads_per_block}, 1, 1],
+        block=[{launch_threads}, 1, 1],
         cooperative=True,
 {launch_smem}        stream=stream,
     )
 """
+    if producer:
+        source = _split_roles(
+            source,
+            plan.launch.threads_per_block // 32,
+            _producer_source(
+                plan.launch.threads_per_block + 32,
+                len(plan.phases),
+                width,
+                {
+                    entry[0]: key[1]
+                    for key, entry in runner_variants.items()
+                    if len(key) == 2 and key[0] == "g0_range"
+                },
+            ),
+        )
     launch_metadata = LaunchMetadata(
         "megabake_kernel",
         "launch",
@@ -1813,7 +1911,7 @@ def launch(
         gemm_splits=tuple(gemm_splits),
         phase_float_elements=float_elements,
         phase_counter_count=counter_count,
-
+        producer_warp=producer,
     )
     return source, launch_metadata, _source_map(source, plan, phase_records)
 
@@ -1905,7 +2003,108 @@ def _weight_stream_schedule(
     return rows, issues
 
 
-def _weight_stream_source(stream_row: str, variants: Sequence[int]) -> str:
+_ROLE_SPLIT = "    # MEGABAKE_ROLE_SPLIT\n"
+
+
+# setmaxnreg budgets (X1.1): 256 body threads x 224 + 128 producer x 64 =
+# all 65,536 registers of the SM (the producer starves at 40).
+BODY_REGISTERS = 224
+PRODUCER_REGISTERS = 64
+
+
+def _prelude_allocations(prelude: str) -> str:
+    """The shared-memory allocations of a scratch prelude. With a producer
+    warp they run before the role split, so both roles see one layout."""
+    return "".join(
+        line + "\n" for line in prelude.splitlines()
+        if line.startswith(("    _worker_scratch = ", "    _scratch_"))
+    )
+
+
+def _prelude_rest(prelude: str) -> str:
+    return "".join(
+        line + "\n" for line in prelude.splitlines()
+        if line.strip() and not line.startswith(("    _worker_scratch = ", "    _scratch_"))
+    )
+
+
+def _producer_source(
+    handshake_threads: int, phases: int, units_column: int, gemm_runners: Mapping[int, int]
+) -> str:
+    """The producer warp's program (X1.1): after the prologue, walk the phase
+    table as the body warps do and, for every GEMM phase this CTA has tiles
+    in, load their weights into the ring (produce_table). It waits only for
+    free ring pages, never for a grid barrier."""
+    dispatch = "".join(
+        f"                        if variant == {runner_id}:\n"
+        f"                            _page, _lap = _gemm_{gemm_variant}.produce_table(\n"
+        f"                                gemm_values[{gemm_variant}],\n"
+        "                                _gemm_scratch,\n"
+        "                                table_descriptors(tma_descriptors, phase_table[phase, 6]),\n"
+        "                                _rotated,\n"
+        "                                _page,\n"
+        "                                _lap,\n"
+        "                            )\n"
+        for runner_id, gemm_variant in sorted(gemm_runners.items())
+    )
+    return (
+        f"            cute.arch.barrier(barrier_id={PRODUCER_START_BARRIER}, "
+        f"number_of_threads={handshake_threads})\n"
+        "            _page = cutlass.Int32(0)\n"
+        "            _lap = cutlass.Int32(0)\n"
+        f"            for phase in cutlass.range({phases}, unroll=1):\n"
+        "                variant = cute.arch.make_warp_uniform(phase_table[phase, 0])\n"
+        "                _rotation = cute.arch.make_warp_uniform(phase_table[phase, 2])\n"
+        f"                _units = cute.arch.make_warp_uniform(phase_table[phase, {units_column}])\n"
+        "                _rotated = (_block + workers - _rotation) % workers\n"
+        "                if _rotation >= 0:\n"
+        "                    if _rotated < _units:\n"
+        + dispatch
+    )
+
+
+def _split_roles(source: str, producer_warp: int, producer: str) -> str:
+    """Run everything after the role split in megabake_kernel on the body
+    warpgroups only. The warpgroup after them lowers its register budget,
+    and its first warp runs ``producer``; the other three warps idle out."""
+    start = source.index(_ROLE_SPLIT)
+    end = source.index("\n\n@cute.jit\ndef launch(")
+    body = source[start + len(_ROLE_SPLIT) : end]
+    return (
+        source[:start]
+        + "    _role = cute.arch.make_warp_uniform(cute.arch.warp_idx())\n"
+        + f"    if _role >= {producer_warp}:\n"
+        + f"        cute.arch.setmaxregister_decrease({PRODUCER_REGISTERS})\n"
+        + f"        if _role == {producer_warp}:\n"
+        + producer
+        + "    else:\n"
+        + f"        cute.arch.setmaxregister_increase({BODY_REGISTERS})\n"
+        + "\n".join(("    " + line) if line.strip() else line for line in body.split("\n"))
+        + source[end:]
+    )
+
+
+def _grid_barrier(
+    ordinal: str, phase: str, stall_timeout: int, inject: int | None = None, wait_only: bool = False
+) -> str:
+    """One grid barrier (or its waiting half) as generated source. With stall
+    diagnostics on (X0.3) its wait reports a timeout; ``inject`` names a phase
+    whose barrier the last CTA does not arrive at (test hook)."""
+    if stall_timeout <= 0:
+        return (f"counting_grid_wait(ready, workers, {ordinal})" if wait_only
+                else f"counting_grid_barrier(ready, workers, {ordinal})")
+    common = f"ready, workers, {ordinal}, _stall_base, _call, {phase}, {stall_timeout}"
+    if wait_only:
+        return f"checked_grid_wait({common})"
+    arrive = (
+        f", (_block != workers - cutlass.Int32(1)) | ({phase} != cutlass.Int32({inject}))"
+        if inject is not None
+        else ""
+    )
+    return f"checked_grid_barrier({common}{arrive})"
+
+
+def _weight_stream_source(stream_row: str, variants: Sequence[int], stall_timeout: int = 0) -> str:
     """A phase's closing grid barrier that streams weights (see
     ``_weight_stream_schedule``): after this CTA arrives, warp 0 loads the
     stages of the GEMM its stream-table entry names, then the CTA waits."""
@@ -1934,7 +2133,7 @@ def _weight_stream_source(stream_row: str, variants: Sequence[int]) -> str:
         "                            stream_table[_stream, 3 * _block + 2]\n"
         "                        )\n"
         f"{dispatch}"
-        "            counting_grid_wait(ready, workers, _ordinal + phase_table[phase, 1])\n"
+        f"            {_grid_barrier('_ordinal + phase_table[phase, 1]', 'phase', stall_timeout, wait_only=True)}\n"
     )
 
 
@@ -2597,6 +2796,7 @@ def _source_map(
                 for index, line in enumerate(source_lines, 1)
                 if "grid_barrier(ready, workers, epoch + phase + " in line
                 or "counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])" in line
+                or "checked_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1]," in line
                 or "counting_grid_arrive(ready, workers)" in line
             )
             entries.append(

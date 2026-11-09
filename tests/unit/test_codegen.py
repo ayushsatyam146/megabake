@@ -90,7 +90,8 @@ def test_emit_cute_deduplicates_equivalent_bodies_and_saves_diagnostics(tmp_path
     source_lines = generated.source.splitlines()
     for symbol, expected in (
         ("_body_0", "sync_threads"),
-        ("megabake_kernel", "counting_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1])"),
+        # Stall checks (X0.3) are on by default: the checked barrier.
+        ("megabake_kernel", "checked_grid_barrier(ready, workers, _ordinal + phase_table[phase, 1],"),
         ("launch", ".launch("),
     ):
         entry = next(

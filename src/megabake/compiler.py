@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+
 import collections
 import copy
 import functools
@@ -49,6 +51,9 @@ from .schedule import (
 from .regions import form_regions
 from .runtime import (
     DYNAMIC_ADDRESS_RING,
+    consumer_cta_sync,
+    register_stall_region,
+    stall_region_words,
     EventRuntimeAdmission,
     RuntimeAdmission,
     admit_event_runtime,
@@ -718,12 +723,17 @@ def compile_plan(
                     else None
                 ),
             )
-            compiled = cute.compile(module.launch, *state.compile_arguments)
+            with (
+                consumer_cta_sync(generated.launch.threads_per_block)
+                if generated.launch.producer_warp
+                else contextlib.nullcontext()
+            ):
+                compiled = cute.compile(module.launch, *state.compile_arguments)
             resources = _query_resources(
                 compiled,
                 current_plan,
                 generated,
-                current_plan.launch.threads_per_block,
+                generated.launch.launch_threads,
                 generated.launch.shared_memory_bytes,
             )
             max_workers = (
@@ -2473,10 +2483,9 @@ class _RuntimeState:
                 (counters, _cute_view(counters)),
             )
         if self._dynamic_ring is None:
-            words = len(launch.dynamic_slots) + 1
-            host = torch.zeros(
-                (DYNAMIC_ADDRESS_RING, words), dtype=torch.int64
-            ).pin_memory()
+            host = _pinned_address_ring(
+                len(launch.dynamic_slots) + 1, launch.grid_size, _phase_names(self.generated)
+            )
             self._dynamic_ring = (host, host.numpy(), [None] * DYNAMIC_ADDRESS_RING)
         if launch.gemm_table:
             if self._gemm_table is None:
@@ -2582,10 +2591,11 @@ class _RuntimeState:
         if _stream_is_capturing(stream):
             # A graph replays these addresses on every call, so every ring
             # entry holds them, stamped -1; the eager ring stays untouched.
-            ring = torch.empty(
-                (DYNAMIC_ADDRESS_RING, len(self.generated.launch.dynamic_slots) + 1),
-                dtype=torch.int64,
-            ).pin_memory()
+            ring = _pinned_address_ring(
+                len(self.generated.launch.dynamic_slots) + 1,
+                self.generated.launch.grid_size,
+                _phase_names(self.generated),
+            )
             arguments = self._table_arguments(cu_stream, ring=ring)
             ring[:, 0] = -1
             ring[:, 1:] = torch.from_numpy(self._pending_dynamic_addresses)
@@ -2718,6 +2728,28 @@ class _RuntimeState:
             )
             self._g0_view_cache[group_index] = entry
         return entry[1]
+
+
+def _phase_names(generated: Any) -> dict[int, str]:
+    """Phase index -> "body (region)", for stall reports."""
+    names: dict[int, str] = {}
+    for entry in getattr(generated, "source_map", ()):
+        if entry.phase_index is not None and entry.body_name and entry.phase_index not in names:
+            names[entry.phase_index] = f"{entry.body_name} ({entry.region_id})"
+    return names
+
+
+def _pinned_address_ring(
+    words: int, workers: int, phase_names: dict[int, str] | None = None
+) -> torch.Tensor:
+    """The host-mapped dynamic-address ring, (DYNAMIC_ADDRESS_RING, words),
+    followed in the same pinned allocation by the stall region the kernel
+    writes on a timeout (runtime.stall_report; X0.3)."""
+    ring_words = DYNAMIC_ADDRESS_RING * words
+    flat = torch.zeros(ring_words + stall_region_words(workers), dtype=torch.int64).pin_memory()
+    ring = flat[:ring_words].view(DYNAMIC_ADDRESS_RING, words)
+    register_stall_region(ring, ring_words, workers, phase_names)
+    return ring
 
 
 def _pack_arguments(compiled: Any, arguments: tuple[Any, ...]) -> tuple[Any, Any]:

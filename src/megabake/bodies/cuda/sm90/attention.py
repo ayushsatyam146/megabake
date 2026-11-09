@@ -584,7 +584,7 @@ def emit_attention_body(
         )
         source = f'''import cutlass
 import cutlass.cute as cute
-from megabake.runtime import trap_if
+from megabake.runtime import poll_at_least, stall_base_from_counters, trap_if
 
 
 @cute.kernel
@@ -1031,7 +1031,7 @@ def _split_decode_attention_body(
         )
     source = f'''import cutlass
 import cutlass.cute as cute
-from megabake.runtime import trap_if
+from megabake.runtime import poll_at_least, stall_base_from_counters, trap_if
 
 
 @cute.kernel
@@ -1410,7 +1410,29 @@ def _decode_variant(
             "(cute.arch.globaltimer_lo() - stamp_t0).to(cutlass.Float32), cop=\"cg\")\n"
         )
 
+    from ....runtime import STALL_ATTENTION_EXCHANGE, stall_timeout_ns
+
+    stall_timeout = stall_timeout_ns()
+
     def wait(counter: int) -> str:
+        if stall_timeout > 0:
+            # X0.3: warp 0 polls on every lane and reports a timeout.
+            return (
+                "                cute.arch.sync_threads()\n"
+                "                if cute.arch.make_warp_uniform(cute.arch.warp_idx()) == 0:\n"
+                "                    poll_at_least(\n"
+                f"                        counters.iterator + counter_base + row * 2 + {counter},\n"
+                "                        in_use,\n"
+                "                        stall_base_from_counters(counters),\n"
+                "                        cutlass.Int32(-1),\n"
+                f"                        {STALL_ATTENTION_EXCHANGE},\n"
+                "                        cutlass.Int32(-1),\n"
+                f"                        (counter_base + row * 2 + {counter}).to(cutlass.Int64),\n"
+                f"                        {stall_timeout},\n"
+                "                    )\n"
+                "                cute.arch.sync_threads()\n"
+                "                cute.arch.fence_acq_rel_gpu()\n"
+            )
         return (
             "                cute.arch.sync_threads()\n"
             "                if thread == 0:\n"

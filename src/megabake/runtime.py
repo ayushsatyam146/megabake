@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 import os
 from typing import Protocol
@@ -153,6 +154,234 @@ def trap_if(condition):
         llvm.intr_trap()
 
 
+# --------------------------------------------------------------------------
+# Stall diagnostics (X0.3)
+#
+# Every spin wait of a table megakernel polls on all lanes of one warp and
+# reads %globaltimer. Past the timeout, lane 0 writes one record for its CTA
+# into a host-mapped region: {1, call, kind, phase, counter, target, observed,
+# time}. The warp then waits a grace period, so that every other stuck CTA
+# also reports, and traps. A trap leaves the context unusable, so the region
+# lives in pinned host memory: the tail of the dynamic-address ring, which
+# every table launch already receives. The host reads it with plain loads
+# (``stall_records``) and prints a table on the way out (``install_stall_hook``).
+#
+# MEGABAKE_STALL_TIMEOUT_S (default 2) sets the timeout when the kernel is
+# generated; 0 compiles the checks out.
+
+STALL_WORDS = 8
+STALL_GRACE_NS = 200_000_000
+# Phase-counter scratch slots 0 and 1 hold the stall region's address (low,
+# high), so a body that only receives its scratch can report too. Every
+# phase's counters start after them.
+STALL_COUNTER_SLOTS = 2
+STALL_KINDS = {
+    1: "grid barrier",
+    2: "attention split exchange",
+    3: "ring page full",
+    4: "ring page empty",
+}
+STALL_GRID_BARRIER = 1
+STALL_ATTENTION_EXCHANGE = 2
+# Producer ring (X1.1): a GEMM waiting for a page's data (full) or for a
+# page to be released (empty); the counter is the page, the target its parity.
+STALL_RING_FULL = 3
+STALL_RING_EMPTY = 4
+
+
+def stall_timeout_ns() -> int:
+    return int(float(os.environ.get("MEGABAKE_STALL_TIMEOUT_S", "2")) * 1e9)
+
+
+# Test hook: MEGABAKE_STALL_INJECT=<k> makes the last CTA skip its arrival
+# at the k-th phase grid barrier (read when the kernel is generated), so every
+# CTA stalls there with the counter one arrival short.
+def stall_inject_phase() -> int | None:
+    value = os.environ.get("MEGABAKE_STALL_INJECT")
+    return int(value) if value not in (None, "") else None
+
+
+# --------------------------------------------------------------------------
+# Producer warp (X1.1)
+#
+# Unless MEGABAKE_PRODUCER_WARP=0 (read when the kernel is generated), table
+# kernels whose GEMMs fit the page ring launch with one extra warpgroup after
+# the body threads; its first warp is the producer. It never takes part in
+# CTA-wide synchronization: while such a kernel compiles, every CTA-wide
+# barrier (``cute.arch.sync_threads``, CUTLASS's ``agent_sync``, ...) becomes
+# ``bar.sync 0, <body threads>`` (``consumer_cta_sync``). The body threads
+# release it once the kernel prologue is done through named barrier
+# ``PRODUCER_START_BARRIER``.
+
+PRODUCER_START_BARRIER = 7
+
+
+def producer_warp_enabled() -> bool:
+    """On by default (2026-11-09: 11 of 11 decode cells faster, outputs
+    bit-identical); MEGABAKE_PRODUCER_WARP=0 turns it off."""
+    return os.environ.get("MEGABAKE_PRODUCER_WARP", "1") == "1"
+
+
+def producer_ring_pages() -> int:
+    """Weight pages (8 KiB of A plus 2 KiB of B each) of the producer's
+    ring at most; MEGABAKE_RING_PAGES (default 20), even. Codegen fits it
+    to the shared memory left next to the other bodies."""
+    pages = int(os.environ.get("MEGABAKE_RING_PAGES", "20"))
+    return pages + pages % 2
+
+
+@contextlib.contextmanager
+def consumer_cta_sync(threads: int):
+    """While active, an argument-less barrier (a CTA-wide sync) is emitted as
+    barrier 0 over the first ``threads`` threads only."""
+    from cutlass.cute.arch import nvvm_wrappers
+
+    nvvm = nvvm_wrappers.nvvm
+    original = nvvm.barrier
+
+    def barrier(*args, barrier_id=None, number_of_threads=None, loc=None, ip=None, **kwargs):
+        if not args and barrier_id is None and number_of_threads is None:
+            barrier_id = cutlass.Int32(0).ir_value(loc=loc, ip=ip)
+            number_of_threads = cutlass.Int32(threads).ir_value(loc=loc, ip=ip)
+        return original(
+            *args, barrier_id=barrier_id, number_of_threads=number_of_threads, loc=loc, ip=ip, **kwargs
+        )
+
+    shadowed = "barrier" in vars(nvvm)
+    nvvm.barrier = barrier
+    try:
+        yield
+    finally:
+        if shadowed:
+            nvvm.barrier = original
+        else:
+            del nvvm.barrier
+
+
+@cute.jit
+def stall_base_from_counters(counters: cute.Tensor) -> cutlass.Int64:
+    low = counters[0].to(cutlass.Int64) & cutlass.Int64(0xFFFFFFFF)
+    high = counters[1].to(cutlass.Int64)
+    return low | (high << 32)
+
+
+@cute.jit
+def publish_stall_base(counters: cute.Tensor, stall_base: cutlass.Int64):
+    """Thread 0 of block 0, before the first barrier: put the stall region's
+    address where bodies can find it."""
+    counters[0] = (stall_base & cutlass.Int64(0xFFFFFFFF)).to(cutlass.Int32)
+    counters[1] = (stall_base >> 32).to(cutlass.Int32)
+
+
+@cute.jit
+def stall_report(
+    stall_base: cutlass.Int64,
+    call: cutlass.Int32,
+    kind: cutlass.Constexpr,
+    phase: cutlass.Int32,
+    counter: cutlass.Int64,
+    target: cutlass.Int32,
+    observed: cutlass.Int32,
+):
+    """Called by every lane of one warp of a stuck CTA: record, wait, trap."""
+    _, _, block = cute.arch.block_idx()
+    lane = cute.arch.lane_idx()
+    now = cute.arch.globaltimer()
+    if lane == 0:
+        record = cute.make_ptr(
+            cutlass.Int64,
+            stall_base + block.to(cutlass.Int64) * (STALL_WORDS * 8),
+            cute.AddressSpace.gmem,
+            assumed_align=8,
+        )
+        cute.arch.store(record + 1, call.to(cutlass.Int64), scope="sys", sem="relaxed")
+        cute.arch.store(record + 2, cutlass.Int64(kind), scope="sys", sem="relaxed")
+        cute.arch.store(record + 3, phase.to(cutlass.Int64), scope="sys", sem="relaxed")
+        cute.arch.store(record + 4, counter, scope="sys", sem="relaxed")
+        cute.arch.store(record + 5, target.to(cutlass.Int64), scope="sys", sem="relaxed")
+        cute.arch.store(record + 6, observed.to(cutlass.Int64), scope="sys", sem="relaxed")
+        cute.arch.store(record + 7, now, scope="sys", sem="relaxed")
+        cute.arch.store(record, cutlass.Int64(1), scope="sys", sem="release")
+        cute.arch.fence_acq_rel_sys()
+    # Grace period: the other stuck CTAs reach their own timeouts and report.
+    waiting = cute.arch.vote_any_sync(cute.arch.globaltimer() - now < cutlass.Int64(STALL_GRACE_NS))
+    while waiting:
+        waiting = cute.arch.vote_any_sync(
+            cute.arch.globaltimer() - now < cutlass.Int64(STALL_GRACE_NS)
+        )
+    trap_if(True)
+
+
+@cute.jit
+def poll_at_least(
+    address,
+    target: cutlass.Int32,
+    stall_base: cutlass.Int64,
+    call: cutlass.Int32,
+    kind: cutlass.Constexpr,
+    phase: cutlass.Int32,
+    counter: cutlass.Int64,
+    timeout_ns: cutlass.Constexpr,
+):
+    """Acquire-poll an Int32 counter until it reaches ``target``. Every lane of
+    the calling warp polls, and the loop and the trap are warp-uniform (C7519:
+    a spin or trap behind a per-lane branch serializes every wgmma)."""
+    seen = cute.arch.load(address, cutlass.Int32, sem="acquire", scope="gpu")
+    unmet = cute.arch.vote_any_sync(seen < target)
+    if unmet:
+        start = cute.arch.globaltimer()
+        waiting = unmet
+        while waiting:
+            seen = cute.arch.load(address, cutlass.Int32, sem="acquire", scope="gpu")
+            unmet = cute.arch.vote_any_sync(seen < target)
+            in_time = cute.arch.vote_all_sync(
+                cute.arch.globaltimer() - start <= cutlass.Int64(timeout_ns)
+            )
+            waiting = unmet & in_time
+        # Still unmet after the loop: it ended on the timeout.
+        if unmet:
+            stall_report(stall_base, call, kind, phase, counter, target, seen)
+
+
+@cute.jit
+def checked_mbarrier_wait(
+    bar,
+    parity,
+    stall_base: cutlass.Int64,
+    kind: cutlass.Constexpr,
+    page,
+    timeout_ns: cutlass.Constexpr,
+):
+    """``cute.arch.mbarrier_wait`` for a whole warp, reporting a stall past
+    ``timeout_ns`` (0: a plain wait). The fast path is one try_wait and one
+    vote; the loop and the trap are warp-uniform."""
+    if cutlass.const_expr(timeout_ns <= 0):
+        cute.arch.mbarrier_wait(bar, parity)
+    else:
+        unmet = cute.arch.vote_any_sync(cute.arch.mbarrier_try_wait(bar, parity) == False)  # noqa: E712
+        if unmet:
+            start = cute.arch.globaltimer()
+            waiting = unmet
+            while waiting:
+                unmet = cute.arch.vote_any_sync(
+                    cute.arch.mbarrier_try_wait(bar, parity) == False  # noqa: E712
+                )
+                in_time = cute.arch.vote_all_sync(
+                    cute.arch.globaltimer() - start <= cutlass.Int64(timeout_ns)
+                )
+                waiting = unmet & in_time
+            if unmet:
+                stall_report(
+                    stall_base,
+                    cutlass.Int32(-1),
+                    kind,
+                    cutlass.Int32(-1),
+                    cutlass.Int32(page).to(cutlass.Int64),
+                    cutlass.Int32(parity),
+                    cutlass.Int32(-1),
+                )
+
+
 @cute.jit
 def counting_grid_barrier(
     ready: cute.Tensor, workers: cutlass.Int32, ordinal: cutlass.Int32
@@ -196,6 +425,161 @@ def counting_grid_wait(
         while seen < target:
             seen = cute.arch.load(counter, cutlass.Int32, sem="acquire", scope="gpu")
     cute.arch.sync_threads()
+
+
+@cute.jit
+def checked_grid_barrier(
+    ready: cute.Tensor,
+    workers: cutlass.Int32,
+    ordinal: cutlass.Int32,
+    stall_base: cutlass.Int64,
+    call: cutlass.Int32,
+    phase: cutlass.Int32,
+    timeout_ns: cutlass.Constexpr,
+    arrive: cutlass.Boolean = True,
+):
+    """``counting_grid_barrier`` whose wait reports a stall (X0.3).
+    ``arrive=False`` skips this CTA's arrival (the injection test only); it
+    must be the same on every thread of the CTA."""
+    if arrive:
+        counting_grid_arrive(ready, workers)
+    else:
+        cute.arch.sync_threads()
+    checked_grid_wait(ready, workers, ordinal, stall_base, call, phase, timeout_ns)
+
+
+@cute.jit
+def checked_grid_wait(
+    ready: cute.Tensor,
+    workers: cutlass.Int32,
+    ordinal: cutlass.Int32,
+    stall_base: cutlass.Int64,
+    call: cutlass.Int32,
+    phase: cutlass.Int32,
+    timeout_ns: cutlass.Constexpr,
+):
+    """``counting_grid_wait`` with stall diagnostics: warp 0 polls on every
+    lane. The report's counter is the barrier ordinal."""
+    warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    if warp == 0:
+        poll_at_least(
+            ready.iterator + workers + 1,
+            (ordinal + cutlass.Int32(1)) * workers,
+            stall_base,
+            call,
+            STALL_GRID_BARRIER,
+            phase,
+            ordinal.to(cutlass.Int64),
+            timeout_ns,
+        )
+    cute.arch.sync_threads()
+
+
+def stall_region_words(workers: int) -> int:
+    return workers * STALL_WORDS
+
+
+def stall_records(region) -> list[dict]:
+    """Decode a stall region (an int64 numpy array or tensor, workers × 8)."""
+    import numpy as np
+
+    words = np.asarray(region).reshape(-1, STALL_WORDS)
+    records = []
+    for cta, row in enumerate(words):
+        if row[0] != 1:
+            continue
+        call, kind, phase, counter, target, observed, time = (int(value) for value in row[1:])
+        records.append({
+            "cta": cta, "call": call, "kind": STALL_KINDS.get(kind, str(kind)), "phase": phase,
+            "counter": counter, "target": target, "observed": observed, "time_ns": time,
+        })
+    return records
+
+
+def format_stall_report(
+    records: list[dict], workers: int | None = None, phase_names: dict[int, str] | None = None
+) -> str:
+    """One line per (kind, phase, counter, target, observed) with its CTAs.
+    The counter is the barrier ordinal for grid barriers and the phase-counter
+    index for attention exchanges (their phase is -1: bodies do not know it)."""
+    if not records:
+        return "MegaBake stall report: no CTA reported a stall."
+    groups: dict[tuple, list[int]] = {}
+    for record in records:
+        key = (record["call"], record["kind"], record["phase"], record["counter"],
+               record["target"], record["observed"])
+        groups.setdefault(key, []).append(record["cta"])
+    lines = [f"MegaBake stall report: {len(records)}"
+             + (f" of {workers}" if workers is not None else "") + " CTAs timed out waiting"]
+    lines.append(f"  {'call':>5} {'kind':<26} {'phase':>5} {'counter':>8} {'target':>10} {'observed':>10}  CTAs")
+    for (call, kind, phase, counter, target, observed), ctas in sorted(groups.items()):
+        name = (phase_names or {}).get(phase)
+        lines.append(f"  {call:>5} {kind:<26} {phase:>5} {counter:>8} {target:>10} {observed:>10}  "
+                     f"{_ranges(sorted(ctas))}" + (f"  (closes after {name})" if name else ""))
+    if workers is not None and len(records) < workers:
+        silent = sorted(set(range(workers)) - {record["cta"] for record in records})
+        lines.append(f"  no report from CTAs {_ranges(silent)} (running, or stuck in a wait without a check)")
+    return "\n".join(lines)
+
+
+def _ranges(values: list[int]) -> str:
+    parts, start = [], None
+    for index, value in enumerate(values):
+        if start is None:
+            start = value
+        if index + 1 == len(values) or values[index + 1] != value + 1:
+            parts.append(str(start) if start == value else f"{start}-{value}")
+            start = None
+    return ",".join(parts)
+
+
+# Live stall regions: (the ring view that owns the pinned allocation, region
+# offset in int64 words, workers, phase names). Strong references: a failing
+# call's runtime state is freed while its exception unwinds, before the hook
+# runs. Each ring is a few KB of pinned memory; the newest 256 are kept (one
+# per CUDA-graph capture adds up). The hook prints a report for every region
+# with a record when the process dies on an error.
+_STALL_REGIONS: list = []
+_STALL_REGION_LIMIT = 256
+_STALL_HOOK_INSTALLED = False
+
+
+def register_stall_region(
+    owner: torch.Tensor, offset: int, workers: int, phase_names: dict[int, str] | None = None
+) -> None:
+    _STALL_REGIONS.append((owner, offset, workers, phase_names))
+    del _STALL_REGIONS[:-_STALL_REGION_LIMIT]
+    install_stall_hook()
+
+
+def pending_stall_reports() -> list[str]:
+    reports = []
+    for owner, offset, workers, phase_names in _STALL_REGIONS:
+        region = torch.empty(0, dtype=torch.int64).set_(
+            owner.untyped_storage(), offset, (stall_region_words(workers),)
+        )
+        records = stall_records(region.numpy())
+        if records:
+            reports.append(format_stall_report(records, workers, phase_names))
+    return reports
+
+
+def install_stall_hook() -> None:
+    """Print pending stall reports before an uncaught exception's traceback."""
+    global _STALL_HOOK_INSTALLED
+    if _STALL_HOOK_INSTALLED:
+        return
+    import sys
+
+    previous = sys.excepthook
+
+    def hook(kind, value, traceback):
+        for report in pending_stall_reports():
+            print(report, file=sys.stderr)
+        previous(kind, value, traceback)
+
+    sys.excepthook = hook
+    _STALL_HOOK_INSTALLED = True
 
 
 @dsl_user_op
