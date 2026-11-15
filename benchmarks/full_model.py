@@ -12,6 +12,12 @@ error and the run continues.
     .venv/bin/python benchmarks/full_model.py --modes decode --capacity 256
     .venv/bin/python benchmarks/full_model.py --model Qwen/Qwen3.5-0.8B google/gemma-3-270m
     .venv/bin/python benchmarks/full_model.py --modes decode --decode-contexts 512 2048
+
+The Inductor decode baseline is ``inductor_hf``: the unmodified Hugging Face
+model, its own attention and a static cache, compiled end to end with CUDA
+graphs. The other ``inductor*`` decode variants compile MegaBake's decode
+wrapper, whose attention is an opaque custom op to Inductor; they are kept as
+diagnostics only (see ``WRAPPED_INDUCTOR``).
 """
 
 from __future__ import annotations
@@ -48,8 +54,16 @@ from megabake.ops.attention import kv_attention  # noqa: E402
 PROMPT = [1, 504, 3458, 314]
 VARIANTS = (
     "eager", "inductor", "inductor_cudagraphs", "inductor_graphed", "inductor_autotune_graphed",
-    "megabake", "megabake_graphed",
+    "inductor_hf", "megabake", "megabake_graphed",
 )
+# Decode variants that compile MegaBake's own decode wrapper (``decode_module``),
+# whose attention is the ``megabake::kv_attention`` custom op. Inductor cannot
+# see into that op: it calls it as one opaque kernel, and graphed runs replace
+# it with ``_static_kv_attention`` (eager, FP32 scores over the whole cache
+# capacity). They are diagnostics, not baselines. ``inductor_hf`` is the
+# baseline: the unmodified Hugging Face model with its own attention and a
+# static KV cache, compiled by Inductor end to end.
+WRAPPED_INDUCTOR = ("inductor", "inductor_cudagraphs", "inductor_graphed", "inductor_autotune_graphed")
 # Inductor at its strongest for decode: autotuned kernels, captured in a CUDA
 # graph by hand (its own CUDA graphs skip steps that mutate the KV state).
 AUTOTUNE_MODE = "max-autotune-no-cudagraphs"
@@ -325,6 +339,8 @@ def bench_decode(model, args) -> dict:
             stateful, backend=_megabake("decode", args.out), fullgraph=True, dynamic=False
         ),
         "megabake_graphed": None,
+        # The baseline: Hugging Face's own model and static cache (HFStaticDecode).
+        "inductor_hf": None,
     }
     calls = 1 + args.warmup + 2 * args.samples + 1
     if calls > args.capacity:
@@ -348,6 +364,10 @@ def bench_decode(model, args) -> dict:
                 build = lambda state=state: GraphedStep(  # noqa: E731
                     torch.compile(stateful, mode=AUTOTUNE_MODE, fullgraph=True, dynamic=False), token, state
                 )
+            if name == "inductor_hf":
+                build = lambda: HFStaticDecode(  # noqa: E731
+                    args.model_name, args.model_revision, args.capacity, args.batch, args.hf_attention
+                )
             if name == "megabake_graphed":
                 build = lambda state=state: graphed(  # noqa: E731
                     torch.compile(
@@ -358,10 +378,12 @@ def bench_decode(model, args) -> dict:
                     *state,
                 )
 
-            def step(function, state=state, position=position):
+            hf = name == "inductor_hf"
+
+            def step(function, state=state, position=position, hf=hf):
                 position_ids = torch.tensor([[position[0]]], device="cuda")
                 position[0] += 1
-                return function(token, position_ids, *state)
+                return function(token, position_ids) if hf else function(token, position_ids, *state)
 
             def pipelined_steps(function, state=state, position=position):
                 # Positions made on the device ahead of time: a pageable host
@@ -375,6 +397,8 @@ def bench_decode(model, args) -> dict:
                     ).view(-1, 1, 1)
                 ]
                 position[0] += args.samples
+                if hf:
+                    return [lambda row=row: function(token, row) for row in ahead]
                 return [lambda row=row: function(token, row, *state) for row in ahead]
 
             results[name] = _measure_or_error(
@@ -383,6 +407,127 @@ def bench_decode(model, args) -> dict:
             results[name]["final_position"] = position[0]
             torch.cuda.empty_cache()
     return results
+
+
+class HFStaticDecode:
+    """Hugging Face decode the way its users compile it: the unmodified
+    model with its default attention (``sdpa``) and a ``StaticCache``, one
+    ``torch.compile(mode="reduce-overhead")`` over the whole forward, so
+    Inductor sees every op (attention included) and replays CUDA graphs.
+
+    Nothing of MegaBake is in this graph. The cache is ``capacity`` keys
+    long; Hugging Face attends over the whole static cache with a mask, so
+    callers size it to the context they time. Call it as
+    ``step(token, position)``; ``position`` is a ``[1, 1]`` device tensor,
+    and the cache position is the same value.
+    """
+
+    def __init__(
+        self, name: str, revision: str | None, capacity: int, batch: int = 1, attention: str = "sdpa"
+    ):
+        from transformers import AutoModelForCausalLM, StaticCache
+
+        # cuDNN's attention fails to load its sublibrary on the test machine;
+        # SDPA then takes flash or memory-efficient attention.
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        from transformers import AutoConfig
+
+        config = AutoConfig.from_pretrained(name, revision=revision)
+        window = getattr(config, "sliding_window", None)
+        if window and capacity <= window and getattr(config, "layer_types", None):
+            # A window at least as long as the cache never drops a key, so
+            # sliding layers compute full attention. Built as full-attention
+            # layers: Hugging Face's sliding static cache keeps a Python
+            # length that recompiles the graph on every call.
+            config.layer_types = ["full_attention"] * len(config.layer_types)
+            config.sliding_window = None
+            if hasattr(config, "use_sliding_window"):
+                config.use_sliding_window = False
+        self.model = AutoModelForCausalLM.from_pretrained(
+            name, revision=revision, config=config, attn_implementation=attention, dtype=torch.bfloat16
+        ).to("cuda").eval()
+        self.cache = StaticCache(config=self.model.config, max_cache_len=capacity)
+        # StaticCache allocates its tensors on first use; one eager call does
+        # that outside the CUDA graphs, so they stay the graphs' static inputs.
+        with torch.no_grad():
+            start = torch.zeros((batch, 1), dtype=torch.long, device="cuda")
+            self.model(
+                input_ids=torch.full((batch, 1), 504, device="cuda"),
+                position_ids=start,
+                cache_position=start[0],
+                past_key_values=self.cache,
+                use_cache=True,
+            )
+        self.forward = torch.compile(
+            self.model, mode="reduce-overhead", fullgraph=True, dynamic=False
+        )
+
+    def __call__(self, token, position):
+        return self.forward(
+            input_ids=token,
+            position_ids=position,
+            cache_position=position.view(-1),
+            past_key_values=self.cache,
+            use_cache=True,
+        ).logits
+
+
+def _time_contexts(function, token, contexts, args, call=None, lengths=()):
+    """{context: complete and pipelined call µs} of ``function`` at each
+    context. ``call(function, token, position)`` makes one decode call."""
+    call = call or (lambda function, token, position: function(token, position))
+    rows = {}
+    for context in contexts:
+        # Separate device tensors made before timing: a host copy inside the
+        # loop would synchronize every call.
+        positions = [
+            torch.tensor([[context + offset]], device="cuda")
+            for offset in range(2 * args.samples + 4)
+        ]
+        for length in lengths:
+            length.fill_(context)
+        for position in positions[:4]:
+            call(function, token, position)
+        torch.cuda.synchronize()
+        complete = []
+        for position in positions[4 : 4 + args.samples]:
+            torch.cuda.synchronize()
+            started = time.perf_counter()
+            call(function, token, position)
+            torch.cuda.synchronize()
+            complete.append((time.perf_counter() - started) * 1e6)
+        pipelined = _pipelined_calls(
+            [
+                lambda position=position: call(function, token, position)
+                for position in positions[4 + args.samples :]
+            ]
+        )
+        rows[str(context)] = {
+            "complete_call_us": statistics.median(complete),
+            "pipelined_call_us": pipelined,
+        }
+    return rows
+
+
+def bench_hf_contexts(name: str, revision: str | None, args) -> dict:
+    """``inductor_hf`` at every context, each with a static cache just long
+    enough for its timed calls: the strongest Inductor configuration, since
+    Hugging Face attends over the whole static cache."""
+    rows = {}
+    token = torch.full((args.batch, 1), 504, device="cuda")
+    with torch.no_grad():
+        for context in sorted(args.decode_contexts):
+            torch._dynamo.reset()
+            step = HFStaticDecode(
+                name, revision, context + 2 * args.samples + 8, args.batch, args.hf_attention
+            )
+            step(token, torch.tensor([[0]], device="cuda"))
+            rows.update(_time_contexts(step, token, [context], args))
+            del step
+            torch.cuda.empty_cache()
+    summary = {context: round(row["pipelined_call_us"]) for context, row in rows.items()}
+    print(f"decode_contexts_inductor_hf pipelined_call_us: {json.dumps(summary)}", flush=True)
+    return rows
 
 
 def bench_decode_contexts(model, args) -> dict:
@@ -414,7 +559,7 @@ def bench_decode_contexts(model, args) -> dict:
     results: dict[str, object] = {"capacity": capacity, "batch": args.batch, "contexts": contexts}
     with torch.no_grad():
         for name, build in variants.items():
-            if name not in args.variants:
+            if name not in args.variants or name == "inductor_hf":
                 continue
             try:
                 torch._dynamo.reset()
@@ -446,36 +591,14 @@ def bench_decode_contexts(model, args) -> dict:
                 else:
                     function = build()
                 function(token, torch.tensor([[0]], device="cuda"), *state)
-                rows = {}
-                for context in contexts:
-                    # Separate device tensors made before timing: a host copy
-                    # inside the loop would synchronize every call.
-                    positions = [
-                        torch.tensor([[context + offset]], device="cuda")
-                        for offset in range(2 * args.samples + 4)
-                    ]
-                    for length in lengths:
-                        length.fill_(context)
-                    for position in positions[:4]:
-                        function(token, position, *state)
-                    torch.cuda.synchronize()
-                    complete = []
-                    for position in positions[4 : 4 + args.samples]:
-                        torch.cuda.synchronize()
-                        started = time.perf_counter()
-                        function(token, position, *state)
-                        torch.cuda.synchronize()
-                        complete.append((time.perf_counter() - started) * 1e6)
-                    pipelined = _pipelined_calls(
-                        [
-                            lambda position=position: function(token, position, *state)
-                            for position in positions[4 + args.samples :]
-                        ]
-                    )
-                    rows[str(context)] = {
-                        "complete_call_us": statistics.median(complete),
-                        "pipelined_call_us": pipelined,
-                    }
+                rows = _time_contexts(
+                    function,
+                    token,
+                    contexts,
+                    args,
+                    call=lambda function, token, position: function(token, position, *state),
+                    lengths=lengths,
+                )
                 results[name] = rows
                 summary = {
                     context: round(row["pipelined_call_us"]) for context, row in rows.items()
@@ -491,6 +614,7 @@ def bench_decode_contexts(model, args) -> dict:
 
 def _bench_model(name: str, revision: str | None, args: argparse.Namespace) -> None:
     args.out.mkdir(parents=True, exist_ok=True)
+    args.model_name, args.model_revision = name, revision
     print(f"== {name}@{revision or 'main'} -> {args.out}", flush=True)
     model = _load(name, revision, args.attention)
     report: dict[str, object] = {
@@ -505,6 +629,13 @@ def _bench_model(name: str, revision: str | None, args: argparse.Namespace) -> N
         (args.out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     if args.decode_contexts:
         report["decode_contexts"] = bench_decode_contexts(model, args)
+        if "inductor_hf" in args.variants:
+            try:
+                report["decode_contexts"]["inductor_hf"] = bench_hf_contexts(name, revision, args)
+            except Exception as error:  # noqa: BLE001 - keep the other variants' results
+                traceback.print_exc()
+                print(f"decode_contexts_inductor_hf: FAILED {type(error).__name__}: {error}", flush=True)
+                report["decode_contexts"]["inductor_hf"] = {"error": f"{type(error).__name__}: {error}"}
         (args.out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(f"wrote {args.out / 'report.json'}")
     del model
@@ -547,6 +678,11 @@ def main() -> None:
         nargs="*",
         default=[],
         help="also time decode with this many tokens already cached (e.g. 512 2048)",
+    )
+    parser.add_argument(
+        "--hf-attention",
+        default="sdpa",
+        help="attention implementation of the inductor_hf baseline (sdpa, eager, ...)",
     )
     parser.add_argument("--out", type=Path, default=Path("artifacts/full_model"))
     args = parser.parse_args()

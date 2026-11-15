@@ -1,98 +1,117 @@
-Completed the progressive decode-context sweep. Each cell is **pipelined / complete-call latency** in µs per one-token decode call; speedup compares the pipelined numbers. Runs used batch 1, BF16, 40 samples, and 5 warmups on an H200 MIG 3g.71gb.
+Completed the progressive decode-context sweep (re-run 2026-11-15 with a fair Inductor baseline). Each cell is **pipelined / complete-call latency** in µs per one-token decode call; speedup compares the pipelined numbers. Runs used batch 1, BF16, 40 samples, and 5 warmups on an H200 MIG 3g.71gb.
 
-This measures decode with a preset cached context length; it does not include prompt prefill. The tested contexts were 16, 32, 64, 128, 256, 512, 1k, 2k, 4k, and 8k tokens. At 8k, MegaBake was 3.19× faster on SmolLM-135M, 2.76× on Qwen2-0.5B, and 2.75× on DeepSeek. SmolLM-1.7B crossed over at 8k, where MegaBake was slightly slower (0.97×).
+This measures decode with a preset cached context length; it does not include prompt prefill. The tested contexts were 16, 32, 64, 128, 256, 512, 1k, 2k, 4k, and 8k tokens. At 8k, MegaBake was 2.11× faster on SmolLM-135M, 1.81× on Qwen2-0.5B, 1.83× on DeepSeek, and 1.06× on Gemma-2B. SmolLM-1.7B crossed over between 4k and 8k: 1.02× at 4k, and MegaBake was slower at 8k (0.93×).
+
+**What the two columns are.**
+
+- **Inductor** is the unmodified Hugging Face model with a Hugging Face `StaticCache`, compiled by `torch.compile(mode="reduce-overhead", fullgraph=True)`: Inductor kernels replayed as CUDA graphs (`benchmarks/full_model.py --variants inductor_hf`). Nothing from MegaBake is in its graph; Inductor compiles every op, attention included. Attention is `attn_implementation="eager"`, which Inductor fuses itself. Hugging Face attends over the whole static cache with a mask, so each context gets its own cache, just long enough for its timed calls (context + 88 keys), and its own compile: the strongest Inductor configuration for that context. Default SDPA attention was measured too and was slower everywhere it was run (16 and 8k keys on every model; at 8k it was 11.5–13.1 ms, because memory-efficient attention gives one CTA per head and does not split the keys).
+- **MegaBake** is MegaBake's decode step (`megabake_graphed`): MegaBake captures the model through its own attention interface and compiles one megakernel, captured in a CUDA graph. It is compiled once at 8,088 keys of capacity and reads only the valid length.
+
+**What changed from the previous version of this page.** The previous Inductor column compiled MegaBake's own decode wrapper. Its attention is the `megabake::kv_attention` custom op, which Inductor cannot see into: it calls it as an opaque kernel (120 times for SmolLM-135M's 30 layers). In the graphed baseline that op ran `_static_kv_attention`: eager PyTorch that repeats K and V per query head and computes FP32 scores and a softmax over the whole 8,088-key capacity at every context. That is why the old Inductor column was flat at about 3.8 ms (SmolLM-135M) to 6.5 ms (Gemma-2B) whatever the context. The old speedups (4.46× at 16 keys on SmolLM-135M, 2.15× on Gemma-2B) overstated MegaBake's lead; against the fair baseline they are 1.80× and 1.12×.
 
 ### SmolLM-135M
 
 | Context | Inductor pipe / complete (µs) | MegaBake pipe / complete (µs) | Speedup |
 |---:|---:|---:|---:|
-| 16 | 3812.4 / 3830.9 | 855.1 / 888.4 | 4.46× |
-| 32 | 3812.4 / 3829.3 | 856.8 / 890.0 | 4.45× |
-| 64 | 3812.6 / 3830.7 | 876.2 / 892.2 | 4.35× |
-| 128 | 3811.5 / 3828.6 | 900.0 / 932.1 | 4.23× |
-| 256 | 3809.1 / 3826.7 | 951.2 / 987.7 | 4.00× |
-| 512 | 3804.0 / 3820.2 | 998.8 / 1035.3 | 3.81× |
-| 1k | 3805.1 / 3822.6 | 998.1 / 1034.7 | 3.81× |
-| 2k | 3799.8 / 3816.0 | 1041.7 / 1074.8 | 3.65× |
-| 4k | 3786.8 / 3804.6 | 1105.7 / 1138.2 | 3.42× |
-| 8k | 3762.4 / 3780.2 | 1179.4 / 1215.8 | 3.19× |
+| 16 | 1542.5 / 2106.4 | 859.1 / 892.1 | 1.80× |
+| 32 | 1559.1 / 2105.6 | 861.1 / 893.4 | 1.81× |
+| 64 | 1580.6 / 2153.1 | 878.8 / 898.0 | 1.80× |
+| 128 | 1606.3 / 2158.2 | 904.8 / 937.8 | 1.78× |
+| 256 | 1642.3 / 2198.8 | 953.6 / 991.8 | 1.72× |
+| 512 | 1674.2 / 2217.9 | 999.7 / 1039.5 | 1.67× |
+| 1k | 1753.1 / 2311.7 | 1000.9 / 1039.0 | 1.75× |
+| 2k | 1977.3 / 2562.2 | 1038.5 / 1045.8 | 1.90× |
+| 4k | 2127.5 / 2744.2 | 1067.0 / 1104.9 | 1.99× |
+| 8k | 2498.8 / 3100.5 | 1182.7 / 1217.2 | 2.11× |
 
 ### Qwen2-0.5B
 
 | Context | Inductor pipe / complete (µs) | MegaBake pipe / complete (µs) | Speedup |
 |---:|---:|---:|---:|
-| 16 | 4488.2 / 4503.2 | 1158.3 / 1186.2 | 3.87× |
-| 32 | 4489.0 / 4515.2 | 1159.6 / 1188.2 | 3.87× |
-| 64 | 4495.4 / 4508.0 | 1173.3 / 1191.4 | 3.83× |
-| 128 | 4488.8 / 4503.8 | 1190.9 / 1219.0 | 3.77× |
-| 256 | 4488.0 / 4505.2 | 1235.4 / 1266.4 | 3.63× |
-| 512 | 4486.9 / 4506.2 | 1256.3 / 1288.7 | 3.57× |
-| 1k | 4491.3 / 4507.9 | 1376.3 / 1407.0 | 3.26× |
-| 2k | 4481.4 / 4494.8 | 1416.1 / 1447.7 | 3.16× |
-| 4k | 4470.3 / 4489.6 | 1502.8 / 1533.4 | 2.97× |
-| 8k | 4456.1 / 4479.4 | 1617.1 / 1650.5 | 2.76× |
+| 16 | 1838.5 / 2415.7 | 1179.7 / 1206.2 | 1.56× |
+| 32 | 1843.7 / 2421.3 | 1180.9 / 1208.1 | 1.56× |
+| 64 | 1854.2 / 2373.4 | 1194.5 / 1209.5 | 1.55× |
+| 128 | 1857.1 / 2414.7 | 1213.0 / 1240.0 | 1.53× |
+| 256 | 1859.4 / 2417.3 | 1254.2 / 1283.8 | 1.48× |
+| 512 | 1882.1 / 2432.7 | 1277.8 / 1305.2 | 1.47× |
+| 1k | 2109.1 / 2648.8 | 1401.4 / 1432.9 | 1.50× |
+| 2k | 2191.7 / 2775.8 | 1430.4 / 1429.0 | 1.53× |
+| 4k | 2519.0 / 3129.9 | 1472.0 / 1502.8 | 1.71× |
+| 8k | 2960.5 / 3559.2 | 1638.9 / 1674.6 | 1.81× |
 
 ### DeepSeek-V3-DRAFT-0.6B-v3.0
 
 | Context | Inductor pipe / complete (µs) | MegaBake pipe / complete (µs) | Speedup |
 |---:|---:|---:|---:|
-| 16 | 4465.0 / 4483.6 | 1144.3 / 1177.6 | 3.90× |
-| 32 | 4459.0 / 4477.3 | 1146.5 / 1176.6 | 3.89× |
-| 64 | 4462.6 / 4483.0 | 1161.3 / 1179.0 | 3.84× |
-| 128 | 4458.1 / 4473.1 | 1180.2 / 1211.7 | 3.78× |
-| 256 | 4459.8 / 4472.4 | 1220.4 / 1251.6 | 3.65× |
-| 512 | 4453.3 / 4471.5 | 1240.7 / 1272.9 | 3.59× |
-| 1k | 4454.6 / 4472.5 | 1369.8 / 1400.4 | 3.25× |
-| 2k | 4452.9 / 4470.1 | 1408.7 / 1437.8 | 3.16× |
-| 4k | 4442.4 / 4461.5 | 1495.5 / 1526.5 | 2.97× |
-| 8k | 4430.4 / 4455.3 | 1610.3 / 1642.2 | 2.75× |
+| 16 | 1814.7 / 2377.3 | 1144.0 / 1170.1 | 1.59× |
+| 32 | 1808.9 / 2374.9 | 1145.9 / 1172.4 | 1.58× |
+| 64 | 1806.4 / 2386.4 | 1159.8 / 1176.2 | 1.56× |
+| 128 | 1821.5 / 2430.0 | 1179.5 / 1209.3 | 1.54× |
+| 256 | 1844.8 / 2399.8 | 1220.5 / 1250.9 | 1.51× |
+| 512 | 1895.0 / 2452.4 | 1241.8 / 1270.6 | 1.53× |
+| 1k | 2065.4 / 2648.0 | 1367.5 / 1397.0 | 1.51× |
+| 2k | 2187.6 / 2768.0 | 1400.1 / 1393.3 | 1.56× |
+| 4k | 2491.5 / 3110.3 | 1439.3 / 1472.2 | 1.73× |
+| 8k | 2944.4 / 3583.9 | 1608.3 / 1640.2 | 1.83× |
 
 ### SmolLM-1.7B
 
 | Context | Inductor pipe / complete (µs) | MegaBake pipe / complete (µs) | Speedup |
 |---:|---:|---:|---:|
-| 16 | 3857.3 / 3876.3 | 2216.1 / 2250.0 | 1.74× |
-| 32 | 3856.3 / 3873.1 | 2218.7 / 2250.5 | 1.74× |
-| 64 | 3856.7 / 3874.1 | 2233.8 / 2254.3 | 1.73× |
-| 128 | 3856.4 / 3873.1 | 2253.4 / 2285.0 | 1.71× |
-| 256 | 3854.4 / 3871.1 | 2291.5 / 2324.5 | 1.68× |
-| 512 | 3850.0 / 3866.5 | 2360.5 / 2395.2 | 1.63× |
-| 1k | 3853.2 / 3868.0 | 2503.1 / 2536.3 | 1.54× |
-| 2k | 3846.7 / 3862.4 | 2824.6 / 2858.8 | 1.36× |
-| 4k | 3834.8 / 3851.9 | 3196.0 / 3231.4 | 1.20× |
-| 8k | 3818.0 / 3834.4 | 3926.2 / 3960.5 | 0.97× |
+| 16 | 2717.8 / 3167.1 | 2188.2 / 2218.8 | 1.24× |
+| 32 | 2741.3 / 3200.4 | 2189.1 / 2219.6 | 1.25× |
+| 64 | 2731.7 / 3235.2 | 2204.8 / 2222.5 | 1.24× |
+| 128 | 2838.7 / 3333.0 | 2224.8 / 2252.7 | 1.28× |
+| 256 | 2771.2 / 3239.5 | 2262.7 / 2290.3 | 1.22× |
+| 512 | 2880.7 / 3387.8 | 2331.9 / 2361.1 | 1.24× |
+| 1k | 2950.3 / 3450.1 | 2471.7 / 2489.2 | 1.19× |
+| 2k | 3058.0 / 3565.3 | 2794.6 / 2823.8 | 1.09× |
+| 4k | 3226.4 / 3744.1 | 3165.9 / 3196.9 | 1.02× |
+| 8k | 3618.3 / 4132.5 | 3900.4 / 3930.6 | 0.93× |
 
 ### Beam-1.0-501B-A23B-DFlash2
 
-This checkpoint has a 4096-token sliding window, so its sweep ends at 4000 tokens.
+This checkpoint has a 4096-token sliding window, so its sweep ends at 4000 tokens. Every cache in the sweep is at most 4,088 keys, shorter than the window, so the window never drops a key; the Inductor baseline builds these layers as full attention. (Hugging Face's sliding static cache keeps a Python length that makes Dynamo recompile on every call, which stops `fullgraph=True` after eight calls.)
 
 | Context | Inductor pipe / complete (µs) | MegaBake pipe / complete (µs) | Speedup |
 |---:|---:|---:|---:|
-| 16 | 3842.9 / 3857.5 | 2423.4 / 2440.0 | 1.59× |
-| 32 | 3842.8 / 3857.8 | 2423.6 / 2442.4 | 1.59× |
-| 64 | 3842.8 / 3856.7 | 2427.8 / 2445.4 | 1.58× |
-| 128 | 3842.1 / 3855.1 | 2433.5 / 2450.8 | 1.58× |
-| 256 | 3843.1 / 3856.6 | 2447.2 / 2467.8 | 1.57× |
-| 512 | 3842.6 / 3857.0 | 2472.2 / 2490.0 | 1.55× |
-| 1k | 3842.5 / 3856.5 | 2529.7 / 2551.4 | 1.52× |
-| 2k | 3840.3 / 3855.1 | 2598.9 / 2616.9 | 1.48× |
-| 4k | 3839.7 / 3853.4 | 2729.6 / 2745.3 | 1.41× |
+| 16 | 2560.2 / 2763.5 | 2427.6 / 2441.7 | 1.05× |
+| 32 | 2564.0 / 2785.5 | 2430.3 / 2443.5 | 1.06× |
+| 64 | 2579.2 / 2793.5 | 2431.9 / 2447.6 | 1.06× |
+| 128 | 2587.9 / 2798.6 | 2438.7 / 2454.7 | 1.06× |
+| 256 | 2622.6 / 2830.9 | 2451.9 / 2467.9 | 1.07× |
+| 512 | 2647.4 / 2862.6 | 2477.5 / 2494.0 | 1.07× |
+| 1k | 2691.5 / 2909.4 | 2532.2 / 2555.9 | 1.06× |
+| 2k | 2791.6 / 3018.0 | 2598.7 / 2617.7 | 1.07× |
+| 4k | 2997.8 / 3226.7 | 2734.6 / 2750.2 | 1.10× |
 
 ### Gemma-2B
 
-The earlier CUDA illegal-instruction failure did not reproduce in a fresh process. Both graphed variants completed the full sweep; the original cause remains undetermined.
+Gemma-2B is the ungated `unsloth/gemma-2b` copy of the checkpoint.
 
 | Context | Inductor pipe / complete (µs) | MegaBake pipe / complete (µs) | Speedup |
 |---:|---:|---:|---:|
-| 16 | 6457.6 / 6472.3 | 3000.2 / 3031.4 | 2.15× |
-| 32 | 6456.5 / 6472.0 | 3000.7 / 3034.6 | 2.15× |
-| 64 | 6456.7 / 6470.7 | 3003.2 / 3031.9 | 2.15× |
-| 128 | 6456.1 / 6472.2 | 3002.7 / 3029.8 | 2.15× |
-| 256 | 6454.9 / 6471.1 | 3016.3 / 3052.9 | 2.14× |
-| 512 | 6449.8 / 6468.7 | 3043.4 / 3075.8 | 2.12× |
-| 1k | 6452.4 / 6469.9 | 3084.8 / 3116.0 | 2.09× |
-| 2k | 6449.4 / 6465.7 | 3186.8 / 3219.1 | 2.02× |
-| 4k | 6442.6 / 6459.1 | 3386.7 / 3415.9 | 1.90× |
-| 8k | 6428.7 / 6442.8 | 3676.9 / 3707.3 | 1.75× |
+| 16 | 3319.0 / 3745.1 | 2961.7 / 2986.5 | 1.12× |
+| 32 | 3316.9 / 3719.1 | 2961.1 / 2992.2 | 1.12× |
+| 64 | 3324.4 / 3746.8 | 2962.5 / 2990.8 | 1.12× |
+| 128 | 3344.2 / 3754.7 | 2962.3 / 2989.0 | 1.13× |
+| 256 | 3363.9 / 3739.9 | 2975.6 / 3004.7 | 1.13× |
+| 512 | 3335.4 / 3778.8 | 3000.8 / 3029.7 | 1.11× |
+| 1k | 3414.3 / 3821.1 | 3044.8 / 3072.3 | 1.12× |
+| 2k | 3554.9 / 3984.8 | 3145.8 / 3167.2 | 1.13× |
+| 4k | 3651.9 / 4078.0 | 3340.0 / 3352.6 | 1.09× |
+| 8k | 3864.6 / 4262.1 | 3634.8 / 3662.8 | 1.06× |
 
 Beam’s load also reported missing embedding and LM-head weights, so treat its numbers as a forward-path timing for that draft checkpoint.
+
+**Complete calls.** Inductor's complete call is 200–600 µs above its pipelined call: Dynamo guards, the CUDA-graph tree's bookkeeping and the Hugging Face forward wrapper run on the host every call. MegaBake's graphed call adds at most about 35 µs.
+
+**Correctness of the baseline.** Fed a prompt token by token, the Inductor baseline gives the same first 13 greedy tokens as Hugging Face `generate` on SmolLM-135M and then diverges by one token, the same with an SDPA or an eager-attention reference. Inductor's fused kernels round differently from eager PyTorch; MegaBake's own Llama-3.2-1B check diverges from eager at token 37 the same way.
+
+Reproduce one model with:
+
+    TORCHINDUCTOR_CACHE_DIR=... .venv/bin/python benchmarks/full_model.py --model HuggingFaceTB/SmolLM-135M --modes \
+        --decode-contexts 16 32 64 128 256 512 1000 2000 4000 8000 \
+        --variants inductor_hf megabake_graphed --hf-attention eager
+
+Artifacts (per-model `report.json` and logs) are in `artifacts/fair_sweep_2026-11-15/`; the whole sweep is `experiments/newarch/fair_sweep.sh`.
