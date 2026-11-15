@@ -88,6 +88,8 @@ def dump_region_graph(graph: ComputeGraph, path: str | Path) -> Path:
 def _fusion_candidates(graph: ComputeGraph) -> dict[str, tuple[RegionCandidate, ...]]:
     """Each op's fusion candidates, in the order the planner tries them."""
     rope_candidates = rope.candidates(graph)
+    norm_candidates = norm.candidates(graph)
+    chain_candidates = elementwise.candidates(graph)
     declared = (
         candidate
         for operation in graph.ops.values()
@@ -100,11 +102,13 @@ def _fusion_candidates(graph: ComputeGraph) -> dict[str, tuple[RegionCandidate, 
     candidates: dict[str, list[RegionCandidate]] = {}
     for candidate in (
         *declared,
-        *elementwise.candidates(graph),
+        *chain_candidates,
         *gemm.epilogue_candidates(graph),
-        *norm.candidates(graph),
+        *norm_candidates,
         *rope_candidates,
-        *attention.prologue_candidates(graph, rope_candidates),
+        *attention.prologue_candidates(
+            graph, (*rope_candidates, *norm_candidates, *chain_candidates)
+        ),
         *attention.pattern_candidates(graph),
     ):
         candidates.setdefault(candidate.source_op_ids[-1], []).append(candidate)

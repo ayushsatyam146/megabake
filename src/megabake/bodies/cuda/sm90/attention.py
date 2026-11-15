@@ -4,7 +4,7 @@ from dataclasses import dataclass, replace
 import os
 import textwrap
 from functools import cache
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from ....graph import Region
 from ....ops import HF_EAGER_NUMERICS, Attention, HeadGrouping, Prologue
@@ -166,6 +166,9 @@ class AttentionBodyProvider:
             return reject("materialized scores and extra attention outputs are unsupported")
 
         loads = {load.id: load for load in program.loads}
+        # A prologued operand is read through its stages; its own access map
+        # is the one the shape checks need.
+        loads.update({load_id: prologue.operand for load_id, prologue in attention.prologues.items()})
         if not {"attention:q", "attention:k", "attention:v"} <= set(loads):
             return reject("attention program lacks Q/K/V accesses")
         if any(
@@ -357,7 +360,7 @@ def _attention_config(
         ),
         layouts=LayoutContract(layouts, {program.store.value_id: layouts[program.store.value_id]}),
         tiles=TileContract(
-            cta_shape=(1, 1, next(load.source_shape[3] for load in program.loads if load.id == "attention:q")),
+            cta_shape=(1, 1, attention.grouping.head_dim),
             cluster_shape=(1, 1, 1),
             work_partition=(
                 "one query row per warp in one CTA" if stateful else "one query row per warp"
@@ -508,7 +511,7 @@ def emit_attention_body(
     required_loads = ("attention:q", "attention:k", "attention:v")
     if not set(required_loads) <= set(loads):
         raise UnsupportedAttentionBody("attention body lacks Q/K/V bindings")
-    query_load = next(load for load in program.loads if load.id == "attention:q")
+    query_load = attention.q
     key_load = next(load for load in program.loads if load.id == "attention:k")
     query_length = _attention_sequence_length(query_load)
     kv_length = _attention_sequence_length(key_load)
@@ -791,36 +794,269 @@ def run(
     )
 
 
-def _prologue_lines(
-    prologue: Prologue, program: Any, head: str, target: str, name: str
-) -> str:
-    """Lines storing to ``target`` (as FP32) an elementwise producer of a
-    (batch, sequence, head, dim) attention operand evaluated at (b,
-    sequence, ``head``, d), rounded as the producer stores it, from the
-    attention's own bindings."""
-    from ..generic import _HOISTED_LOADS, _cast_expression, _emit_expression, _load_access
+class _PrologueEmitter:
+    """Statements evaluating a prologue's stages inside the decode body.
 
-    bindings = {load.value_id: index for index, load in enumerate(program.loads)}
-    loads = prologue.loads
-    indices = {load.id: bindings[load.value_id] for load in loads}
-    coordinates = {"o0": "b", "o1": "sequence", "o2": head, "o3": "d"}
-    indent = "                    "
-    # Each load is bound once, which keeps the expression within the DSL
-    # preprocessor's recursion limit.
-    hoisted = {load.id: f"{name}_load_{index}" for index, load in enumerate(loads)}
-    lines = "".join(
-        f"{indent}{hoisted[load.id]} = {_load_access(load, indices[load.id], loads, coordinates).code}\n"
-        for load in loads
-    )
-    token = _HOISTED_LOADS.set(hoisted)
-    try:
-        value = _cast_expression(
-            _emit_expression(prologue.combine, indices, coordinates, loads),
-            prologue.dtype,
+    A stage is evaluated where its result is read: a load of an earlier
+    stage becomes that stage's expression at the coordinates the load
+    addresses (storage offset, then the stage's dense axes), zero where the
+    load is out of bounds, and rounded as the stage stores. A reduction stage
+    reads its row's statistic from ``stats``."""
+
+    def __init__(self, prologue: Prologue, program: Any, name: str) -> None:
+        self.stats: dict[int, str] = {}
+        self.prologue = prologue
+        self.bindings = {load.value_id: index for index, load in enumerate(program.loads)}
+        self.name = name
+        self.count = 0
+
+    def fresh(self) -> str:
+        self.count += 1
+        return f"{self.name}_{self.count}"
+
+    def unravel(
+        self, element: str, stage: int, lines: list[str], indent: str
+    ) -> dict[str, str]:
+        from ....ops.attention import dense_axes, output_axes
+
+        program = self.prologue.stages[stage].program
+        axes = dense_axes(program.store)
+        assert axes is not None
+        coordinates = {}
+        for axis, (stride, size) in zip(output_axes(program), axes):
+            if not stride:
+                coordinates[axis] = "0"
+                continue
+            name = self.fresh()
+            lines.append(f"{indent}{name} = {element} // {stride} % {size}\n")
+            coordinates[axis] = name
+        return coordinates
+
+    def operand(
+        self, b: str, head: str, d: str, lines: list[str], indent: str
+    ) -> dict[str, str]:
+        """Coordinates of the last stage at operand element (b, 0, head, d)."""
+        terms = [
+            f"({value}) * {stride}"
+            for value, stride in zip((b, "0", head, d), self.prologue.operand.strides)
+            if stride and value != "0"
+        ]
+        element = self.fresh()
+        lines.append(f"{indent}{element} = {' + '.join([str(self.prologue.offset), *terms])}\n")
+        return self.unravel(element, len(self.prologue.stages) - 1, lines, indent)
+
+    def translate(
+        self, stage: int, load: Any, coordinates: Mapping[str, str], lines: list[str], indent: str
+    ) -> tuple[dict[str, str], str | None]:
+        """Coordinates of the stage ``load`` reads, and its bounds condition."""
+        from ..generic import _axis_code
+
+        current = self.prologue.stages[stage]
+        values = [_axis_code(axis, coordinates, ()) for axis in load.axes]
+        bounds = [
+            f"0 <= ({value}) < {size}"
+            for axis, value, size in zip(load.axes, values, load.source_shape)
+            if not isinstance(axis, int)
+        ]
+        terms = [f"({value}) * {stride}" for value, stride in zip(values, load.strides) if stride]
+        element = " + ".join([str(current.offsets[load.id]), *terms])
+        condition = " and ".join(bounds) or None
+        name = self.fresh()
+        # Out of bounds reads element 0, so the inner loads stay in range.
+        lines.append(
+            f"{indent}{name} = {element}\n"
+            if condition is None
+            else f"{indent}{name} = ({element}) if ({condition}) else 0\n"
         )
-    finally:
-        _HOISTED_LOADS.reset(token)
-    return lines + f"{indent}{target} = ({value.code}).to(cutlass.Float32)\n"
+        return self.unravel(name, current.inputs[load.id], lines, indent), condition
+
+    def evaluate(
+        self,
+        stage: int,
+        expression: Any,
+        coordinates: Mapping[str, str],
+        accumulator: str | None,
+        lines: list[str],
+        indent: str,
+        dtype: str | None,
+    ) -> str:
+        """A variable holding ``expression`` of ``stage`` at ``coordinates``
+        (``accumulator`` names the reduction's statistic or running sum),
+        cast to ``dtype`` when given."""
+        from ....ir import IndexedLoad
+        from ..generic import _HOISTED_LOADS, _cast_expression, _cutlass_type, _emit_expression, _load_access
+
+        current = self.prologue.stages[stage]
+        program = current.program
+        expression = _accumulator_as_load(expression)
+        referenced = _referenced_loads(expression)
+        loads = (
+            *program.loads,
+            IndexedLoad("prologue:accumulator", "", (), (), program.accumulator_dtype or "torch.float32"),
+        )
+        indices = {load.id: index for index, load in enumerate(loads)}
+        hoisted: dict[str, str] = {}
+        for load in program.loads:
+            if load.id not in referenced:
+                continue
+            name = self.fresh()
+            if load.id in current.inputs:
+                inner_coordinates, condition = self.translate(stage, load, coordinates, lines, indent)
+                inner_program = self.prologue.stages[current.inputs[load.id]].program
+                inner = self.evaluate(
+                    current.inputs[load.id],
+                    inner_program.post if inner_program.reduction_axes else inner_program.combine,
+                    inner_coordinates,
+                    self.stats.get(current.inputs[load.id]),
+                    lines,
+                    indent,
+                    inner_program.store.dtype,
+                )
+                lines.append(
+                    f"{indent}{name} = {inner}\n"
+                    if condition is None
+                    else f"{indent}{name} = {inner} if ({condition}) else {_cutlass_type(load.dtype)}(0)\n"
+                )
+            else:
+                access = _load_access(load, self.bindings[load.value_id], program.loads, coordinates)
+                lines.append(f"{indent}{name} = {access.code}\n")
+            hoisted[load.id] = name
+        if accumulator is not None:
+            hoisted["prologue:accumulator"] = accumulator
+        token = _HOISTED_LOADS.set(hoisted)
+        try:
+            value = _emit_expression(expression, indices, coordinates, loads)
+        finally:
+            _HOISTED_LOADS.reset(token)
+        if dtype is not None:
+            value = _cast_expression(value, dtype)
+        name = self.fresh()
+        lines.append(f"{indent}{name} = {value.code}\n")
+        return name
+
+
+def _accumulator_as_load(expression: Any) -> Any:
+    from ....ir import Accumulator, Binary, Cast, Load, Unary, Where
+
+    if isinstance(expression, Accumulator):
+        return Load("prologue:accumulator", expression.dtype)
+    if isinstance(expression, Binary):
+        return replace(
+            expression, lhs=_accumulator_as_load(expression.lhs), rhs=_accumulator_as_load(expression.rhs)
+        )
+    if isinstance(expression, (Unary, Cast)):
+        return replace(expression, operand=_accumulator_as_load(expression.operand))
+    if isinstance(expression, Where):
+        return replace(
+            expression,
+            condition=_accumulator_as_load(expression.condition),
+            true_value=_accumulator_as_load(expression.true_value),
+            false_value=_accumulator_as_load(expression.false_value),
+        )
+    return expression
+
+
+def _referenced_loads(expression: Any) -> set[str]:
+    from ....ir import Binary, Cast, Load, Unary, Where
+
+    if isinstance(expression, Load):
+        return {expression.load_id}
+    if isinstance(expression, Binary):
+        return _referenced_loads(expression.lhs) | _referenced_loads(expression.rhs)
+    if isinstance(expression, (Unary, Cast)):
+        return _referenced_loads(expression.operand)
+    if isinstance(expression, Where):
+        return (
+            _referenced_loads(expression.condition)
+            | _referenced_loads(expression.true_value)
+            | _referenced_loads(expression.false_value)
+        )
+    return set()
+
+
+def _prologue_staging(
+    targets: Sequence[tuple[str, Prologue, str, str, int]],
+    program: Any,
+    batch: int,
+    head_dim: int,
+    threads: int,
+    warps: int,
+    partial_base: int,
+) -> str:
+    """Staging lines for ``targets`` (name, prologue, head expression, FP32
+    shared-scratch row offset expression, heads of that operand): first each
+    reduction stage's statistic for the head's row, summed by the whole CTA
+    (per-warp partials at ``partial_base``, combined in warp order, so every
+    CTA computing a row gets the same value), then each operand row."""
+    from ....ops.attention import reduction_witnesses, row_axes, output_axes
+
+    indent = "            "
+    inner = indent + "    "
+    lines: list[str] = []
+    emitters = []
+    tasks: list[tuple[_PrologueEmitter, int, str, dict[str, str]]] = []
+    for name, prologue, head, _, heads in targets:
+        emitter = _PrologueEmitter(prologue, program, name)
+        emitters.append(emitter)
+        witnesses = reduction_witnesses(prologue, heads, batch, head_dim)
+        if witnesses is None:
+            raise UnsupportedAttentionBody("a prologue reduction reads several rows per head")
+        for stage, (d, path) in sorted(witnesses.items()):
+            # The head's row: follow the witness path at head dimension d.
+            coordinates = emitter.operand("b", head, str(d), lines, indent)
+            current = len(prologue.stages) - 1
+            for load_id in path:
+                load = next(item for item in prologue.stages[current].program.loads if item.id == load_id)
+                coordinates, _ = emitter.translate(current, load, coordinates, lines, indent)
+                current = prologue.stages[current].inputs[load_id]
+            assert current == stage
+            reduction = prologue.stages[stage].program
+            rows = row_axes(reduction)
+            row = {axis: (coordinates[axis] if axis in rows else "0") for axis in output_axes(reduction)}
+            tasks.append((emitter, stage, f"{name}_stat_{stage}", row))
+    if len(tasks) > head_dim:
+        raise UnsupportedAttentionBody("too many prologue statistics for the warp scratch")
+    if tasks:
+        for task, (emitter, stage, stat, row) in enumerate(tasks):
+            reduction = emitter.prologue.stages[stage].program
+            axis = reduction.reduction_axes[0]
+            width = next(domain.size for domain in reduction.iteration_domains if domain.axis == axis)
+            init = reduction.init.value if reduction.init is not None else 0
+            lines.append(f"{indent}{stat} = cutlass.Float32({float(init)!r})\n")
+            lines.append(f"{indent}for {stat}_r in cutlass.range(thread, {width}, {threads}):\n")
+            body: list[str] = []
+            value = emitter.evaluate(
+                stage, reduction.combine, {**row, axis: f"{stat}_r"}, stat, body, inner, "torch.float32"
+            )
+            lines.extend(body)
+            lines.append(f"{inner}{stat} = {value}\n")
+            for offset in (16, 8, 4, 2, 1):
+                lines.append(f"{indent}{stat} = {stat} + cute.arch.shuffle_sync_bfly({stat}, offset={offset})\n")
+        lines.append(f"{indent}if lane == 0:\n")
+        for task, (_, _, stat, _) in enumerate(tasks):
+            lines.append(f"{inner}scratch[{partial_base} + warp * {len(tasks)} + {task}] = {stat}\n")
+        lines.append(f"{indent}cute.arch.sync_threads()\n")
+        for task, (emitter, stage, stat, _) in enumerate(tasks):
+            lines.append(f"{indent}{stat} = scratch[{partial_base + task}]\n")
+            lines.append(f"{indent}for {stat}_w in cutlass.range_constexpr(1, {warps}):\n")
+            lines.append(f"{inner}{stat} = {stat} + scratch[{partial_base} + {stat}_w * {len(tasks)} + {task}]\n")
+            emitter.stats[stage] = stat
+    for emitter, (name, prologue, head, target, _) in zip(emitters, targets):
+        lines.append(f"{indent}for d in cutlass.range(thread, {head_dim}, {threads}):\n")
+        last = len(prologue.stages) - 1
+        program = prologue.stages[last].program
+        coordinates = emitter.operand("b", head, "d", lines, inner)
+        value = emitter.evaluate(
+            last,
+            program.post if program.reduction_axes else program.combine,
+            coordinates,
+            emitter.stats.get(last),
+            lines,
+            inner,
+            program.store.dtype,
+        )
+        lines.append(f"{inner}scratch[{target} + d] = ({value}).to(cutlass.Float32)\n")
+    return "".join(lines)
 
 
 def _decode_key_seconds(heads: int, head_dim: int) -> float:
@@ -1184,25 +1420,24 @@ def _decode_variant(
     staging = "".join(
         f"            head_{g} = head_base + {g}\n" for g in range(groups)
     )
+    targets = []
     for g in range(groups):
-        target = f"scratch[{layout.query_rows + g * head_dim} + d]"
-        staging += f"            for d in cutlass.range(thread, {head_dim}, {threads}):\n"
         if "attention:q" in prologues:
-            staging += _prologue_lines(
-                prologues["attention:q"], program, f"head_{g}", target, f"query_{g}"
+            targets.append(
+                (f"query_{g}", prologues["attention:q"], f"head_{g}", str(layout.query_rows + g * head_dim), query_heads)
             )
         else:
             staging += (
-                f"                {target} = "
+                f"            for d in cutlass.range(thread, {head_dim}, {threads}):\n"
+                f"                scratch[{layout.query_rows + g * head_dim} + d] = "
                 f"tensor_bindings[{q_index}][b, 0, head_{g}, d].to(cutlass.Float32)\n"
             )
     if "attention:new_k" in prologues:
-        staging += f"            for d in cutlass.range(thread, {head_dim}, {threads}):\n"
-        staging += _prologue_lines(
-            prologues["attention:new_k"], program, "kv_head", f"scratch[{layout.key_row} + d]", "key"
-        )
-    if prologues:
-        staging = "            sequence = cutlass.Int32(0)\n" + staging
+        targets.append(("key", prologues["attention:new_k"], "kv_head", str(layout.key_row), kv_heads))
+    if targets:
+        # Statistic partials use the value-partial scratch, which is free
+        # until this item's scores.
+        staging += _prologue_staging(targets, program, batch, head_dim, threads, warps, layout.values)
     new_key_row = (
         shared_row(layout.key_row)
         if "attention:new_k" in prologues

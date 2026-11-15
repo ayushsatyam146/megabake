@@ -428,7 +428,7 @@ def _attention_body_order(
 ) -> tuple[int, ...]:
     loads = {load.id: load for load in region.tensor_programs[0].loads}
     grouping = region.semantics.grouping
-    query_length = loads["attention:q"].source_shape[1]
+    query_length = region.semantics.q.source_shape[1]
     kv_length = loads["attention:k"].source_shape[1]
     parallelism = grouping.batch * grouping.query_heads * query_length
     decode_work = query_length == 1 and kv_length > 0 and parallelism > 0

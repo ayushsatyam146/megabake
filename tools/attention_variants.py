@@ -111,6 +111,9 @@ def run_variant(name: str, capacity: int, length: int = 800, check_all: bool = T
     attention_phases = [p for p in compiled_plan.plan.phases if p.body.provider == "attention"] if compiled_plan else []
     report["megakernel"] = compiled_plan is not None
     report["attention_phases"] = len(attention_phases)
+    # Attention that evaluates its query/key producers (RoPE, q/k norms).
+    report["prologue_phases"] = sum(p.region_id.endswith(":attention_prologue") for p in attention_phases)
+    report["phases"] = len(compiled_plan.plan.phases) if compiled_plan else 0
     report["split_body"] = "chunk_keys = (visible" in source
     report["window_in_body"] = "first = keys - cutlass.Int32(" in source
     report["softcap_in_body"] = "cute.math.tanh" in source
