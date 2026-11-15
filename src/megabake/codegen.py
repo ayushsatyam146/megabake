@@ -55,6 +55,7 @@ from .runtime import (
     WEIGHT_STREAM_STAGES,
     call_counter_offset,
     producer_ring_pages,
+    ring_pages_forced,
     producer_warp_enabled,
     stall_inject_phase,
     stall_timeout_ns,
@@ -150,6 +151,8 @@ class LaunchMetadata:
     # Producer warp (X1.1): one extra warpgroup after threads_per_block,
     # outside every CTA-wide barrier, whose first warp produces.
     producer_warp: bool = False
+    # Weight pages of the producer's ring per CTA.
+    ring_pages: int = 0
 
     @property
     def launch_threads(self) -> int:
@@ -1296,8 +1299,21 @@ def _emit_table_module(
         free = budget - _generic_scratch_bytes(
             _representative_scratch_plan(plan, representative_phases), scratch_elements
         ) - 1024 - 1024 - 4 * 64 * 16 * 2
-        ring_pages = min(producer_ring_pages(), free // ((64 * 64 + 16 * 64) * 2)) // 2 * 2
-        if ring_pages < 8:
+        # The staging planner sizes the ring from the plan and the device
+        # tree (plan.mapping). Without a mapping, on a tree that was not
+        # measured, or with MEGABAKE_RING_PAGES set, the fixed count applies.
+        staging = (
+            plan.mapping.staging
+            if plan.mapping is not None and plan.mapping.tree.measured
+            else None
+        )
+        wanted = (
+            staging.ring_pages
+            if staging is not None and not ring_pages_forced()
+            else producer_ring_pages()
+        )
+        ring_pages = min(wanted, free // ((64 * 64 + 16 * 64) * 2)) // 2 * 2
+        if ring_pages < 8 or (staging is not None and not staging.producer):
             producer, ring_pages = False, 0
     launch_threads = plan.launch.threads_per_block + (128 if producer else 0)
     for gemm_variant, spec in gemm_variant_specs.items():
@@ -1912,6 +1928,7 @@ def launch(
         phase_float_elements=float_elements,
         phase_counter_count=counter_count,
         producer_warp=producer,
+        ring_pages=ring_pages,
     )
     return source, launch_metadata, _source_map(source, plan, phase_records)
 

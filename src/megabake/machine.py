@@ -30,7 +30,7 @@ import time
 
 import torch
 
-MACHINE_MODEL_VERSION = 1
+MACHINE_MODEL_VERSION = 2
 
 
 def _cache_dir() -> Path:
@@ -104,6 +104,18 @@ class MachineModel:
     tensor_peak_flops: dict[str, float]
     measured_at: str = ""
     notes: tuple[str, ...] = field(default_factory=tuple)
+    # Streaming write with ``k`` CTAs (one per SM): {k: bytes/s}.
+    hbm_write_bytes_per_s_by_ctas: dict[int, float] = field(default_factory=dict)
+    # What one warp of one CTA reads with ordinary loads: the rate of a body
+    # whose compute threads issue their own loads.
+    thread_load_bytes_per_s: float = 0.0
+    # One dependent load from DRAM (pointer chase over a footprint far above L2).
+    dram_latency_s: float = 0.0
+    # Slowdown of that load while other SMs stream: {HBM utilization: factor}.
+    contention_by_utilization: dict[float, float] = field(default_factory=dict)
+    # Rates of body families fitted from a phase profile on this device
+    # (tools/calibrate_bodies.py): {family: {rate: value}}.
+    body_rates: dict[str, dict[str, float]] = field(default_factory=dict)
 
     def read_bandwidth(self, busy_ctas: int | None = None) -> float:
         """HBM read bandwidth reachable with ``busy_ctas`` CTAs (all if None).
@@ -152,6 +164,17 @@ class MachineModel:
             tensor_peak_flops={key: float(value) for key, value in data["tensor_peak_flops"].items()},
             measured_at=data.get("measured_at", ""),
             notes=tuple(data.get("notes", ())),
+            hbm_write_bytes_per_s_by_ctas=ints(data.get("hbm_write_bytes_per_s_by_ctas", {})),
+            thread_load_bytes_per_s=float(data.get("thread_load_bytes_per_s", 0.0)),
+            dram_latency_s=float(data.get("dram_latency_s", 0.0)),
+            contention_by_utilization={
+                float(key): float(value)
+                for key, value in data.get("contention_by_utilization", {}).items()
+            },
+            body_rates={
+                family: {key: float(value) for key, value in rates.items()}
+                for family, rates in data.get("body_rates", {}).items()
+            },
         )
 
 
@@ -175,10 +198,16 @@ def machine_model(device=None, *, force: bool = False, repeats: int = 3) -> Mach
     from . import calibration
 
     model = calibration.calibrate(device_fingerprint(device), repeats=repeats)
+    save_machine_model(model)
+    return model
+
+
+def save_machine_model(model: MachineModel) -> Path:
+    """Write ``model`` to the calibration cache of its device."""
     path = _cache_dir() / f"{model.fingerprint.key}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(model.to_json(), indent=2) + "\n")
-    return model
+    return path
 
 
 def _now() -> str:

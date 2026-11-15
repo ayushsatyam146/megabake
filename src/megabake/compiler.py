@@ -24,6 +24,7 @@ from torch.utils import _pytree as pytree
 
 from .bodies import SelectionPolicy, TargetFacts
 from .bodies.catalog import launch_options
+from .device import device_tree
 from .bodies.cuda.sm90.gemm import TABLE_DESCRIPTORS_PER_GEMM, cute_gemm_tensors, is_swap_ab
 from .cache import PlanCache, make_plan_key
 from .codegen import GEMM_SECOND_A_COLUMN, GeneratedCuTeModule, emit_cute
@@ -41,7 +42,7 @@ from .plan import (
     SearchBudget,
     search_plans,
 )
-from .planner import enumerate_body_selections
+from .planner import enumerate_body_selections, with_emitted_staging
 from .schedule import (
     EventSchedule,
     _recompute_assignments,
@@ -62,6 +63,7 @@ from .runtime import (
     execute_event_plan,
     execute_phase_plan,
     make_ready,
+    plan_with_tree,
     reset_ready,
 )
 
@@ -383,10 +385,14 @@ def compile_post_grad(
         )
     if policy is None:
         table_launch = _uses_table_launch(graph)
+        # The device tree the launch is planned with: measured on this GPU if
+        # tools/calibrate.py has run, else the spec tree of its family.
+        tree = device_tree(selected_target) if plan_with_tree() else None
         policy = SelectionPolicy(
             mode=prepared.context.mode,
             table_launch=table_launch,
-            target_options=launch_options(graph, selected_target, table_launch),
+            target_options=launch_options(graph, selected_target, table_launch, tree),
+            device=tree,
         )
     if isinstance(search_budget, int):
         if search_budget < 1:
@@ -395,7 +401,12 @@ def compile_post_grad(
     else:
         budget = search_budget or SearchBudget()
         if search_budget is None and _uses_table_launch(graph):
-            budget = SearchBudget(max_plans=1, max_compilations=1)
+            # A full model compiles for minutes, so one plan is compiled.
+            # With a device tree the cost model picks it among the legal
+            # plans; without one it is the greedy seed.
+            budget = SearchBudget(
+                max_plans=3 if policy.device is not None else 1, max_compilations=1
+            )
 
     plan_key: str | None = None
     if cache is not None:
@@ -423,6 +434,7 @@ def compile_post_grad(
             prepared.context,
             scheduler=scheduler,
             body_revisions=body_revisions,
+            device=None if policy.device is None else policy.device.digest,
         )
 
     def compile_selected() -> CompiledKernel:
@@ -777,6 +789,12 @@ def compile_plan(
                     required_active_blocks=legal_workers,
                 ),
             )
+            if current_plan.mapping is not None:
+                # The mapping as emitted: codegen fits the producer's ring to
+                # the shared memory it has, and may drop the producer.
+                current_plan = with_emitted_staging(
+                    current_plan, generated.launch.producer_warp, generated.launch.ring_pages
+                )
             try:
                 admission = (
                     admit_event_runtime(event_schedule)

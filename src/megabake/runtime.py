@@ -230,6 +230,18 @@ def producer_ring_pages() -> int:
     return pages + pages % 2
 
 
+def plan_with_tree() -> bool:
+    """Whether launches are planned with the device tree (default). With
+    MEGABAKE_PLAN_WITH_TREE=0 the planner uses its fixed rules, for A/B runs."""
+    return os.environ.get("MEGABAKE_PLAN_WITH_TREE", "1") == "1"
+
+
+def ring_pages_forced() -> bool:
+    """Whether MEGABAKE_RING_PAGES fixes the ring size (an experiment knob);
+    otherwise the staging planner sizes it from the plan and the device."""
+    return "MEGABAKE_RING_PAGES" in os.environ
+
+
 @contextlib.contextmanager
 def consumer_cta_sync(threads: int):
     """While active, an argument-less barrier (a CTA-wide sync) is emitted as

@@ -1,0 +1,46 @@
+# NVIDIA H200, MIG slice 3g.71gb (60 SMs): the device MegaBake is developed
+# on, as calibrated on 2026-11-15. Edges, engines and sync were measured by
+# tools/calibrate.py; the GEMM, generic and sync-skew rates and the bulk-copy
+# latency were fitted by tools/plan_report.py --fit on SmolLM-135M decode;
+# the attention rates are the 2026-11-07 forced-chunk fits. Unit tests use
+# this file as a calibrated tree. A calibration cache on the device replaces
+# it there.
+name: NVIDIA H200 MIG 3g.71gb
+family: hopper
+levels:
+- {name: hbm, capacity_bytes: 74893492224, fanout: 1, managed: software}
+- {name: l2, capacity_bytes: 41943040, fanout: 1, managed: hardware}
+- name: sm
+  capacity_bytes: 232448
+  fanout: 60
+  managed: software
+  engines: {'tensor:bfloat16': 6794000000000.0, 'tensor:float16': 6744000000000.0, 'tensor:float8_e4m3fn': 12880000000000.0}
+edges:
+- source: hbm
+  target: sm
+  read_bytes_per_s: {1.0: 79690000000.0, 2.0: 161200000000.0, 4.0: 325900000000.0, 8.0: 630200000000.0,
+    15.0: 1087000000000.0, 16.0: 1144000000000.0, 30.0: 1802000000000.0, 32.0: 1866000000000.0, 45.0: 2138000000000.0,
+    48.0: 2170000000000.0, 60.0: 2313000000000.0}
+  write_bytes_per_s: {1.0: 63320000000.0, 30.0: 1838000000000.0, 60.0: 2261000000000.0}
+  mechanisms:
+    tma_bulk: {latency_s: 1.06e-06, bytes_per_s: null, occupies_compute: false}
+    thread_load: {latency_s: 1.392e-07, bytes_per_s: 9704000000.0, occupies_compute: true}
+  contention: {0.0: 1.0, 1.0: 2.129}
+- source: l2
+  target: sm
+  read_bytes_per_s: {60.0: 4018000000000.0}
+  write_bytes_per_s: {}
+  mechanisms: {}
+  contention: {0.0: 1.0}
+sync:
+  grid_barrier_s: {1.0: 4.668e-07, 15.0: 6.596e-07, 30.0: 6.754e-07, 60.0: 6.873e-07}
+  counter_round_trip_s: 8.852e-07
+  interval_skew_s: 1.358e-07
+bodies:
+  gemm: {start_s: 1.463e-06, staged_start_s: 1.618e-06, tile_s: 5.667e-07, split_exchange_s: 1.5e-06}
+  attention_decode: {item_fixed_s: 1.2e-06, item_min_work_s: 1.8e-06, exchange_s: 2.2e-06, merge_head_s: 2.0e-08,
+    merge_dim_s: 5.0e-10, key_s_64: 1.6e-08, key_s_128: 3.4e-08, key_s_256: 1.7e-07, head_key_s: 2.0e-09,
+    pass_s: 1.4e-06}
+  generic: {start_s: 3.248e-07, round_s: 1.0e-06}
+provenance: {levels: spec, edges: measured, sync: measured, engines: measured, bodies: measured, measured_at: '2026-11-15T06:28:19+0000',
+  note: 'tools/calibrate.py and tools/plan_report.py --fit on SmolLM-135M decode, 2026-11-15'}

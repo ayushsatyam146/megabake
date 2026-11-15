@@ -1,0 +1,77 @@
+# NVIDIA H100 SXM (sm90a). The mechanism family of every Hopper body:
+# TMA bulk copies into shared memory, WGMMA tensor cores, mbarriers.
+#
+# Numbers marked "spec" are from NVIDIA's documentation; "assumed" ones are
+# measurements of an H200 MIG slice (60 SMs) applied here until
+# tools/calibrate.py has run on a full H100. A calibration replaces the
+# edges, engines and sync of this file on the device it ran on.
+name: NVIDIA H100
+family: hopper
+levels:
+  - name: hbm
+    capacity_bytes: 80.0e+9
+  - name: l2
+    capacity_bytes: 50.0e+6
+    managed: hardware            # a cache: the planner cannot place a tile in it
+  - name: sm
+    fanout: 132
+    capacity_bytes: 232448       # shared memory one CTA can take (227 KiB)
+    engines:
+      "tensor:bfloat16": 7.5e+12  # FLOP/s per SM (cuBLAS peak / SMs)
+      "tensor:float16": 7.5e+12
+      "tensor:float8_e4m3fn": 14.0e+12
+edges:
+  - source: hbm
+    target: sm
+    # Total bytes/s by active SMs. One SM alone streams ~80 GB/s; the edge
+    # saturates near 90% of the 3.35 TB/s interface.
+    read_bytes_per_s: {peak: 3.0e+12, per_child: 80.0e+9}
+    write_bytes_per_s: {peak: 3.0e+12, per_child: 80.0e+9}
+    mechanisms:
+      tma_bulk:                  # asynchronous bulk copy; no compute thread waits
+        latency_s: 1.06e-6           # issue to arrival of one stage, fitted from a shallow-ring kernel
+        occupies_compute: false
+      thread_load:               # loads issued by compute threads, one warp
+        latency_s: 0.14e-6         # one dependent load from DRAM
+        bytes_per_s: 10.0e+9
+    # Slowdown of a latency-bound access by the edge's utilization.
+    contention: {0.0: 1.0, 1.0: 1.5}
+  - source: l2
+    target: sm
+    read_bytes_per_s: {132: 6.0e+12}
+sync:
+  grid_barrier_s: {1: 0.47e-6, 132: 0.75e-6}
+  counter_round_trip_s: 0.9e-6
+  interval_skew_s: 0.14e-6
+# Rates of each body family, in seconds unless named otherwise. They are the
+# body's, not the edge's: decode attention reads K and V far below its share
+# of HBM. tools/calibrate_bodies.py fits them from a phase profile.
+bodies:
+  gemm:                          # persistent TMA/WGMMA GEMM (bodies/cuda/sm90/gemm.py)
+    # Once per CTA and GEMM phase: dispatch and the first stage. One value
+    # per kernel state, fitted in that state; the producer's gain shows in
+    # the stream rate its deeper ring allows more than in the start.
+    start_s: 1.46e-6              # no producer: the GEMM loads its own stages
+    staged_start_s: 1.62e-6       # the producer staged the first weight stage
+    tile_s: 0.57e-6               # each tile boundary
+    split_exchange_s: 1.5e-6     # split-K: partial store and counter hand-off per item
+  attention_decode:              # split-context decode attention (sm90/attention.py)
+    item_fixed_s: 1.2e-6
+    item_min_work_s: 1.8e-6      # one load round
+    exchange_s: 2.2e-6           # statistics exchange of a split row
+    merge_head_s: 2.0e-8         # value merge, per chunk and head
+    merge_dim_s: 5.0e-10         # value merge, per chunk and head_dim element
+    key_s_64: 16.0e-9            # per visible key, one head, by head_dim
+    key_s_128: 34.0e-9
+    key_s_256: 170.0e-9
+    head_key_s: 2.0e-9           # per visible key and extra packed head
+    pass_s: 1.4e-6               # from phase entry to the first item
+  generic:                       # generated map, reduction, gather, copy bodies
+    start_s: 0.32e-6
+    round_s: 1.0e-6              # one round of dependent memory latency
+provenance:
+  levels: spec
+  edges: assumed
+  sync: assumed
+  engines: assumed
+  bodies: fitted on an H200 MIG slice (60 SMs), 2026-11

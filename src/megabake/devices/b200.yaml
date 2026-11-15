@@ -1,0 +1,51 @@
+# NVIDIA B200 (sm100). Hopper's family plus tensor memory (TMEM) at the SM.
+# Spec numbers only: no calibration and no performance provider exist yet
+# (bodies/cuda/sm100 is a correctness baseline). Body rates are Hopper's and
+# are assumptions here.
+name: NVIDIA B200
+family: blackwell
+levels:
+  - name: hbm
+    capacity_bytes: 180.0e+9
+  - name: l2
+    capacity_bytes: 64.0e+6      # sources give 64 MB to 126 MB; unverified
+    managed: hardware
+  - name: sm
+    fanout: 148
+    capacity_bytes: 232448
+    engines:
+      "tensor:bfloat16": 15.0e+12
+      "tensor:float8_e4m3fn": 30.0e+12
+edges:
+  - source: hbm
+    target: sm
+    read_bytes_per_s: {peak: 7.2e+12, per_child: 80.0e+9}
+    write_bytes_per_s: {peak: 7.2e+12, per_child: 80.0e+9}
+    mechanisms:
+      tma_bulk: {latency_s: 1.06e-6, occupies_compute: false}
+      thread_load: {latency_s: 0.14e-6, bytes_per_s: 10.0e+9}
+    contention: {0.0: 1.0, 1.0: 1.5}
+sync:
+  grid_barrier_s: {1: 0.47e-6, 148: 0.75e-6}
+  counter_round_trip_s: 0.9e-6
+  interval_skew_s: 0.14e-6
+bodies:
+  gemm: {start_s: 1.46e-6, staged_start_s: 1.62e-6, tile_s: 0.57e-6, split_exchange_s: 1.5e-6}
+  attention_decode:
+    item_fixed_s: 1.2e-6
+    item_min_work_s: 1.8e-6
+    exchange_s: 2.2e-6
+    merge_head_s: 2.0e-8
+    merge_dim_s: 5.0e-10
+    key_s_64: 16.0e-9
+    key_s_128: 34.0e-9
+    key_s_256: 170.0e-9
+    head_key_s: 2.0e-9
+    pass_s: 1.4e-6
+  generic: {start_s: 0.32e-6, round_s: 1.0e-6}
+provenance:
+  levels: spec
+  edges: spec peak, assumed per-SM rate
+  sync: assumed
+  engines: assumed
+  bodies: assumed from Hopper

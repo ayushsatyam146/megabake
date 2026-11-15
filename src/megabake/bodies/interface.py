@@ -48,6 +48,9 @@ class SelectionPolicy:
     target_options: Any = None
     numerical_policy: str = "source_semantics"
     require_measured: bool = False
+    # The launch's ``device.DeviceTree``: the rates and capacities providers
+    # and the planner decide with. None plans as before the tree existed.
+    device: Any = None
 
 
 @dataclass(frozen=True)
@@ -214,8 +217,9 @@ class Generation:
 
     architectures: frozenset[str]
     providers: tuple[BodyProvider, ...]
-    # The ``SelectionPolicy.target_options`` of a graph: (graph, table_launch).
-    launch_options: Callable[[ComputeGraph, bool], Any] | None = None
+    # The ``SelectionPolicy.target_options`` of a graph:
+    # (graph, table_launch, device tree or None).
+    launch_options: Callable[[ComputeGraph, bool, Any], Any] | None = None
 
 
 def widened_participants(config: BodyConfig, threads: int) -> ParticipantContract:

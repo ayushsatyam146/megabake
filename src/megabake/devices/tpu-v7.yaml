@@ -1,0 +1,37 @@
+# Google TPU v7 (Ironwood), one chip. A third mechanism family: DMA between
+# HBM and one large software-managed vector memory (VMEM) per TensorCore,
+# a systolic matrix unit and a vector unit. Kernels are written in Pallas.
+# No MegaBake bodies exist for it. Numbers are from the Inferact TPU
+# megakernel post, not from Google documentation.
+#
+# The tree is short and narrow: two leaves, each with as much staging memory
+# as all 132 SMs of an H100 together.
+name: Google TPU v7
+family: tpu
+levels:
+  - name: hbm
+    capacity_bytes: 206.0e+9
+  - name: tensorcore
+    fanout: 2
+    capacity_bytes: 67108864     # 64 MiB VMEM
+    engines:
+      "tensor:bfloat16": 1.15e+15  # 2.31 PFLOPS per chip
+      "tensor:float8_e4m3fn": 2.3e+15
+edges:
+  - source: hbm
+    target: tensorcore
+    read_bytes_per_s: {2: 7.38e+12, 1: 3.69e+12}
+    write_bytes_per_s: {2: 7.38e+12, 1: 3.69e+12}
+    mechanisms:
+      dma: {latency_s: 1.0e-6, occupies_compute: false}
+sync:
+  grid_barrier_s: {1: 0.0, 2: 0.0}   # one sequential program per TensorCore
+  counter_round_trip_s: 0.0
+  interval_skew_s: 0.0
+bodies: {}
+provenance:
+  levels: Inferact post
+  edges: Inferact post
+  sync: structural
+  engines: Inferact post
+  bodies: none

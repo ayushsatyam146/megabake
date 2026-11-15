@@ -1,0 +1,46 @@
+# AMD Instinct MI300X (CDNA 3). A different mechanism family: loads are
+# issued by compute threads into LDS (no bulk copy engine), matrix cores run
+# MFMA. No MegaBake bodies exist for it; this file lets the planner and the
+# cost model run on its shape. Spec numbers only.
+#
+# The tree has one more level than NVIDIA's: a memory-side Infinity Cache
+# shared by all eight XCDs, then an L2 per XCD. Both are hardware-managed.
+name: AMD Instinct MI300X
+family: cdna3
+levels:
+  - name: hbm
+    capacity_bytes: 192.0e+9
+  - name: infinity_cache
+    capacity_bytes: 256.0e+6
+    managed: hardware
+  - name: xcd_l2
+    fanout: 8
+    capacity_bytes: 4.0e+6
+    managed: hardware
+  - name: cu
+    fanout: 38                   # compute units enabled per XCD
+    capacity_bytes: 65536        # LDS per workgroup; unverified for CDNA 3
+    engines:
+      "tensor:bfloat16": 3.5e+12  # half an H100 SM's FP16 rate per CU
+edges:
+  - source: hbm
+    target: cu
+    read_bytes_per_s: {peak: 4.8e+12, per_child: 40.0e+9}
+    write_bytes_per_s: {peak: 4.8e+12, per_child: 40.0e+9}
+    mechanisms:
+      thread_load: {latency_s: 1.0e-6, bytes_per_s: 20.0e+9}
+    contention: {0.0: 1.0, 1.0: 1.5}
+  - source: infinity_cache
+    target: cu
+    read_bytes_per_s: {304: 17.2e+12}
+sync:
+  grid_barrier_s: {1: 0.5e-6, 304: 1.0e-6}
+  counter_round_trip_s: 1.0e-6
+  interval_skew_s: 0.7e-6
+bodies: {}
+provenance:
+  levels: spec
+  edges: spec peak, assumed per-CU rate
+  sync: assumed
+  engines: spec
+  bodies: none

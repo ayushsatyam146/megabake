@@ -73,6 +73,7 @@ def make_plan_key(
     scheduler: str = "phase",
     toolchain: Mapping[str, str] | None = None,
     body_revisions: Sequence[tuple[str, str, str]] | None = None,
+    device: str | None = None,
 ) -> str:
     payload = {
         "plan": _plan_data(plan, body_revisions),
@@ -87,6 +88,8 @@ def make_plan_key(
         "stall_inject": stall_inject_phase(),
         "producer_warp": producer_warp_enabled(),
         "ring_pages": producer_ring_pages(),
+        # The device tree's digest: the planner's choices follow its numbers.
+        "device": device,
         "stall_inject_ring": os.environ.get("MEGABAKE_STALL_INJECT_RING"),
     }
     encoded = json.dumps(

@@ -81,6 +81,86 @@ def _best_read(buffer, programs, footprint, reps, sms) -> float:
     )
 
 
+@triton.jit
+def _write_kernel(x, chunk, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)
+    base = pid.to(tl.int64) * chunk
+    value = tl.full([BLOCK], 1.0, dtype=tl.float32)
+    for offset in range(0, chunk, BLOCK):
+        tl.store(x + base + offset + tl.arange(0, BLOCK), value)
+
+
+def _write_bandwidth(buffer: torch.Tensor, programs: int, footprint: int) -> float:
+    """bytes/s of ``programs`` CTAs each writing footprint/programs once."""
+    best = 0.0
+    for block, warps in ((1024, 4), (4096, 8)):
+        chunk = (footprint // 4 // programs) // block * block
+        if chunk == 0:
+            continue
+        ms = _time_ms(lambda: _write_kernel[(programs,)](buffer, chunk, BLOCK=block, num_warps=warps))
+        best = max(best, programs * chunk * 4 / (ms * 1e-3))
+    return best
+
+
+@triton.jit
+def _chase_kernel(links, x, out, steps, chunk, reps, BLOCK: tl.constexpr):
+    """Program 0 follows ``steps`` dependent loads through ``links``; every
+    other program streams its chunk of ``x`` ``reps`` times beside it."""
+    pid = tl.program_id(0)
+    if pid == 0:
+        index = tl.load(links)
+        for _ in range(steps):
+            index = tl.load(links + index.to(tl.int64), cache_modifier=".cg")
+        tl.store(out, index.to(tl.float32))
+    else:
+        base = pid.to(tl.int64) * chunk
+        acc = tl.zeros([BLOCK], dtype=tl.float32)
+        for _ in range(reps):
+            for offset in range(0, chunk, BLOCK):
+                acc += tl.load(x + base + offset + tl.arange(0, BLOCK), cache_modifier=".cg")
+        tl.store(out + pid, tl.sum(acc))
+
+
+def _chase_links(elements: int) -> torch.Tensor:
+    """One random cycle over ``elements`` int32 slots: every load misses."""
+    order = torch.randperm(elements, device="cuda", dtype=torch.int32)
+    links = torch.empty(elements, device="cuda", dtype=torch.int32)
+    links[order.long()] = torch.roll(order, -1)
+    return links
+
+
+def _latency_probe(buffer: torch.Tensor, sms: int) -> tuple[float, dict[float, float]]:
+    """(seconds per dependent DRAM load, slowdown of that load in a kernel
+    whose other SMs stream).
+
+    Both are slopes over the number of chase steps, so launch time and the
+    streams' own duration drop out. The chase outlasts the streams, and it
+    stays slow after they end: on the H200 slice a kernel that streamed at
+    all runs its dependent loads about 2x slower to the end (2026-11-15,
+    cause unknown). That is the megakernel's situation, so the factor is
+    recorded as the slowdown at full utilization."""
+    links = _chase_links(64 << 20)  # 256 MiB of int32: far above L2
+    block = 2048
+
+    def run(programs: int, steps: int, chunk: int, reps: int) -> float:
+        out = torch.empty(programs, device="cuda", dtype=torch.float32)
+        return _time_ms(
+            lambda: _chase_kernel[(programs,)](
+                links, buffer, out, steps, chunk, reps, BLOCK=block, num_warps=4
+            ),
+            iterations=3,
+        ) * 1e-3
+
+    low, high = 40_000, 80_000
+    alone = (run(1, high, block, 0) - run(1, low, block, 0)) / (high - low)
+    slowdown = {0.0: 1.0}
+    if sms > 1:
+        chunk = buffer.numel() // sms // block * block
+        beside = (run(sms, high, chunk, 1) - run(sms, low, chunk, 1)) / (high - low)
+        slowdown[1.0] = max(1.0, beside / alone)
+    return alone, slowdown
+
+
 # --------------------------------------------------------------------------
 # Synchronization (CuTe DSL, MegaBake's own barrier)
 
@@ -241,6 +321,22 @@ def calibrate(fingerprint: DeviceFingerprint, *, repeats: int = 3) -> MachineMod
         (footprint for footprint, bandwidth in by_footprint.items() if bandwidth >= 1.5 * hbm),
         default=0,
     )
+    write_by_ctas = {
+        count: measure(f"hbm_write[{count} ctas]",
+                       lambda count=count: _write_bandwidth(buffer, count, hbm_footprint))
+        for count in sorted({1, sms // 2, sms})
+        if count
+    }
+    thread_load = measure("thread_load[1 warp]", lambda: max(
+        _read_bandwidth(buffer, 1, 64 << 20, 1, block, 1) for block in (256, 1024)
+    ))
+    latencies = [_latency_probe(buffer, sms) for _ in range(repeats)]
+    dram_latency = statistics.median(latency for latency, _ in latencies)
+    notes.append(f"dram_latency: spread {_spread([latency for latency, _ in latencies]) * 100:.2f}% over {repeats}")
+    contention = {
+        key: statistics.median(curve[key] for _, curve in latencies if key in curve)
+        for key in sorted({key for _, curve in latencies for key in curve})
+    }
     del buffer
     torch.cuda.empty_cache()
 
@@ -263,4 +359,8 @@ def calibrate(fingerprint: DeviceFingerprint, *, repeats: int = 3) -> MachineMod
         tensor_peak_flops=peaks,
         measured_at=_now(),
         notes=tuple(notes),
+        hbm_write_bytes_per_s_by_ctas=write_by_ctas,
+        thread_load_bytes_per_s=thread_load,
+        dram_latency_s=dram_latency,
+        contention_by_utilization=contention,
     )

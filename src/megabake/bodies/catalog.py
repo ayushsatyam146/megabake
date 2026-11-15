@@ -50,12 +50,15 @@ def provider(name: str) -> BodyProvider:
     raise KeyError(f"no body provider named {name!r}")
 
 
-def launch_options(graph: ComputeGraph, target: TargetFacts, table_launch: bool) -> Any:
-    """The ``SelectionPolicy.target_options`` of a launch of ``graph``."""
+def launch_options(
+    graph: ComputeGraph, target: TargetFacts, table_launch: bool, device: Any = None
+) -> Any:
+    """The ``SelectionPolicy.target_options`` of a launch of ``graph``;
+    ``device`` is the launch's ``DeviceTree`` when it is planned with one."""
     found = generation(target)
     if found is None or found.launch_options is None:
         return None
-    return found.launch_options(graph, table_launch)
+    return found.launch_options(graph, table_launch, device)
 
 
 def get_candidates(

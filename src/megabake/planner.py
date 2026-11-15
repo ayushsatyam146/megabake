@@ -785,3 +785,93 @@ def _logical_tile(
 def _conversion_cost(layout: CuTeLayout) -> int:
     return 2 * prod(layout.shape) * DTYPE_BYTES.get(layout.dtype, 0)
 
+
+# --------------------------------------------------------------------------
+# The plan's mapping on a device tree
+
+# One page of the producer's ring: 64 weight rows of a 64-wide K tile plus a
+# 16-row activation slot, BF16 (HopperWgmmaGemmPersistentKernel.ring_pages).
+RING_PAGE_WEIGHT_BYTES = 64 * 64 * 2
+RING_PAGE_BYTES = RING_PAGE_WEIGHT_BYTES + 16 * 64 * 2
+
+
+def producer_possible(plan: Any) -> bool:
+    """Whether codegen can give the plan a producer warpgroup: every tensor
+    core GEMM is an unsplit swapAB GEMM with 16-row activation slots."""
+    from .bodies.cuda.sm90.gemm import is_swap_ab, split_k
+    from .runtime import WEIGHT_STREAM_STAGES, producer_warp_enabled
+
+    gemms = [phase.body for phase in plan.phases if phase.body.provider == "g0_range"]
+    return (
+        bool(gemms)
+        and producer_warp_enabled()
+        and not WEIGHT_STREAM_STAGES
+        and plan.launch.threads_per_block % 128 == 0
+        and plan.launch.threads_per_block <= 256
+        and all(
+            is_swap_ab(body) and split_k(body) == 1 and body.tiles.cta_shape[0] == 16
+            for body in gemms
+        )
+    )
+
+
+def map_plan(plan: Any, tree: Any, kv_valid_length: int | None = None) -> Any:
+    """``plan`` with its ``KernelMapping`` on ``tree``: each region's
+    mapping, the formats of the values between regions, the staging the
+    producer should run, and the cost model's estimate.
+
+    Decode time depends on the cached length; the estimate is taken at
+    ``kv_valid_length`` (None: every KV cache at its capacity)."""
+    from dataclasses import replace as _replace
+
+    from .costmodel import estimate, plan_intervals
+    from .mapping import KernelMapping, StagePlan, edge_formats, region_mapping
+    from .staging import plan_staging
+
+    root = tree.root.name
+    regions = tuple(region_mapping(selected, tree.leaf.name) for selected in plan.selection.selections)
+    staging = StagePlan(reason="the plan's GEMMs take no producer pages")
+    if producer_possible(plan):
+        staged = [planned.interval for planned in plan_intervals(plan, tree, kv_valid_length, staged=True)]
+        staging = plan_staging(
+            staged,
+            tree,
+            free_bytes=tree.leaf.capacity_bytes,
+            page_bytes=RING_PAGE_BYTES,
+            staged_bytes_per_page=RING_PAGE_WEIGHT_BYTES,
+        )
+    mapping = KernelMapping(
+        regions=regions,
+        staging=staging,
+        edges=edge_formats(plan.selection, root),
+        device=tree.name,
+        kv_valid_length=kv_valid_length,
+        tree=tree,
+    )
+    mapped = _replace(plan, mapping=mapping)
+    intervals = [planned.interval for planned in plan_intervals(mapped, tree, kv_valid_length)]
+    return _replace(mapped, mapping=_replace(mapping, estimate=estimate(intervals, tree)))
+
+
+def with_emitted_staging(plan: Any, producer: bool, ring_pages: int) -> Any:
+    """``plan`` with its mapping's staging as codegen emitted it, and the
+    estimate taken again for that staging."""
+    from dataclasses import replace as _replace
+
+    from .costmodel import estimate, plan_intervals
+
+    mapping = plan.mapping
+    staging = _replace(
+        mapping.staging,
+        producer=producer,
+        ring_pages=ring_pages,
+        page_bytes=RING_PAGE_BYTES if producer else 0,
+    )
+    mapped = _replace(plan, mapping=_replace(mapping, staging=staging))
+    intervals = [
+        planned.interval
+        for planned in plan_intervals(mapped, mapping.tree, mapping.kv_valid_length)
+    ]
+    return _replace(
+        mapped, mapping=_replace(mapped.mapping, estimate=estimate(intervals, mapping.tree))
+    )

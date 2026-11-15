@@ -10,9 +10,10 @@ Rules:
 - A KV cache (``TensorProgram.state_accesses``) is read only up to the valid
   length and written for ``query_length`` rows, not at its capacity.
 - A gather (embedding lookup) reads as many table bytes as it writes.
-- A contraction over two 2-D operands costs ``2·M·N·K`` FLOPs; everything
-  else is counted as bandwidth only (decode-sized elementwise FLOPs are
-  negligible next to their bytes).
+- A contraction costs two FLOPs per iteration point of its einsum and
+  accumulator (``2·M·N·K`` for a GEMM, twice that for a paired one);
+  everything else is counted as bandwidth only (decode-sized elementwise
+  FLOPs are negligible next to their bytes).
 """
 
 from __future__ import annotations
@@ -112,12 +113,12 @@ def phase_traffic(
             weights += size
     written += output_bytes
 
-    shapes = [plan.graph.values[value_id].shape for value_id in inputs]
-    two_d = [shape for shape in shapes if shape is not None and len(shape) == 2]
-    if len(two_d) >= 2 and two_d[0][1] == two_d[1][0]:
-        (m, k), (_, n) = two_d[0], two_d[1]
-        # Paired (gate·up) bodies contract the same activation with two weights.
-        flops = 2 * m * k * n * sum(1 for shape in two_d[1:] if shape[0] == k)
+    if getattr(program, "family", "") == "contraction":
+        # One multiply-add per iteration point and accumulator; a paired
+        # (gate·up) body keeps two accumulators.
+        from .einsum import einsum_view
+
+        flops = einsum_view(program).flops
     return PhaseTraffic(read, written, flops, weights, kv)
 
 

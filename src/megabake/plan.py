@@ -282,6 +282,10 @@ class KernelPlan:
     tile_maps: tuple[TileMap, ...]
     storage: StoragePlan
     launch: LaunchRequirements
+    # What the planner decided with the device tree (``mapping.KernelMapping``):
+    # region mappings, the producer's staging, and the cost model's estimate.
+    # None when the launch was planned without a tree.
+    mapping: Any = None
 
     @property
     def bodies(self) -> tuple[BodyConfig, ...]:
@@ -580,6 +584,10 @@ def search_plans(
             )
             plan = assign_storage(schedule)
             verify_plan(plan)
+            if selected_policy.device is not None:
+                from .planner import map_plan
+
+                plan = map_plan(plan, selected_policy.device)
             projected_shared_memory = _projected_shared_memory(plan)
             if projected_shared_memory > target.max_shared_memory_per_cta:
                 candidates.append(
@@ -610,6 +618,9 @@ def search_plans(
             PlanCandidate(plan, worker_count, description, "unmeasured")
         )
         legal_plan_count += 1
+
+    if selected_policy.device is not None:
+        candidates = _rank_by_estimate(candidates)
 
     compiled_count = 0
     for index, candidate in enumerate(candidates):
@@ -703,6 +714,32 @@ def search_plans(
         exhausted,
         None if selected is None else selected.description,
     )
+
+
+def _rank_by_estimate(candidates: list[PlanCandidate]) -> list[PlanCandidate]:
+    """Legal plans in the order the cost model would compile them: the
+    default plan first, unless another is estimated faster by more than the
+    model's margin; then by estimate. Compilation is the expensive step, so
+    the budget goes to the plans the model ranks best."""
+    from .search import MARGIN
+
+    def seconds(candidate: PlanCandidate) -> float:
+        mapping = candidate.plan.mapping if candidate.plan is not None else None
+        if candidate.status != "unmeasured" or mapping is None or mapping.estimate is None:
+            return float("inf")
+        return mapping.estimate.total_s
+
+    legal = [candidate for candidate in candidates if seconds(candidate) != float("inf")]
+    if len(legal) < 2:
+        return candidates
+    default = legal[0]
+    ranked = sorted(legal[1:], key=seconds)
+    if seconds(ranked[0]) < seconds(default) * (1.0 - MARGIN):
+        ranked = sorted(legal, key=seconds)
+    else:
+        ranked = [default, *ranked]
+    chosen = {id(candidate) for candidate in legal}
+    return ranked + [candidate for candidate in candidates if id(candidate) not in chosen]
 
 
 def _selection_description(

@@ -272,6 +272,9 @@ class AttentionBodyProvider:
                     body_name,
                     target.multiprocessor_count,
                     stateful and policy.table_launch and split_decode_head_dim(head_dim),
+                    DecodeRates.from_tree(policy.device)
+                    if policy.device is not None and policy.device.body("attention_decode")
+                    else None,
                 ),
             ),
             (),
@@ -295,7 +298,12 @@ def attention_scratch_rows(kv_length: int) -> int:
 
 
 def _attention_config(
-    region: Region, program: Any, name: str, workers: int, split: bool
+    region: Region,
+    program: Any,
+    name: str,
+    workers: int,
+    split: bool,
+    rates: DecodeRates | None = None,
 ) -> BodyConfig:
     """``split`` sizes the scratch for the table launch's split-context decode
     body, which ``workers`` CTAs run."""
@@ -321,6 +329,7 @@ def _attention_config(
                 min(kv_capacity, decode_window(attention) or kv_capacity),
                 threads,
                 workers,
+                rates,
             ),
         )
     elif stateful:
@@ -431,6 +440,8 @@ def _attention_config(
                 "median_isolated_launch_us": 16.794,
                 "median_device_event_span_us": 137.040,
                 "median_complete_call_us": 150.397,
+                # The split cost model's rates on the launch's device.
+                **({"decode_rates": rates} if rates is not None else {}),
             },
         ),
     )
@@ -458,23 +469,67 @@ DECODE_STAMP_STRIDE = 16
 # Split cost model (X2a, 2026-11-07). An item costs a fixed time plus its
 # key work, which is at least one load round; a split row also pays one
 # statistics exchange and a value merge that grow with chunks, heads and
-# head_dim, and items past one wave of CTAs run in another pass. Fitted to
-# forced-chunk sweeps on the 60-SM H200 slice (Llama-3.2-1B, SmolLM-135M,
-# Qwen2-0.5B, Qwen3-0.6B, gemma-3-270m at 113-4,013 keys).
-# shortcut: these are one body's rates on one GPU; they belong in a per-body
-# calibration (X0.1-style), not here. They are not HBM rates: at head_dim 64
-# a CTA reads K and V at ~16 GB/s, against a ~59 GB/s calibrated HBM share.
-DECODE_ITEM_FIXED_S = 1.2e-6
-DECODE_ITEM_MIN_WORK_S = 1.8e-6
-DECODE_EXCHANGE_S = 2.2e-6
-DECODE_MERGE_HEAD_S = 2.0e-8
-DECODE_MERGE_DIM_S = 5.0e-10
-# Seconds per visible key for one head, by head_dim, and per extra head.
-DECODE_KEY_S = {64: 16e-9, 128: 34e-9, 256: 170e-9}
-DECODE_HEAD_KEY_S = 2.0e-9
-# Each extra pass of items re-enters the item loop late (measured ~1.4 µs
-# from phase entry to the first item).
-DECODE_PASS_S = 1.4e-6
+# head_dim, and items past one wave of CTAs run in another pass.
+#
+# The rates are this body's on one device, so they live in the device tree
+# (``DeviceTree.bodies["attention_decode"]``; megabake/devices/h100.yaml holds
+# the values fitted on the 60-SM H200 slice). They are not HBM rates: at
+# head_dim 64 a CTA reads K and V at ~16 GB/s against a ~59 GB/s HBM share.
+
+
+@dataclass(frozen=True)
+class DecodeRates:
+    item_fixed_s: float
+    item_min_work_s: float
+    exchange_s: float
+    merge_head_s: float
+    merge_dim_s: float
+    # (head_dim, seconds per visible key for one head), ascending.
+    key_s: tuple[tuple[int, float], ...]
+    head_key_s: float
+    # Each extra pass of items re-enters the item loop late.
+    pass_s: float
+
+    @classmethod
+    def from_tree(cls, tree: Any) -> DecodeRates:
+        rates = tree.body("attention_decode")
+        return cls(
+            item_fixed_s=rates["item_fixed_s"],
+            item_min_work_s=rates["item_min_work_s"],
+            exchange_s=rates["exchange_s"],
+            merge_head_s=rates["merge_head_s"],
+            merge_dim_s=rates["merge_dim_s"],
+            key_s=tuple(sorted(
+                (int(name.removeprefix("key_s_")), value)
+                for name, value in rates.items()
+                if name.startswith("key_s_")
+            )),
+            head_key_s=rates["head_key_s"],
+            pass_s=rates["pass_s"],
+        )
+
+    def key_seconds(self, heads: int, head_dim: int) -> float:
+        base = dict(self.key_s).get(head_dim)
+        if base is None:
+            # Nearest measured head_dim, scaled by bytes.
+            nearest, value = min(self.key_s, key=lambda item: abs(item[0] - head_dim))
+            base = value * head_dim / nearest
+        return base + (heads - 1) * self.head_key_s
+
+
+@cache
+def default_decode_rates() -> DecodeRates:
+    """The Hopper spec file's rates: what a launch without a device tree uses."""
+    from ....device import load_spec
+
+    return DecodeRates.from_tree(load_spec("h100"))
+
+
+def decode_rates_of(config: BodyConfig) -> DecodeRates:
+    """The rates a decode body was configured with."""
+    return config.evidence.measurements.get("decode_rates") or default_decode_rates()
+
+
 _LAST_STAMP_BASE = 0
 
 
@@ -544,6 +599,7 @@ def emit_attention_body(
                 program, loads, batch, query_heads // group_size, group_size, head_dim,
                 kv_length, scale, threads, workers, config.scratch.size_bytes,
                 prologues, decode_window(attention), attention.softcap,
+                decode_rates_of(config),
             )
         if attention.mask.window_offsets is not None or attention.softcap:
             raise UnsupportedAttentionBody(
@@ -1059,19 +1115,14 @@ def _prologue_staging(
     return "".join(lines)
 
 
-def _decode_key_seconds(heads: int, head_dim: int) -> float:
-    known = sorted(DECODE_KEY_S)
-    base = DECODE_KEY_S.get(head_dim)
-    if base is None:
-        # Nearest measured head_dim, scaled by bytes.
-        nearest = min(known, key=lambda dim: abs(dim - head_dim))
-        base = DECODE_KEY_S[nearest] * head_dim / nearest
-    return base + (heads - 1) * DECODE_HEAD_KEY_S
-
-
 @cache
 def decode_split_steps(
-    rows: int, workers: int, heads: int, head_dim: int, kv_length: int
+    rows: int,
+    workers: int,
+    heads: int,
+    head_dim: int,
+    kv_length: int,
+    rates: DecodeRates | None = None,
 ) -> tuple[tuple[int, int], ...]:
     """(first visible key count, chunks in use) steps of the split cost model:
     for each key count the chunk count with the least modeled interval time,
@@ -1086,17 +1137,18 @@ def decode_split_steps(
     if _FORCE_CHUNKS:
         forced = min(_FORCE_CHUNKS, limit)
         return tuple(((count - 1) ** 2 + 1, count) for count in range(2, forced + 1))
-    per_key = _decode_key_seconds(heads, head_dim)
+    rates = rates or default_decode_rates()
+    per_key = rates.key_seconds(heads, head_dim)
 
     def cost(keys: int, chunks: int) -> float:
         passes = -(-rows * chunks // workers)
-        work = max(DECODE_ITEM_MIN_WORK_S, per_key * -(-keys // chunks))
+        work = max(rates.item_min_work_s, per_key * -(-keys // chunks))
         exchange = (
-            DECODE_EXCHANGE_S + chunks * (DECODE_MERGE_HEAD_S * heads + DECODE_MERGE_DIM_S * head_dim)
+            rates.exchange_s + chunks * (rates.merge_head_s * heads + rates.merge_dim_s * head_dim)
             if chunks > 1
             else 0.0
         )
-        return passes * (DECODE_ITEM_FIXED_S + work + exchange) + (passes - 1) * DECODE_PASS_S
+        return passes * (rates.item_fixed_s + work + exchange) + (passes - 1) * rates.pass_s
 
     steps: list[tuple[int, int]] = []
     current = 1
@@ -1107,6 +1159,33 @@ def decode_split_steps(
             steps.append((keys, best))
             current = best
     return tuple(steps)
+
+
+@dataclass(frozen=True)
+class RowSplit:
+    rows: int  # query rows (items before splitting)
+    chunks: int  # chunks each row's keys are split into
+    heads: int  # query heads one row packs
+    head_dim: int
+
+
+def decode_row_split(config: BodyConfig, workers: int, keys: int) -> RowSplit:
+    """How an attention body divides its work with ``keys`` visible keys on
+    ``workers`` CTAs: what the kernel does at run time, for the cost model."""
+    attention = config.semantic.semantics
+    grouping = attention.grouping
+    rows = grouping.batch * grouping.query_heads
+    if config.name != "attention_stateful_decode_rows" or not split_decode_head_dim(grouping.head_dim):
+        return RowSplit(rows, 1, 1, grouping.head_dim)
+    visible = min(keys, decode_window(attention) or keys)
+    packed = decode_packed_heads(grouping.group_size, grouping.head_dim)
+    heads = packed if visible >= DECODE_PACKED_KEYS_PER_HEAD * packed else 1
+    rows //= heads
+    steps = decode_split_steps(
+        rows, workers, heads, grouping.head_dim, max(1, visible), decode_rates_of(config)
+    )
+    chunks = max((count for first, count in steps if visible >= first), default=1)
+    return RowSplit(rows, chunks, heads, grouping.head_dim)
 
 
 @cache
@@ -1176,7 +1255,11 @@ def decode_packed_heads(group_size: int, head_dim: int) -> int:
 
 
 def decode_scratch_bytes(
-    head_grouping: HeadGrouping, kv_length: int, threads: int, workers: int
+    head_grouping: HeadGrouping,
+    kv_length: int,
+    threads: int,
+    workers: int,
+    rates: DecodeRates | None = None,
 ) -> int:
     """Shared scratch the split-context decode body needs to keep a chunk's
     scores in shared memory when ``workers`` CTAs run it."""
@@ -1185,7 +1268,7 @@ def decode_scratch_bytes(
     for heads in dict.fromkeys((1, packed)):
         rows = head_grouping.batch * head_grouping.query_heads // heads
         layout = _DecodeScratch(threads // 32, heads, head_grouping.head_dim)
-        steps = decode_split_steps(rows, workers, heads, head_grouping.head_dim, kv_length)
+        steps = decode_split_steps(rows, workers, heads, head_grouping.head_dim, kv_length, rates)
         sizes.append(layout.bytes(_modeled_capacity(steps, kv_length)))
     return max(sizes)
 
@@ -1213,6 +1296,7 @@ def _split_decode_attention_body(
     prologues: Mapping[str, Prologue] | None = None,
     window: int = 0,
     softcap: float = 0.0,
+    rates: DecodeRates | None = None,
 ) -> GeneratedAttentionBody:
     """One-token decode with each row's visible keys split into chunks that
     run on different CTAs (flash decoding), keeping the captured rounding
@@ -1239,7 +1323,7 @@ def _split_decode_attention_body(
             _decode_variant(
                 program, loads, batch, kv_heads, group_size, head_dim, kv_length, scale,
                 threads, workers, scratch_bytes, prologues or {}, heads, stamp_base,
-                window, softcap,
+                window, softcap, rates,
             )
             for heads in dict.fromkeys((1, packed))
         ]
@@ -1316,6 +1400,7 @@ def _decode_variant(
     stamp_base: int | None = None,
     window: int = 0,
     softcap: float = 0.0,
+    rates: DecodeRates | None = None,
 ) -> _DecodeVariant:
     """The item loop of split-context decode with ``heads_per_item`` query
     heads of one KV group per row, so each cached key and value row is read
@@ -1349,7 +1434,7 @@ def _decode_variant(
     rows = batch * kv_heads * tiles
     # At most this many keys are visible to a row.
     visible_limit = min(kv_length, window) if window else kv_length
-    steps = decode_split_steps(rows, workers, groups, head_dim, visible_limit)
+    steps = decode_split_steps(rows, workers, groups, head_dim, visible_limit, rates)
     chunks = steps[-1][1] if steps else 1
     capacity = _modeled_capacity(steps, visible_limit)
     choose_in_use = "    in_use = cutlass.Int32(1)\n" + "".join(

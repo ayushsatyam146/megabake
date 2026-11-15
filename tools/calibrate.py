@@ -33,6 +33,11 @@ def main() -> None:
     print("grid barrier: " + ", ".join(
         f"{k} CTAs {v * 1e6:.2f} us" for k, v in sorted(model.grid_barrier_s_by_ctas.items())))
     print(f"counter round trip {model.counter_round_trip_s * 1e6:.2f} us")
+    print("HBM write by busy CTAs: " + ", ".join(
+        f"{k}: {gb(v)}" for k, v in sorted(model.hbm_write_bytes_per_s_by_ctas.items())))
+    print(f"one warp's loads {gb(model.thread_load_bytes_per_s)}; "
+          f"dependent DRAM load {model.dram_latency_s * 1e9:.0f} ns; slowdown by HBM utilization: "
+          + ", ".join(f"{k:.2f}: {v:.2f}x" for k, v in sorted(model.contention_by_utilization.items())))
     print("tensor peak: " + ", ".join(f"{k} {v / 1e12:.0f} TFLOP/s" for k, v in model.tensor_peak_flops.items()))
     if args.out is not None:
         args.out.write_text(json.dumps(data, indent=2) + "\n")
