@@ -92,6 +92,10 @@ class ScheduledPhase:
     dependencies: tuple[str, ...]
     conversion_bodies: tuple[ConversionBody, ...] = ()
     barrier: PhaseBarrier | None = None
+    # Prerequisites that run earlier in this phase's own barrier interval: the
+    # producer publishes a counter per output tile and this phase waits on
+    # the tiles it reads (see _count_gemm_inputs).
+    counted: tuple[str, ...] = ()
     # Every worker runs all of this phase's work items before the other
     # phases of its barrier interval, which may then depend on it. Small
     # producers fold into the interval of their consumers this way instead
@@ -384,12 +388,92 @@ def make_phase_schedule(
             )
         )
 
+    if counted_gemm_enabled():
+        phases = _count_gemm_inputs(phases, dependencies, selected_by_region)
     return PhaseSchedule(
         tuple(phases),
         worker_count,
         dependencies.prerequisite_sets,
         selection,
         dependencies,
+    )
+
+
+def counted_gemm_enabled() -> bool:
+    """A decode GEMM whose activation is exactly another GEMM's output joins
+    that GEMM's interval and waits per K tile on the producer's tile counters
+    (MEGABAKE_COUNTED_GEMM=0: a grid barrier as before)."""
+    import os
+
+    return os.environ.get("MEGABAKE_COUNTED_GEMM", "1") == "1"
+
+
+def _count_gemm_inputs(
+    phases: list[ScheduledPhase], dependencies: DependencyPlan, selected_by_region
+) -> list[ScheduledPhase]:
+    """Drop the grid barrier in front of a GEMM whose prerequisites in the
+    previous interval are one unsplit GEMM producing its whole activation
+    (_counted_gemm_consumer); the consumer then waits on the producer's tile
+    counters, K tile by K tile, and overlaps the producer's last tiles.
+
+    Measured on Llama-3.2-1B decode (2026-11-19, 60 SMs): gate.up -> down,
+    1,529 -> 1,454 us. Doing the same for decode attention after q/k/v
+    (waiting on its heads' tiles) was 1,564 us and was removed. The memory
+    planner releases storage at the barrier that closes its last use, so the
+    merged interval keeps every buffer it touches distinct."""
+    phases = list(phases)
+    for index, phase in enumerate(phases):
+        if index == 0 or phases[index - 1].barrier is None:
+            continue
+        if not _counted_gemm_consumer(phase, dependencies, selected_by_region):
+            continue
+        # The interval that ends at index - 1 began after the barrier before it.
+        start = max(
+            (position + 1 for position in range(index - 1) if phases[position].barrier is not None),
+            default=0,
+        )
+        interval = {item.region_id: item for item in phases[start:index]}
+        needed = dependencies.prerequisites_for(phase.region_id) & set(interval)
+        if len(needed) == 1 and _counted_producer(interval[next(iter(needed))]):
+            phases[index - 1] = replace(phases[index - 1], barrier=None)
+            phases[index] = replace(phase, counted=tuple(needed))
+    return phases
+
+
+def _counted_gemm_consumer(phase: ScheduledPhase, dependencies, selected_by_region) -> bool:
+    """An unsplit swapAB GEMM with one token row whose activation (CUTLASS B,
+    the program's first load) is one GEMM's whole output, its K tile k that
+    GEMM's output tile k."""
+    if selected_by_region is None or not _counted_producer(phase):
+        return False
+    program = selected_by_region[phase.region_id].program
+    if program.store.shape[0] != 1:
+        return False
+    activation = program.loads[0].value_id
+    sources = [
+        dependency
+        for dependency in dependencies.dependencies
+        if dependency.consumer_region_id == phase.region_id and dependency.value_id == activation
+    ]
+    if len(sources) != 1:
+        return False
+    producer = selected_by_region.get(sources[0].producer_region_id)
+    if producer is None or producer.body.provider != "g0_range":
+        return False
+    reduction = next(
+        domain.size for domain in program.iteration_domains if domain.axis in program.reduction_axes
+    )
+    return tuple(producer.program.store.shape) == (1, reduction)
+
+
+def _counted_producer(phase: ScheduledPhase) -> bool:
+    import re
+
+    return (
+        phase.body.provider == "g0_range"
+        and phase.body.name.startswith("g0_range_swapab_")
+        and re.search(r"_k\d+(?=_|$)", phase.body.name) is None
+        and not phase.recompute
     )
 
 
@@ -410,13 +494,20 @@ def simulate_phase_schedule(schedule: PhaseSchedule) -> ScheduleSimulation:
             raise InvalidSchedule(
                 f"recompute phase {phase.index} follows a distributed phase of its interval"
             )
-        concurrent = schedule.prerequisites_for(phase.region_id) & (interval - recomputed)
+        counted = set(phase.counted)
+        if counted - interval:
+            raise InvalidSchedule(
+                f"phase {phase.index} counts on {sorted(counted - interval)} outside its interval"
+            )
+        concurrent = schedule.prerequisites_for(phase.region_id) & (
+            interval - recomputed - counted
+        )
         if concurrent:
             raise InvalidSchedule(
                 f"phase {phase.index} shares a barrier interval with its prerequisites "
                 f"{sorted(concurrent)}"
             )
-        missing = schedule.prerequisites_for(phase.region_id) - completed - recomputed
+        missing = schedule.prerequisites_for(phase.region_id) - completed - recomputed - counted
         if missing:
             raise InvalidSchedule(
                 f"phase {phase.index} has unfinished prerequisites {sorted(missing)}"

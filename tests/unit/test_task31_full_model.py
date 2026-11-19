@@ -222,3 +222,49 @@ def test_task31_plan_search_restores_state_between_runs():
     snapshot.reset()
     assert all(torch.equal(private, original) for private, original in snapshot.pairs)
     assert all(int(value.abs().sum()) == 0 for value in args[2:])
+
+
+def _table_decode_plan(monkeypatch, counted: str):
+    """The 2-layer SmolLM-architecture decode plan as a table launch."""
+    from megabake.bodies.catalog import launch_options
+
+    monkeypatch.setenv("MEGABAKE_COUNTED_GEMM", counted)
+    torch.manual_seed(31)
+    model = StatefulSmolLMArchitecture(layers=2, device="cpu", dtype=torch.bfloat16)
+    args = (
+        torch.empty(1, 1, dtype=torch.int64),
+        torch.empty(1, 1, dtype=torch.int64),
+        *(torch.empty(1, 4, 3, 64, dtype=torch.bfloat16) for _ in range(4)),
+        *(torch.empty(1, dtype=torch.int32) for _ in range(2)),
+    )
+    capture = capture_exported_program(
+        torch.export.export(model, args), args=args, model=model, model_name=SMOLLM_MODEL_NAME
+    )
+    graph = form_regions(canonicalize_semantics(import_fx(capture.graph, capture.context)))
+    policy = SelectionPolicy(
+        mode="decode",
+        table_launch=True,
+        target_options=launch_options(graph, _target(), True),
+    )
+    selection = select_bodies(graph, _target(), policy)
+    plan = assign_storage(make_phase_schedule(selection, derive_dependencies(selection)))
+    verify_plan(plan)
+    return plan
+
+
+def test_task31_down_projection_counts_on_its_gate_up(monkeypatch):
+    plan = _table_decode_plan(monkeypatch, "1")
+    counted = [phase for phase in plan.phases if phase.counted]
+    # One down projection per layer, each counting on its paired gate.up GEMM.
+    assert len(counted) == 2
+    by_region = {phase.region_id: phase for phase in plan.phases}
+    for phase in counted:
+        (producer,) = phase.counted
+        assert by_region[producer].body.name.startswith("g0_range_swapab_")
+        assert "_paired" in by_region[producer].body.name
+        # No barrier between the producer's interval and the consumer.
+        assert plan.phases[phase.index - 1].barrier is None
+    baseline = _table_decode_plan(monkeypatch, "0")
+    assert not any(phase.counted for phase in baseline.phases)
+    barriers = lambda p: sum(phase.barrier is not None for phase in p.phases)  # noqa: E731
+    assert barriers(baseline) == barriers(plan) + 2

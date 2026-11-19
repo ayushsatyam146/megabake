@@ -91,6 +91,8 @@ def make_plan_key(
         # The device tree's digest: the planner's choices follow its numbers.
         "device": device,
         "stall_inject_ring": os.environ.get("MEGABAKE_STALL_INJECT_RING"),
+        # Counted GEMMs change the schedule's barriers.
+        "counted_gemm": os.environ.get("MEGABAKE_COUNTED_GEMM", "1"),
     }
     encoded = json.dumps(
         _canonical(payload), sort_keys=True, separators=(",", ":"), allow_nan=False

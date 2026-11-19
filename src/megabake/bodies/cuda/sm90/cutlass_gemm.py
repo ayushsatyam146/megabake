@@ -744,6 +744,7 @@ class HopperWgmmaGemmPersistentKernel:
         c_address=None,
         epilogue_state=None,
         stream_tag=None,
+        publish=None,
     ):
         """Run one table-launched phase whose TMA descriptors live in global
         memory. ``prepared`` is this variant's ``prepare`` result; the kernel
@@ -789,6 +790,7 @@ class HopperWgmmaGemmPersistentKernel:
             c_address,
             epilogue_state,
             stream_tag,
+            publish,
         )
 
     @cute.jit
@@ -1172,6 +1174,7 @@ class HopperWgmmaGemmPersistentKernel:
         c_address=None,
         epilogue_state=None,
         stream_tag=None,
+        publish=None,
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -1419,6 +1422,30 @@ class HopperWgmmaGemmPersistentKernel:
                     tBgB_nkl = tBgB[(None, tile_coord_mnl[1], None, tile_coord_mnl[2])]
                     for k_tile in cutlass.range(k_tile_cnt, unroll=1):
                         cute.arch.mbarrier_wait(ring_empty + page, lap ^ 1)
+                        if cutlass.const_expr(publish is not None):
+                            # MegaBake: a counted consumer (mode 2) waits for
+                            # the producer tiles that are its K tiles of B, 32
+                            # at a time (one counter per lane, one L2 round
+                            # trip per poll), then orders their generic stores
+                            # before its TMA loads.
+                            wait_counters, wait_mode, wait_base = publish
+                            if wait_mode == 2:
+                                if k_tile % 32 == 0:
+                                    lane = cute.arch.lane_idx()
+                                    wait_tile = k_tile + lane
+                                    wait_seen = cutlass.Int32(1)
+                                    if wait_tile < k_tile_cnt:
+                                        wait_seen = cute.arch.load(
+                                            wait_counters.iterator + wait_base + wait_tile,
+                                            cutlass.Int32, sem="acquire", scope="gpu",
+                                        )
+                                    while cute.arch.vote_any_sync(wait_seen < cutlass.Int32(1)):
+                                        if wait_tile < k_tile_cnt:
+                                            wait_seen = cute.arch.load(
+                                                wait_counters.iterator + wait_base + wait_tile,
+                                                cutlass.Int32, sem="acquire", scope="gpu",
+                                            )
+                                    cute.arch.fence_proxy("async.global")
                         cute.copy(
                             tma_atom_b,
                             tBgB_nkl[(None, k_tile)],
@@ -1840,6 +1867,23 @@ class HopperWgmmaGemmPersistentKernel:
                             c_address,
                         )
 
+                if cutlass.const_expr(publish is not None and self.direct_store):
+                    # MegaBake: a counted consumer in this interval waits on
+                    # the tile's counter (schedule._count_gemm_inputs).
+                    # The store ended with a sync of the MMA threads.
+                    counters, publish_flag, publish_base = publish
+                    if publish_flag == 1:
+                        if tidx == self.num_dma_warp_groups * self.num_threads_per_warp_group:
+                            # The release is cumulative over the MMA threads'
+                            # stores ordered before it by the store's sync.
+                            cute.arch.red(
+                                counters.iterator + publish_base + tile_coord_mnl[0],
+                                cutlass.Int32(1),
+                                op="add",
+                                dtype="s32",
+                                sem="release",
+                                scope="gpu",
+                            )
                 if cutlass.const_expr(self.stamp_address != 0):
                     if tidx == self.num_dma_warp_groups * self.num_threads_per_warp_group:
                         self._stamp(stamp_item, 6)

@@ -873,6 +873,26 @@ def _emit_table_module(
         )
         return len(work_iterators) - 1
 
+    # Counted GEMMs (schedule._count_gemm_inputs): a dedicated counter per
+    # output tile of each producer GEMM, right after the stall slots, which
+    # the kernel prologue zeroes every call. Producer phase -> the base it
+    # publishes to; consumer phase -> the base its B loader waits on (its K
+    # tile k is the producer's output tile k).
+    publish_bases: dict[int, int] = {}
+    gemm_wait_bases: dict[int, int] = {}
+    wait_counters = 0
+    phase_of_region = {phase.region_id: phase for phase in plan.phases}
+    for phase in plan.phases:
+        if not phase.counted:
+            continue
+        if phase.body.provider != "g0_range" or len(phase.counted) != 1:
+            raise UnsupportedCodegen(f"phase {phase.index} cannot count on its producers")
+        produced = selected[phase.counted[0]].program
+        offset = STALL_COUNTER_SLOTS + wait_counters
+        publish_bases[phase_of_region[phase.counted[0]].index] = offset
+        gemm_wait_bases[phase.index] = offset
+        wait_counters += -(-produced.store.shape[1] // 64)
+
     for phase in plan.phases:
         selection = selected[phase.region_id]
         if phase.body.provider == "g0_range":
@@ -1225,8 +1245,8 @@ def _emit_table_module(
     # phase-scratch region; later intervals reuse the regions.
     # Counter slots 0 and 1 hold the stall region's address (X0.3).
     float_elements = 0
-    counter_count = STALL_COUNTER_SLOTS
-    float_offset, counter_offset = 0, STALL_COUNTER_SLOTS
+    counter_count = STALL_COUNTER_SLOTS + wait_counters
+    float_offset, counter_offset = 0, STALL_COUNTER_SLOTS + wait_counters
     for index, phase in enumerate(plan.phases):
         floats, counters = phase_scratch.get(phase.index, (0, 0))
         if floats or counters:
@@ -1237,7 +1257,19 @@ def _emit_table_module(
             float_elements = max(float_elements, float_offset)
             counter_count = max(counter_count, counter_offset)
         if phase.barrier is not None:
-            float_offset, counter_offset = 0, STALL_COUNTER_SLOTS
+            float_offset, counter_offset = 0, STALL_COUNTER_SLOTS + wait_counters
+    # Counted GEMM rows: column 4 is the mode (1 publishes per output tile,
+    # 2 waits per K tile), column 5 the counter base. Unsplit GEMM rows use
+    # neither column otherwise.
+    for index, phase in enumerate(plan.phases):
+        if phase.index in publish_bases and phase.index in gemm_wait_bases:
+            raise UnsupportedCodegen(f"phase {phase.index} would both publish and wait")
+        if phase.index in publish_bases:
+            row = phase_rows[index]
+            phase_rows[index] = (*row[:4], 1, publish_bases[phase.index], *row[6:])
+        if phase.index in gemm_wait_bases:
+            row = phase_rows[index]
+            phase_rows[index] = (*row[:4], 2, gemm_wait_bases[phase.index], *row[6:])
 
     # Every body starts its tiles at CTA 0. Phases in one barrier interval run
     # concurrently, so each starts where the previous phase's tiles ended.
@@ -1315,6 +1347,10 @@ def _emit_table_module(
         ring_pages = min(wanted, free // ((64 * 64 + 16 * 64) * 2)) // 2 * 2
         if ring_pages < 8 or (staging is not None and not staging.producer):
             producer, ring_pages = False, 0
+    if gemm_wait_bases and not ring_pages:
+        raise UnsupportedCodegen(
+            "counted GEMMs wait in the ring-mode B loader; set MEGABAKE_COUNTED_GEMM=0"
+        )
     launch_threads = plan.launch.threads_per_block + (128 if producer else 0)
     for gemm_variant, spec in gemm_variant_specs.items():
         kinds = variant_epilogues.get(gemm_variant, [])
@@ -1420,6 +1456,11 @@ def _emit_table_module(
                 *(
                     ["                stream_tag=phase_table[phase, 6] + 1,"]
                     if gemm_variant in streamed_variants
+                    else []
+                ),
+                *(
+                    ["                publish=(phase_counters, phase_table[phase, 4], phase_table[phase, 5]),"]
+                    if publish_bases and spec["splits"] == 1
                     else []
                 ),
                 "            )",
@@ -1557,6 +1598,14 @@ def _emit_table_module(
         "        if _thread == 0:\n"
         "            publish_stall_base(phase_counters, _stall_base)\n"
         if stall_timeout > 0
+        else ""
+    ) + (
+        # Counted-GEMM counters start every call at zero; the first grid
+        # barrier orders this before any publish.
+        "    if _block == 0:\n"
+        f"        for _wait in cutlass.range(_thread, {wait_counters}, {plan.launch.threads_per_block}, unroll=1):\n"
+        f"            phase_counters[{STALL_COUNTER_SLOTS} + _wait] = cutlass.Int32(0)\n"
+        if wait_counters
         else ""
     )
     dynamic_writes = (
