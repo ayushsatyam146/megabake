@@ -253,6 +253,8 @@ def _table_decode_plan(monkeypatch, counted: str):
 
 
 def test_task31_down_projection_counts_on_its_gate_up(monkeypatch):
+    # Counted GEMMs join two WGMMA bodies; a GEMV down projection has none.
+    monkeypatch.setenv("MEGABAKE_GEMV", "0")
     plan = _table_decode_plan(monkeypatch, "1")
     counted = [phase for phase in plan.phases if phase.counted]
     # One down projection per layer, each counting on its paired gate.up GEMM.

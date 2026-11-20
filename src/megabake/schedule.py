@@ -388,7 +388,7 @@ def make_phase_schedule(
             )
         )
 
-    if counted_gemm_enabled():
+    if counted_gemm_enabled() and _ring_possible(phases):
         phases = _count_gemm_inputs(phases, dependencies, selected_by_region)
     return PhaseSchedule(
         tuple(phases),
@@ -406,6 +406,22 @@ def counted_gemm_enabled() -> bool:
     import os
 
     return os.environ.get("MEGABAKE_COUNTED_GEMM", "1") == "1"
+
+
+def _ring_possible(phases: list[ScheduledPhase]) -> bool:
+    """Whether codegen can give this schedule the producer ring, which
+    counted GEMMs wait in: one split-K GEMM (a ``_k<n>`` body) takes the
+    ring from the whole kernel (planner.producer_possible). Without the ring
+    the GEMMs keep their grid barriers; counting them would fail in codegen
+    (seen on 132 SMs, where the planner splits the narrow projections)."""
+    import re
+
+    from .runtime import producer_warp_enabled
+
+    return producer_warp_enabled() and not any(
+        phase.body.provider == "g0_range" and re.search(r"_k\d+(?=_|$)", phase.body.name)
+        for phase in phases
+    )
 
 
 def _count_gemm_inputs(

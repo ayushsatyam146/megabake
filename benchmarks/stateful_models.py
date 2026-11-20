@@ -135,9 +135,14 @@ class StatefulCausalLM(torch.nn.Module):
         hidden = self.model.embed_tokens(input_ids)
         position_ids = position_ids.to(torch.int64)
         rotary = {}
+        rotary_positions = position_ids
+        if hasattr(self.model.rotary_emb, "mrope_section") and position_ids.ndim == 2:
+            # Multimodal RoPE (Qwen3.5) takes (3, batch, positions); text-only
+            # input repeats the same positions, as the Hugging Face model does.
+            rotary_positions = position_ids[None].expand(3, *position_ids.shape)
         for kind in set(self.layer_types) - {"linear_attention"}:
             arguments = (kind,) if self.rotary_takes_type else ()
-            rotary[kind] = self.model.rotary_emb(hidden, position_ids, *arguments)
+            rotary[kind] = self.model.rotary_emb(hidden, rotary_positions, *arguments)
         offset = 0
         for layer, kind in zip(self.model.layers, self.layer_types, strict=True):
             residual = hidden

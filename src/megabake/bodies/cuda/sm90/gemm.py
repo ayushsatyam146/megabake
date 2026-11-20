@@ -608,6 +608,15 @@ def plan_splits(
     if not counts:
         return ()
     staged = token_rows == 16 and producer_warp_enabled()
+    if staged:
+        # Keep the producer. Its gain is run-ahead: the next interval's weights
+        # load during norms, attention and barriers. The per-interval model
+        # below has no term for that (fitted on a full H200, staged_start_s
+        # 1.44 us against start_s 1.42 us), so it prefers split-K. Measured on
+        # Llama-3.2-1B decode, 132 SMs (2026-11-20): split q/k/v with no
+        # producer 1,327-1,330 us; unsplit with the producer 1,176 us, and
+        # 1,159 us with counted GEMMs, which need the producer.
+        return ()
 
     def seconds(tiles: int, k_tiles: int, token: int, splits: int, staged: bool) -> float:
         tile_bytes = 64 * k_tiles * 64 * 2 + (token * k_tiles * 64 + token * 64) * 2

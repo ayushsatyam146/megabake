@@ -93,6 +93,16 @@ def make_plan_key(
         "stall_inject_ring": os.environ.get("MEGABAKE_STALL_INJECT_RING"),
         # Counted GEMMs change the schedule's barriers.
         "counted_gemm": os.environ.get("MEGABAKE_COUNTED_GEMM", "1"),
+        # Forced split-K changes the selected GEMM bodies.
+        "split_k_force": os.environ.get("MEGABAKE_SPLIT_K_FORCE"),
+        # CTA balancing changes every phase's rotation.
+        "balance_ctas": os.environ.get("MEGABAKE_BALANCE_CTAS", "0"),
+        # GEMV bodies change the selected bodies of narrow decode GEMMs.
+        "gemv": (
+            os.environ.get("MEGABAKE_GEMV", "1"),
+            os.environ.get("MEGABAKE_GEMV_MIN_ROWS"),
+            os.environ.get("MEGABAKE_GEMV_MAX_ROWS"),
+        ),
     }
     encoded = json.dumps(
         _canonical(payload), sort_keys=True, separators=(",", ":"), allow_nan=False

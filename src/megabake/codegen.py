@@ -1271,13 +1271,16 @@ def _emit_table_module(
             row = phase_rows[index]
             phase_rows[index] = (*row[:4], 2, gemm_wait_bases[phase.index], *row[6:])
 
-    # Every body starts its tiles at CTA 0. Phases in one barrier interval run
-    # concurrently, so each starts where the previous phase's tiles ended.
-    # Recompute phases run every tile on every CTA; rotation -1 marks them.
+    # Phases in one barrier interval run concurrently, so each starts where the
+    # previous phase's tiles ended. Recompute phases run every tile on every
+    # CTA; rotation -1 marks them. Each interval starts at the CTA offset that
+    # keeps the weight bytes streamed per CTA even across the kernel
+    # (_balanced_interval_starts).
+    starts = _balanced_interval_starts(plan, phase_tiles, selected)
     offset = 0
     for index, phase in enumerate(plan.phases):
         if index == 0 or plan.phases[index - 1].barrier is not None:
-            offset = 0
+            offset = starts[index]
         row = phase_rows[index]
         if phase.recompute:
             phase_rows[index] = (*row[:2], -1, *row[3:])
@@ -2012,6 +2015,81 @@ def _read_only_input(plan: KernelPlan, argument: TensorArgument) -> bool:
         for selection in plan.selection.selections
         for output in selection.outputs
     )
+
+
+def balance_ctas_enabled() -> bool:
+    """MEGABAKE_BALANCE_CTAS=1 balances weight bytes per CTA across barrier
+    intervals (_balanced_interval_starts). Off by default: on Llama-3.2-1B
+    decode (132 SMs, 2026-11-20) it took a no-barrier replay of the weight
+    stream from 809 to 593 us, but the kernel from 1,165 to 1,172 us, since
+    each interval is bound by its own slowest CTA. Off, every interval starts
+    its tiles at CTA 0."""
+    import os
+
+    return os.environ.get("MEGABAKE_BALANCE_CTAS", "0") == "1"
+
+
+def _gemm_tile_bytes(phase: Any, selected: Mapping[str, Any]) -> int:
+    """Weight bytes one work unit of a decode GEMM phase streams: 64 weight
+    rows (128 for a paired GEMM) over its share of K; 0 for other bodies."""
+    if phase.body.provider != "g0_range":
+        return 0
+    program = selected[phase.region_id].program
+    reduction = next(
+        domain.size for domain in program.iteration_domains if domain.axis in program.reduction_axes
+    )
+    rows = 128 if is_paired(phase.body) else 64
+    return rows * reduction * 2 // max(1, split_k(phase.body))
+
+
+def _balanced_interval_starts(
+    plan: KernelPlan, phase_tiles: Sequence[int], selected: Mapping[str, Any]
+) -> dict[int, int]:
+    """The CTA each barrier interval's first tile goes to, keyed by the index
+    of the interval's first phase.
+
+    Tile j of a phase runs on CTA (rotation + j) mod workers. Starting every
+    interval at CTA 0 puts every narrow projection on the same CTAs: on a
+    132-SM H200, Llama-3.2-1B's q, o and down (32 tiles each) gave CTAs 0-27
+    up to 46 MB of weights per token against a mean of 18.7 MB, and a no-math
+    replay of that stream (experiments/x10_streaming_ceiling) ran at 70% of
+    HBM bandwidth. Each interval here starts where the busiest CTA it would
+    load is least loaded so far, counting GEMM weight bytes."""
+    workers = plan.launch.grid_size
+    starts: dict[int, int] = {}
+    intervals: list[list[int]] = []
+    for index in range(len(plan.phases)):
+        if index == 0 or plan.phases[index - 1].barrier is not None:
+            intervals.append([])
+        intervals[-1].append(index)
+    if not balance_ctas_enabled():
+        return {interval[0]: 0 for interval in intervals}
+    load = [0] * workers
+    for interval in intervals:
+        units: list[int] = []  # weight bytes of the interval's tiles, in placement order
+        for index in interval:
+            phase = plan.phases[index]
+            if phase.recompute:
+                continue
+            units.extend([_gemm_tile_bytes(phase, selected)] * phase_tiles[index])
+        if not any(units):
+            starts[interval[0]] = 0
+            continue
+        best, best_score = 0, None
+        for start in range(workers):
+            added = [0] * workers
+            for position, size in enumerate(units):
+                added[(start + position) % workers] += size
+            peak = max(load[cta] + added[cta] for cta in range(workers))
+            # Ties: the window whose CTAs carry the least so far.
+            touched = sum(load[cta] * added[cta] for cta in range(workers))
+            score = (peak, touched)
+            if best_score is None or score < best_score:
+                best, best_score = start, score
+        starts[interval[0]] = best
+        for position, size in enumerate(units):
+            load[(best + position) % workers] += size
+    return starts
 
 
 def _weight_stream_schedule(

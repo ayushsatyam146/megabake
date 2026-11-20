@@ -79,11 +79,21 @@ def test_split_planner_keeps_decode_gemms_whole_on_the_slice():
     assert plan_splits(programs, 16, TREE) == ()
 
 
-def test_split_planner_splits_where_few_leaves_leave_the_edge_idle():
-    # The same kernel on a device whose leaves each pull little of the edge.
+def test_split_planner_splits_where_few_leaves_leave_the_edge_idle(monkeypatch):
+    # The same kernel on a device whose leaves each pull little of the edge,
+    # with no producer to lose: the model's split choice applies.
+    monkeypatch.setenv("MEGABAKE_PRODUCER_WARP", "0")
     slow_leaves = replace(load_spec("mi300x"), bodies=TREE.bodies, sync=TREE.sync)
     splits = dict(plan_splits([_program(1, 576, 8192)] * 30, 16, slow_leaves))
     assert splits[(9, 128)] > 1
+
+
+def test_split_planner_keeps_the_producer_when_it_can_have_one():
+    # A split GEMM takes the producer from every GEMM; its run-ahead is not in
+    # the per-interval model, and keeping it measured 12.5% faster on Llama-1B
+    # decode at 132 SMs. So with a producer, decode GEMMs stay whole.
+    slow_leaves = replace(load_spec("mi300x"), bodies=TREE.bodies, sync=TREE.sync)
+    assert plan_splits([_program(1, 576, 8192)] * 30, 16, slow_leaves) == ()
 
 
 def _layer(tree, tile_bytes: float):
@@ -162,9 +172,11 @@ def test_a_planned_graph_carries_its_mapping_on_any_hopper_tree(sms):
     assert all(candidate.plan is None or candidate.plan.mapping is None for candidate in plain.candidates)
 
 
-def test_only_a_calibrated_tree_changes_the_kernel():
+def test_only_a_calibrated_tree_changes_the_kernel(monkeypatch):
     from megabake.bodies.cuda.sm90.gemm import launch_options
 
+    # The model decides splits only without a producer (see above).
+    monkeypatch.setenv("MEGABAKE_PRODUCER_WARP", "0")
     # A shape the slow-leaf device splits (see above), as a launch's graph.
     graph = SimpleNamespace(
         ops={f"op:{index}": SimpleNamespace(tensor_program=_program(1, 576, 8192)) for index in range(30)}

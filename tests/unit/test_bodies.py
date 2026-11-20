@@ -510,7 +510,7 @@ def test_catalog_offers_a_target_the_generic_and_its_generation_providers():
     def names(target):
         return [provider.provider_name for provider in catalog.providers(target)]
 
-    assert names(_target()) == ["generic", "g0_range", "attention"]
+    assert names(_target()) == ["generic", "g0_range", "gemv", "attention"]
     assert names(_target(architecture="sm100")) == ["generic", "blackwell_mma"]
     assert names(_target(architecture="sm80")) == ["generic"]
     assert catalog.provider("attention").provider_name == "attention"

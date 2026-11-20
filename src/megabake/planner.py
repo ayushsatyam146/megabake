@@ -447,6 +447,9 @@ def _contraction_body_order(
     mode_priority = 0 if (policy.mode == "decode") == small_m else 1
     small_tile = config.tiles.cta_shape[-1] <= 64
     return (
+        # The GEMV provider offers itself only for decode GEMMs whose 64-row
+        # tensor-core tiles leave SMs idle (bodies/cuda/sm90/gemv.py).
+        0 if config.provider == "gemv" else 1,
         0 if config.evidence.measured else 1,
         0 if config.tiles.mma_family else 1,
         0 if small_tile == small_m else 1,

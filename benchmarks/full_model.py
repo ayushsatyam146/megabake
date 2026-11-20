@@ -440,7 +440,8 @@ class HFStaticDecode:
             # layers: Hugging Face's sliding static cache keeps a Python
             # length that recompiles the graph on every call.
             config.layer_types = ["full_attention"] * len(config.layer_types)
-            config.sliding_window = None
+            # sliding_window stays set: Gemma 3 builds its sliding mask
+            # whatever the layer types, and raises without a window.
             if hasattr(config, "use_sliding_window"):
                 config.use_sliding_window = False
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -518,14 +519,22 @@ def bench_hf_contexts(name: str, revision: str | None, args) -> dict:
     with torch.no_grad():
         for context in sorted(args.decode_contexts):
             torch._dynamo.reset()
-            step = HFStaticDecode(
-                name, revision, context + 2 * args.samples + 8, args.batch, args.hf_attention
-            )
-            step(token, torch.tensor([[0]], device="cuda"))
-            rows.update(_time_contexts(step, token, [context], args))
+            step = None
+            try:
+                step = HFStaticDecode(
+                    name, revision, context + 2 * args.samples + 8, args.batch, args.hf_attention
+                )
+                step(token, torch.tensor([[0]], device="cuda"))
+                rows.update(_time_contexts(step, token, [context], args))
+            except Exception as error:  # noqa: BLE001 - one context's failure keeps the others
+                print(f"inductor_hf @{context}: FAILED {type(error).__name__}: {error}", flush=True)
+                rows[str(context)] = {"error": f"{type(error).__name__}: {error}"}
             del step
             torch.cuda.empty_cache()
-    summary = {context: round(row["pipelined_call_us"]) for context, row in rows.items()}
+    summary = {
+        context: round(row["pipelined_call_us"]) if "pipelined_call_us" in row else "FAILED"
+        for context, row in rows.items()
+    }
     print(f"decode_contexts_inductor_hf pipelined_call_us: {json.dumps(summary)}", flush=True)
     return rows
 
