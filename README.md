@@ -103,14 +103,18 @@ For CUDA development, install the optional compiler toolchain as well:
 uv sync --locked --extra dev --extra cuda --python 3.13
 ```
 
-For a library installation with pip, run from the checkout in an active Python environment:
+To install with pip in an active Python environment, then check the result:
 
 ```bash
-python -m pip install 'torch>=2.14' --index-url https://download.pytorch.org/whl/cu130
-python -m pip install .
+python -m pip install 'megabake @ git+https://github.com/megabake/megabake.git'
+megabake doctor --cuda
 ```
 
-For a pip development install, replace `.` with `-e '.[dev]'`. To install directly from GitHub, replace `.` with `'megabake @ git+https://github.com/aka-vm/megabake.git'`. The package exposes `import megabake` and the `megabake` CLI. Pip needs the explicit PyTorch install above because it does not read UV's CUDA index configuration.
+This installs PyTorch 2.14, Transformers, NumPy and, on Linux, the CUTLASS DSL. The package exposes `import megabake` and the `megabake` CLI. From a checkout, use `python -m pip install .`, or `-e '.[dev]'` for development. Pip does not read UV's CUDA index configuration, so it takes PyTorch from PyPI. On Linux aarch64 (for example DGX Spark), that is the CUDA 13.0 build. If `megabake doctor` reports another CUDA build, install PyTorch from the CUDA 13.0 index first:
+
+```bash
+python -m pip install 'torch>=2.14,<2.15' --index-url https://download.pytorch.org/whl/cu130
+```
 
 Point `CUDA_HOME` at the CUDA 13.0 toolkit before compiling kernels, especially if `/usr/local/cuda` selects another version:
 
@@ -125,6 +129,12 @@ Check the selected Python, PyTorch CUDA build, GPU visibility, and CUDA compiler
 python --version
 python -c 'import torch; print("torch:", torch.__version__); print("CUDA runtime:", torch.version.cuda); print("GPU available:", torch.cuda.is_available())'
 nvcc --version  # should report release 13.0
+```
+
+Or run all of these checks at once; add `--cuda` to fail instead of warn when a GPU piece is missing:
+
+```bash
+megabake doctor --cuda
 ```
 
 Activate the environment again in new shells with `source .venv/bin/activate`.

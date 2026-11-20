@@ -54,3 +54,19 @@ def test_transformers_cli_dumps_all_graphs(tmp_path, monkeypatch):
     assert (output_directory / "compute_graph.txt").is_file()
     assert (output_directory / "lowering_graph.txt").is_file()
     assert (output_directory / "region_graph.txt").is_file()
+
+
+def test_export_cli_turns_json_lists_into_tensors(tmp_path, monkeypatch, capsys):
+    (tmp_path / "tiny_export_model.py").write_text(
+        "import torch\n\n"
+        "class Double(torch.nn.Module):\n"
+        "    def forward(self, x):\n"
+        "        return x * 2\n\n"
+        "model = Double()\n"
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    exit_code = main(["export", "--callable", "tiny_export_model:model", "--arg", "[[1.0, 2.0]]"])
+
+    assert exit_code == 0
+    assert "export: PASS tensor(shape=(1, 2)" in capsys.readouterr().out

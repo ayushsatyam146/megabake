@@ -5,11 +5,13 @@ import importlib
 import json
 import re
 from collections.abc import Sequence
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from .doctor import format_checks, run_checks
 from .frontend import make_backend
 from .fx_handler.export import capture_exported_program
 from .fx_handler.transformers import capture_transformer
@@ -112,7 +114,9 @@ def _run_transformers(args: argparse.Namespace) -> int:
 
 
 def _json_value(value: str) -> Any:
-    return json.loads(value)
+    """Parse a JSON argument; a list becomes a tensor, since torch.export traces tensors."""
+    parsed = json.loads(value)
+    return torch.tensor(parsed) if isinstance(parsed, list) else parsed
 
 
 def _run_export(args: argparse.Namespace) -> int:
@@ -221,6 +225,19 @@ def _run_megakernel(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_doctor(args: argparse.Namespace) -> int:
+    checks = run_checks(require_cuda=args.cuda)
+    print(format_checks(checks))
+    return 1 if any(check.status == "fail" for check in checks) else 0
+
+
+def _package_version() -> str:
+    try:
+        return version("megabake")
+    except PackageNotFoundError:
+        return "unknown"
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--mode", choices=("prefill", "decode"), default=argparse.SUPPRESS)
@@ -228,7 +245,7 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--no-cache", action="store_true", default=argparse.SUPPRESS)
     common.add_argument("--dump-dir", default=argparse.SUPPRESS)
     parser = argparse.ArgumentParser(prog="megabake", parents=[common])
-    parser.add_argument("--version", action="version", version="megabake 0.1.0")
+    parser.add_argument("--version", action="version", version=f"megabake {_package_version()}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     demo = subparsers.add_parser("demo", parents=[common])
@@ -274,6 +291,14 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--arg", action="append", default=[], metavar="JSON")
     export_parser.add_argument("--kwarg", action="append", default=[], metavar="NAME=JSON")
     export_parser.set_defaults(handler=_run_export)
+
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="check Python, PyTorch, GPU and CUDA toolkit setup"
+    )
+    doctor_parser.add_argument(
+        "--cuda", action="store_true", help="treat missing CUDA pieces as failures, not warnings"
+    )
+    doctor_parser.set_defaults(handler=_run_doctor)
     return parser
 
 

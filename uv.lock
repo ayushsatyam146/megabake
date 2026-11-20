@@ -439,9 +439,12 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "huggingface-hub" },
+    { name = "numpy" },
+    { name = "nvidia-cutlass-dsl", extra = ["cu13"], marker = "sys_platform == 'linux'" },
     { name = "safetensors" },
     { name = "torch", version = "2.14.1", source = { registry = "https://pypi.org/simple" }, marker = "sys_platform != 'linux'" },
     { name = "torch", version = "2.14.1+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux'" },
+    { name = "transformers" },
 ]
 
 [package.optional-dependencies]
@@ -450,26 +453,25 @@ cuda = [
     { name = "nvidia-cutlass-dsl", extra = ["cu13"] },
 ]
 dev = [
-    { name = "numpy" },
     { name = "pre-commit" },
     { name = "pytest" },
     { name = "ruff" },
-    { name = "transformers" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "huggingface-hub", specifier = ">=1.33.0,<2.0" },
-    { name = "numpy", marker = "extra == 'dev'", specifier = ">=2.5.3" },
+    { name = "numpy", specifier = ">=2.5.3" },
     { name = "nvidia-cutlass", marker = "extra == 'cuda'", specifier = ">=4.2.0.0" },
+    { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "sys_platform == 'linux'", specifier = "==4.8.0" },
     { name = "nvidia-cutlass-dsl", extras = ["cu13"], marker = "extra == 'cuda'", specifier = "==4.8.0" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=4.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.1.1" },
     { name = "ruff", marker = "extra == 'dev'", specifier = "==0.17.3" },
     { name = "safetensors", specifier = ">=0.8.0" },
-    { name = "torch", marker = "sys_platform != 'linux'", specifier = ">=2.14" },
-    { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.14", index = "https://download.pytorch.org/whl/cu130" },
-    { name = "transformers", marker = "extra == 'dev'", specifier = ">=5.18.0" },
+    { name = "torch", marker = "sys_platform != 'linux'", specifier = ">=2.14,<2.15" },
+    { name = "torch", marker = "sys_platform == 'linux'", specifier = ">=2.14,<2.15", index = "https://download.pytorch.org/whl/cu130" },
+    { name = "transformers", specifier = ">=5.18.0" },
 ]
 provides-extras = ["cuda", "dev"]
 

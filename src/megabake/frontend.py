@@ -15,7 +15,8 @@ from torch.utils import _pytree as pytree
 from .diagnostics import CompilerError
 from .fx_handler.utils import dump_graph
 
-_PINNED_TORCH = (2, 14)
+PINNED_TORCH = (2, 14)
+SUPPORTED_CAPABILITIES = frozenset({(9, 0), (10, 0), (10, 3), (12, 0), (12, 1)})
 
 
 @dataclass
@@ -202,7 +203,7 @@ def _cse_key(target: Any, args: Any, kwargs: Any) -> Any:
     return key
 
 
-def _torch_version() -> tuple[int, int]:
+def torch_version() -> tuple[int, int]:
     match = re.match(r"(\d+)\.(\d+)", torch.__version__)
     if match is None:
         raise RuntimeError(f"Cannot parse PyTorch version {torch.__version__!r}")
@@ -210,9 +211,9 @@ def _torch_version() -> tuple[int, int]:
 
 
 def _check_torch_version() -> None:
-    if _torch_version() != _PINNED_TORCH:
+    if torch_version() != PINNED_TORCH:
         raise RuntimeError(
-            f"MegaBake supports PyTorch {_PINNED_TORCH[0]}.{_PINNED_TORCH[1]}; "
+            f"MegaBake supports PyTorch {PINNED_TORCH[0]}.{PINNED_TORCH[1]}; "
             f"found {torch.__version__}"
         )
 
@@ -670,7 +671,7 @@ def _can_auto_compile(example_inputs: Sequence[Any]) -> bool:
         capability = torch.cuda.get_device_capability(tensors[0].device)
     except Exception:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
         return False
-    return capability in {(9, 0), (10, 0), (10, 3), (12, 0), (12, 1)}
+    return capability in SUPPORTED_CAPABILITIES
 
 
 def prepare_fx_graph(
