@@ -43,11 +43,18 @@ def main() -> None:
     parser.add_argument("--model", required=True)
     parser.add_argument("--tokens", type=int, default=64)
     parser.add_argument("--capacity", type=int, default=256)
+    parser.add_argument("--revision", help="pinned checkpoint revision (required with MEGABAKE_TRUST_REMOTE_CODE=1)")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    import os
+
+    trust = os.environ.get("MEGABAKE_TRUST_REMOTE_CODE") == "1"
+    tokenizer = AutoTokenizer.from_pretrained(args.model, revision=args.revision, trust_remote_code=trust)
+    # The references' own SDPA (remote-code models) must not pick cuDNN's
+    # backend: this box lacks libcudnn_engines_runtime_compiled.
+    torch.backends.cuda.enable_cudnn_sdp(False)
     prompt = tokenizer(TEXT, return_tensors="pt").input_ids[0].tolist()
-    model = _load(args.model, None, "eager")
+    model = _load(args.model, args.revision, "eager")
     with torch.no_grad():
         hf_model = copy.deepcopy(model)
         hf_model.config.use_cache = True

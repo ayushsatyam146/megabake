@@ -304,6 +304,27 @@ def _effects(node: torch.fx.Node) -> dict[str, Any]:
     return {"unknown": False, "mutates_inputs": bool(schema.is_mutable)}
 
 
+def _with_mutated_operands(
+    effects: dict[str, Any],
+    node: torch.fx.Node,
+    node_values: Mapping[torch.fx.Node, tuple[str, ...]],
+) -> dict[str, Any]:
+    """Add ``mutated_operands``, the values a mutable op's schema says it
+    writes, when the op names them (``megabake::linear_attention`` writes
+    only its state; its weights stay read-only)."""
+    schema = getattr(node.target, "_schema", None)
+    if not effects.get("mutates_inputs") or schema is None:
+        return effects
+    mutated: list[str] = []
+    for index, argument in enumerate(schema.arguments):
+        if argument.alias_info is None or not argument.alias_info.is_write:
+            continue
+        value = node.args[index] if index < len(node.args) else node.kwargs.get(argument.name)
+        if isinstance(value, torch.fx.Node):
+            mutated.extend(item for item in node_values[value] if item not in mutated)
+    return {**effects, "mutated_operands": tuple(mutated)}
+
+
 def _operand_ids(
     node: torch.fx.Node, node_values: Mapping[torch.fx.Node, tuple[str, ...]]
 ) -> tuple[str, ...]:
@@ -452,7 +473,7 @@ def import_fx(graph: torch.fx.GraphModule, context: Any) -> ComputeGraph:
                 "fx_kwargs": node.kwargs,
             },
             tensor_program=None,
-            effects=_effects(node),
+            effects=_with_mutated_operands(_effects(node), node, node_values),
             numerical_rules={"known": False, "reason": "task-03 lowering pending"},
             source_location=getattr(node, "stack_trace", None),
             result_reconstruction=result_reconstruction,

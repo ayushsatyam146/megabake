@@ -26,6 +26,7 @@ from ...interface import (
     access_effects,
     widened_participants,
 )
+from . import linear_attention
 
 
 def split_decode_head_dim(head_dim: int) -> bool:
@@ -110,11 +111,15 @@ class AttentionBodyProvider:
         defer_length_publish: bool = False,
         workers: int | None = None,
     ) -> GeneratedAttentionBody:
+        if config.name == linear_attention.BODY_NAME:
+            return linear_attention.emit(program, config)
         return emit_attention_body(
             program, config, defer_length_publish=defer_length_publish, workers=workers
         )
 
     def widen(self, program: Any, config: BodyConfig, threads: int) -> BodyConfig:
+        if config.name == linear_attention.BODY_NAME:
+            return linear_attention.widen(config, threads)
         # Decode attention keeps a statistic and a head-dim row of value
         # partials per warp in its shared scratch.
         head_dim = config.tiles.cta_shape[-1]
@@ -145,6 +150,9 @@ class AttentionBodyProvider:
         attention = region.semantics
         if not isinstance(attention, Attention):
             return reject("region semantics are not attention")
+        if attention.recurrent is not None:
+            # Linear attention: no scores, masks or KV cache.
+            return linear_attention.candidates(region, program, attention, target)
 
         if attention.numerics != HF_EAGER_NUMERICS:
             return reject("provider preserves only the captured BF16/float32 policy")

@@ -260,10 +260,66 @@ class Prologue:
 
 
 @dataclass(frozen=True)
-class Attention:
-    """Softmax attention over the query, key and value accesses."""
+class LinearRecurrence:
+    """Linear attention (``algorithm="linear"``): one decode token of a
+    recurrence over a per-value-head state ``S`` of ``head_k_dim x
+    head_v_dim`` FP32 elements (``megabake::linear_attention``).
 
-    algorithm: Literal["stable_softmax", "online_softmax"]
+    One form covers Gated DeltaNet (Qwen3.5, Qwen3-Next), Kimi Delta
+    Attention, Mamba2 and plain gated linear attention:
+
+    1. ``x`` = causal conv(qkv), through SiLU when ``conv_silu``, when
+       ``conv_kernel`` is set, else qkv;
+       q, k and v are channel ranges of ``x`` from their offsets;
+    2. q and k L2-normalized when ``qk_l2norm``; q scaled by ``Attention.scale``;
+    3. log decay ``g``: ``-exp(A_log) * softplus(a + dt_bias)`` (``decay=
+       "softplus_gate"``) or the input itself (``"log"``), one per head or,
+       with ``decay_per_key``, one per key dimension;
+    4. ``S <- exp(g) * S``, then ``S <- S + k u^T`` with ``u = sigmoid(b)
+       (v - k^T S)`` (``update="delta"``) or ``u = v``, times
+       ``softplus(a + dt_bias)`` when ``dt_update`` (``"additive"``, Mamba2);
+    5. ``o = q^T S``, plus ``D * v`` when ``skip``; then, when ``norm``, each
+       head's RMSNorm with the ``output_gate`` activation of the gate input.
+
+    ``Attention.grouping`` reads value heads as query heads, key heads as KV
+    heads and head_k_dim as head_dim. ``state_layout`` is ``"kv"`` for a
+    ``[k, v]`` state (Hugging Face GDN/KDA) or ``"vk"`` (Mamba2). The
+    convolution window is read, not shifted: the declaring model shifts it.
+    """
+
+    state_value_id: str
+    state_layout: Literal["kv", "vk"]
+    head_v_dim: int
+    conv_kernel: int
+    q_offset: int
+    k_offset: int
+    v_offset: int
+    decay: Literal["softplus_gate", "log"]
+    decay_per_key: bool
+    update: Literal["delta", "additive"]
+    dt_update: bool
+    qk_l2norm: bool
+    skip: bool
+    output_gate: Literal["none", "silu", "sigmoid"]
+    norm: bool
+    norm_eps: float = 1e-6
+    # Round the normalized head to the input dtype before the weight product
+    # (Qwen3.5's gated norm); Kimi keeps it in FP32.
+    norm_rounds: bool = True
+    # SiLU after the causal convolution (every model here but the ComplexKDA
+    # checkpoints trained with ``drop_silu``).
+    conv_silu: bool = True
+    # The window is a ring of ``conv_kernel`` slots indexed by the token
+    # position, which the op writes (else ``conv_kernel - 1`` slots, read only).
+    conv_ring: bool = False
+
+
+@dataclass(frozen=True)
+class Attention:
+    """Softmax attention over the query, key and value accesses, or, with
+    ``algorithm="linear"``, a ``LinearRecurrence`` over a per-head state."""
+
+    algorithm: Literal["stable_softmax", "online_softmax", "linear"]
     numerics: NumericalPolicy
     q: IndexedLoad
     k: IndexedLoad
@@ -281,6 +337,7 @@ class Attention:
     prologues: Mapping[str, Prologue] = field(default_factory=dict)
     # Scaled scores s become softcap * tanh(s / softcap) when set.
     softcap: float = 0.0
+    recurrent: LinearRecurrence | None = None
 
 
 def _declared_grouping(query: IndexedLoad, key: IndexedLoad) -> HeadGrouping:

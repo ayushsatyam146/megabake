@@ -39,6 +39,13 @@ from .ops.attention import (
     attention_program,
     kv_attention_program,
 )
+from .ops.linear_attention import (
+    LINEAR_ATTENTION_OP,
+    TENSOR_ARGUMENTS as LINEAR_ATTENTION_TENSORS,
+    arguments_of as linear_attention_arguments,
+    linear_attention_program,
+    static_attributes as linear_attention_attributes,
+)
 
 
 LoweringRule = Callable[
@@ -1566,6 +1573,21 @@ def _kv_attention_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> T
     )
 
 
+def _linear_attention_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
+    arguments = linear_attention_arguments(node.args, dict(node.kwargs))
+    operands = {}
+    for name in LINEAR_ATTENTION_TENSORS:
+        argument = arguments[name]
+        if argument is None:
+            continue
+        if not isinstance(argument, torch.fx.Node):
+            raise UnsupportedLowering(f"linear attention {name} must be a tensor or None")
+        operands[name] = _node_value(argument, graph)
+    return linear_attention_program(
+        operands, linear_attention_attributes(node.args, dict(node.kwargs)), _result_value(op, graph)
+    )
+
+
 def _attention_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> TensorProgram:
     query, key, value = (_node_value(argument, graph) for argument in node.args[:3])
     mask = node.args[3]
@@ -1583,6 +1605,7 @@ def _attention_program(node: torch.fx.Node, op: Op, graph: ComputeGraph) -> Tens
 
 LOWERERS: dict[Any, LoweringRule] = {
     KV_ATTENTION_OP: _kv_attention_program,
+    LINEAR_ATTENTION_OP: _linear_attention_program,
     ATTENTION_OP: _attention_program,
     torch.ops.aten.add.Tensor: lambda node, op, graph: _binary_program(node, op, graph, "add"),
     torch.ops.aten.add.Scalar: lambda node, op, graph: _binary_program(node, op, graph, "add"),
@@ -1832,6 +1855,9 @@ def _verify_tensor_program(program: TensorProgram, op: Op, graph: ComputeGraph) 
                     for axis in loads_by_id[load_id].axes
                 ):
                     raise UnsupportedLowering("post expression depends on a reduction coordinate")
+    elif program.family == "attention" and program.source_target == "megabake.linear_attention":
+        if program.init is None:
+            raise UnsupportedLowering("linear attention lacks its accumulator")
     elif program.family == "attention":
         if program.reduction_axes != ("k",) or program.init is None:
             raise UnsupportedLowering("attention lacks its reduction state")
@@ -1941,7 +1967,7 @@ def lower_semantics(graph: ComputeGraph) -> ComputeGraph:
             if node.op == "get_attr"
             else LOWERERS.get(target) or LOWERERS.get(str(target))
         )
-        declared_effects = target in (KV_ATTENTION_OP, torch.ops.aten.copy_.default)
+        declared_effects = target in (KV_ATTENTION_OP, LINEAR_ATTENTION_OP, torch.ops.aten.copy_.default)
         unsupported_effects = not declared_effects and bool(
             operation.effects.get("unknown")
             or operation.effects.get("mutates_inputs")

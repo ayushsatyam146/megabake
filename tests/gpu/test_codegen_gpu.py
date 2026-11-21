@@ -164,7 +164,10 @@ def test_generated_cooperative_module_compiles_and_matches_reference(tmp_path):
     torch.testing.assert_close(output.cpu(), torch.relu(source) + torch.relu(source))
 
 
-def test_generated_layout_conversion_compiles_and_matches_reference(tmp_path):
+def test_generated_layout_conversion_compiles_and_matches_reference(tmp_path, monkeypatch):
+    # relu -> sum would fuse as a reduction prologue, leaving no conversion.
+    monkeypatch.setenv("MEGABAKE_REDUCTION_PROLOGUE", "0")
+
     class Model(torch.nn.Module):
         def forward(self, value):
             return value.relu().sum(dim=-1)

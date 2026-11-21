@@ -108,7 +108,10 @@ def gemv_rejection(program: TensorProgram, target: TargetFacts, policy: Selectio
     # Where 64-row tiles fill over half the SMs the ring-fed WGMMA body wins:
     # Beam DFlash2's 5,120-wide projections (80 tiles on 132 SMs) measured
     # 1,348 us on it and 1,495 us as GEMVs (2026-11-20).
-    if columns > 32 * target.multiprocessor_count:
+    # Only where that body can take the shape: N and K multiples of 64. Mamba's
+    # 50,288-wide vocabulary projection otherwise fell to the generic
+    # contraction (573 us on Mamba2-1.3B, 2026-11-21).
+    if columns > 32 * target.multiprocessor_count and columns % 64 == 0 and _reduction_size(program) % 64 == 0:
         return "64-row tensor-core tiles already fill half the SMs"
     if len(program.loads) < 2 or any(load.dtype != "torch.bfloat16" for load in program.loads[:2]):
         return "GEMV reads BF16 operands"

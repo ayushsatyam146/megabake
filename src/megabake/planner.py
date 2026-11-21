@@ -416,7 +416,7 @@ def _body_order(
     program: TensorProgram,
     policy: SelectionPolicy,
 ) -> tuple[int, ...]:
-    if program.family == "attention":
+    if program.family == "attention" and getattr(region.semantics, "recurrent", None) is None:
         return _attention_body_order(config, region, policy)
     if program.family == "contraction" and program.store.shape:
         return _contraction_body_order(config, program, policy)

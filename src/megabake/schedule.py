@@ -1536,9 +1536,21 @@ def _fold_small_intervals(
         for region_id in region_ids:
             selected = selected_by_region[region_id]
             values.extend(selected.outputs)
-            if not writes or selected.program.state_accesses:
-                # Stateful bodies may write their inputs (KV appends).
+            if not writes:
                 values.extend(selected.inputs)
+            else:
+                # Stateful bodies write their caches and valid lengths (KV
+                # appends), not their other inputs: counting every input
+                # kept a decode attention's q/k-norm statistics in an
+                # interval of their own.
+                for access in selected.program.state_accesses:
+                    values.extend(
+                        (
+                            access.key_cache_value_id,
+                            access.value_cache_value_id,
+                            access.valid_length_value_id,
+                        )
+                    )
         return _storage_ids(graph, tuple(values)) if graph is not None else frozenset()
 
     intervals: list[list[str]] = [[]]

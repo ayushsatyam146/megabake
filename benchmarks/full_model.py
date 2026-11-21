@@ -28,6 +28,7 @@ import gc
 import json
 import statistics
 import sys
+import os
 import time
 import traceback
 from pathlib import Path
@@ -46,6 +47,7 @@ from benchmarks.stateful_models import StatefulCausalLM, layer_types, text_confi
 from megabake.fx_handler.hf_attention import (  # noqa: E402
     ATTENTION_IMPLEMENTATION,
     DecodeStep,
+    mixer_of,
     register_transformers_attention,
 )
 from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION, StatefulSmolLM  # noqa: E402
@@ -76,11 +78,17 @@ def _load(name: str, revision: str | None, attention: str = "eager") -> torch.nn
 
     if attention == ATTENTION_IMPLEMENTATION:
         register_transformers_attention()
+    # Checkpoints that ship their own modeling code run it only on request:
+    # MEGABAKE_TRUST_REMOTE_CODE=1, with a pinned --revision of code you read.
+    trust = os.environ.get("MEGABAKE_TRUST_REMOTE_CODE") == "1"
+    if trust and revision is None:
+        raise ValueError("MEGABAKE_TRUST_REMOTE_CODE=1 needs a pinned --revision")
     model = AutoModelForCausalLM.from_pretrained(
         name,
         revision=revision,
         attn_implementation=attention,
         dtype=torch.bfloat16,
+        trust_remote_code=trust,
     )
     model.config.use_cache = False
     text_config(model).use_cache = False
@@ -226,6 +234,13 @@ def _decode_module(model, capacity: int) -> tuple[torch.nn.Module, list]:
         )
         state_shapes = [[(shape, torch.bfloat16)]] * 2 * layers + [[((1,), torch.int32)]] * layers
         return StatefulSmolLM(model).eval(), state_shapes
+    mixers = [module for module in model.modules() if mixer_of(module) is not None]
+    if mixers and len(mixers) == model.config.get_text_config(decoder=True).num_hidden_layers:
+        # Every layer's token mixer has a declaration (Mamba2, ComplexKDA and
+        # its hybrid attention): ``megabake::linear_attention`` and
+        # ``megabake::kv_attention`` over DecodeStep's explicit state.
+        step = DecodeStep(model, capacity).eval()
+        return step, step.state_shapes()
     if set(layer_types(model)) <= {"full_attention", "sliding_attention"}:
         # Any Hugging Face attention model: declared attention over explicit KV state.
         step = DecodeStep(model, capacity).eval()

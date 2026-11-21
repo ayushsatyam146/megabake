@@ -89,20 +89,6 @@ def test_decode_step_matches_hugging_face_decode(name, model_class, config):
     assert all(int(length.item()) == tokens.shape[1] for length in state[2::3])
 
 
-def test_decode_step_rejects_undeclared_token_mixers():
-    from transformers import Qwen3_5TextConfig, Qwen3_5ForCausalLM
-
-    from megabake.fx_handler import DecodeStep
-
-    config = Qwen3_5TextConfig(
-        vocab_size=64, hidden_size=32, intermediate_size=64, num_hidden_layers=2,
-        num_attention_heads=2, num_key_value_heads=1, head_dim=16,
-        layer_types=["linear_attention", "full_attention"],
-    )
-    with pytest.raises(NotImplementedError, match="linear_attention"):
-        DecodeStep(Qwen3_5ForCausalLM(config), capacity=8)
-
-
 @pytest.mark.parametrize("name,model_class,config", _tiny_models())
 def test_decode_step_captures_one_kv_attention_region_per_layer(name, model_class, config):
     from megabake.fx_handler import DecodeStep

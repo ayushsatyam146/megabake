@@ -20,14 +20,17 @@ from .attention import (
     Mask,
     NumericalPolicy,
     Prologue,
+    LinearRecurrence,
 )
 from .elementwise import ScalarChain
+from .linear_attention import LINEAR_ATTENTION_OP
 from .gemm import GemmEpilogue, ViewPlusGemm
 from .norm import RMSNorm
+from .prologue import ReductionPrologue
 from .rope import Rope
 
 # The descriptor a region or fusion candidate carries, if any.
-Semantics = Attention | GemmEpilogue | RMSNorm | Rope | ScalarChain | ViewPlusGemm
+Semantics = Attention | GemmEpilogue | ReductionPrologue | RMSNorm | Rope | ScalarChain | ViewPlusGemm
 
 __all__ = [
     "ATTENTION_OP",
@@ -35,13 +38,16 @@ __all__ = [
     "KV_ATTENTION_OP",
     "Attention",
     "CacheEffects",
+    "LINEAR_ATTENTION_OP",
     "GemmEpilogue",
     "HeadGrouping",
     "Mask",
     "NumericalPolicy",
     "Prologue",
     "RMSNorm",
+    "LinearRecurrence",
     "Rope",
+    "ReductionPrologue",
     "ScalarChain",
     "Semantics",
     "ViewPlusGemm",

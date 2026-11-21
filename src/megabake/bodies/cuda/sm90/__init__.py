@@ -1,4 +1,4 @@
-"""Hopper (sm90a): TMA/WGMMA GEMMs and softmax attention."""
+"""Hopper (sm90a): TMA/WGMMA GEMMs, softmax attention and linear-attention decode."""
 
 from ...interface import Generation
 from .attention import AttentionBodyProvider

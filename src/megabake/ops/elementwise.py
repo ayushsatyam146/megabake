@@ -27,30 +27,50 @@ class ScalarChain:
     saved_bytes: int
 
 
-def candidates(graph: ComputeGraph) -> tuple[RegionCandidate, ...]:
+def candidates(
+    graph: ComputeGraph, reserved: frozenset[str] = frozenset()
+) -> tuple[RegionCandidate, ...]:
     """The maximal chain ending at each elementwise op: a chain inside a
-    longer one is left out."""
+    longer one is left out. ``reserved`` ops belong to other pattern
+    candidates (norms, RoPE); a chain that absorbs one also comes in a
+    variant that reads it as an external input, so the planner, which takes
+    the largest non-overlapping candidates first, can still fuse the rest
+    of the chain after the pattern claims its op."""
     chains = [
         candidate
         for operation in graph.ops.values()
         if (candidate := _chain_candidate(operation, graph)) is not None
     ]
-    return tuple(
+    maximal = [
         candidate
         for candidate in chains
         if not any(
             set(candidate.source_op_ids) < set(other.source_op_ids) for other in chains
         )
-    )
+    ]
+    variants = [
+        candidate
+        for chain in maximal
+        if set(chain.source_op_ids[:-1]) & reserved
+        and (
+            candidate := _chain_candidate(
+                graph.ops[chain.source_op_ids[-1]], graph, reserved, suffix=":unreserved"
+            )
+        )
+        is not None
+    ]
+    return (*maximal, *variants)
 
 
-def _chain_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate | None:
+def _chain_candidate(
+    tail: Op, graph: ComputeGraph, excluded: frozenset[str] = frozenset(), suffix: str = ""
+) -> RegionCandidate | None:
     if not isinstance(tail.tensor_program, TensorProgram):
         return None
     if tail.tensor_program.family not in {"elementwise", "copy"}:
         return None
 
-    operations = scalar_fusion_operations(tail, graph)
+    operations = scalar_fusion_operations(tail, graph, excluded)
     if len(operations) < 2:
         return None
 
@@ -82,7 +102,7 @@ def _chain_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate | None:
         for operation in operations[:-1]
     )
     return RegionCandidate(
-        id=f"region:{tail.id.removeprefix('op:')}:fused",
+        id=f"region:{tail.id.removeprefix('op:')}:fused{suffix}",
         source_op_ids=tuple(operation.id for operation in operations),
         external_inputs=external_inputs,
         live_outputs=(tail.results[0],),
@@ -93,7 +113,45 @@ def _chain_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate | None:
     )
 
 
-def scalar_fusion_operations(tail: Op, graph: ComputeGraph) -> tuple[Op, ...]:
+def scalar_fusion_operations(
+    tail: Op, graph: ComputeGraph, excluded: frozenset[str] = frozenset()
+) -> tuple[Op, ...]:
+    """``tail`` and the elementwise producers that can fold into it, in
+    producer-first order.
+
+    A producer joins when its result has the tail's layout, is no graph
+    output, and every use of it is inside the chain; anything else is an
+    external input. Growing the chain only through such producers keeps it
+    local: following every elementwise producer instead let a chain run the
+    whole residual stream of a model (Gemma 3's residual adds connect every
+    layer through elementwise ops), which then failed its layout and
+    external-use checks as a whole, so nothing around it fused."""
+    members: set[str] = {tail.id}
+    changed = True
+    while changed:
+        changed = False
+        for member_id in tuple(members):
+            program = graph.ops[member_id].tensor_program
+            if not isinstance(program, TensorProgram):
+                continue
+            for load in program.loads:
+                producer_id = graph.values[load.value_id].producer
+                if producer_id is None or producer_id in members or producer_id in excluded:
+                    continue
+                producer = graph.ops[producer_id]
+                result = producer.results[0] if len(producer.results) == 1 else None
+                if (
+                    result is None
+                    or not is_scalar_operation(producer)
+                    or has_illegal_effects(producer)
+                    or result in graph.outputs
+                    or not same_chain_layout(result, tail.results[0], graph)
+                    or not all(user in members for user in graph.values[result].users)
+                ):
+                    continue
+                members.add(producer_id)
+                changed = True
+
     operations: list[Op] = []
     visited: set[str] = set()
 
@@ -102,15 +160,11 @@ def scalar_fusion_operations(tail: Op, graph: ComputeGraph) -> tuple[Op, ...]:
             return
         visited.add(operation.id)
         program = operation.tensor_program
-        if not isinstance(program, TensorProgram):
-            return
-        for load in program.loads:
-            producer_id = graph.values[load.value_id].producer
-            if producer_id is None:
-                continue
-            producer = graph.ops[producer_id]
-            if is_scalar_operation(producer):
-                visit(producer)
+        if isinstance(program, TensorProgram):
+            for load in program.loads:
+                producer_id = graph.values[load.value_id].producer
+                if producer_id in members:
+                    visit(graph.ops[producer_id])
         operations.append(operation)
 
     visit(tail)
@@ -134,7 +188,7 @@ def compose_scalar_chain(
         return None
 
     leaf_loads: list[IndexedLoad] = []
-    leaf_ids: dict[str, str] = {}
+    leaf_ids: dict[tuple, str] = {}
     expressions: dict[str, ScalarExpression] = {}
     for operation in chain:
         program = operation.tensor_program
@@ -145,7 +199,10 @@ def compose_scalar_chain(
             if load.value_id in expressions:
                 replacements[load.id] = expressions[load.value_id]
                 continue
-            leaf_id = leaf_ids.get(load.value_id)
+            # A value read through different index maps (a broadcast and a
+            # full read) needs one leaf load per map.
+            leaf_key = (load.value_id, tuple(load.axes), tuple(load.strides))
+            leaf_id = leaf_ids.get(leaf_key)
             if leaf_id is None:
                 leaf_id = f"load:{len(leaf_loads)}"
                 leaf_loads.append(
@@ -158,7 +215,7 @@ def compose_scalar_chain(
                         source_shape=load.source_shape,
                     )
                 )
-                leaf_ids[load.value_id] = leaf_id
+                leaf_ids[leaf_key] = leaf_id
             replacements[load.id] = Load(leaf_id, load.dtype)
         expressions[operation.results[0]] = substitute_loads(
             program.combine, replacements

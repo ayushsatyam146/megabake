@@ -113,11 +113,8 @@ def test_select_bodies_uses_legal_vector_chain_and_preserves_fallback():
         "region:relu",
         "region:add",
     ]
-    assert any(
-        rejection.region_id == "region:add:fused"
-        and rejection.reason == "an intermediate value has an external use"
-        for rejection in fallback.report.rejections
-    )
+    # The externally used relu stays outside the chain: no fused candidate.
+    assert not any(selected.region_id.endswith(":fused") for selected in fallback.selections)
 
 
 def test_search_plans_measures_provider_and_worker_candidates():
@@ -366,6 +363,8 @@ def test_make_tile_maps_handles_unit_dimensions_and_boundary_strides():
 def test_make_tile_maps_inserts_layout_conversion_with_cost_and_dependency(
     monkeypatch,
 ):
+    # relu -> sum would fuse as a reduction prologue, leaving no conversion.
+    monkeypatch.setenv("MEGABAKE_REDUCTION_PROLOGUE", "0")
     class Model(torch.nn.Module):
         def forward(self, value):
             return value.relu().sum(dim=-1)

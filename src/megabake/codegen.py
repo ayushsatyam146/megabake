@@ -2467,7 +2467,7 @@ def _event_worker_loop(
         workers,
         epoch,
         (
-{("," + chr(10)).join(f"            ({entry[0]}, {entry[1]}, {entry[2]}, {entry[3]})" for entry in entries)}
+{chr(10).join(f"            ({entry[0]}, {entry[1]}, {entry[2]}, {entry[3]})," for entry in entries)}
         ),
     )
 '''

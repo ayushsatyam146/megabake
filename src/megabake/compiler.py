@@ -1208,7 +1208,7 @@ class _StateSnapshot:
             value_id
             for operation in graph.ops.values()
             if operation.effects.get("mutates_inputs")
-            for value_id in operation.operands[:1]
+            for value_id in operation.effects.get("mutated_operands", operation.operands[:1])
             if value_id in graph.inputs
         }
         inputs = list(example_inputs)

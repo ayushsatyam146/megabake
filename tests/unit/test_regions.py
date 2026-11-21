@@ -136,9 +136,12 @@ def test_form_regions_rejects_vector_chain_when_intermediate_is_external():
     value = torch.randn(2, 3)
     graph = form_regions(_import(Model(), value))
 
-    candidate = graph.regions[-1].fusion_candidates[0]
-    assert not candidate.executable
-    assert candidate.rejections == ("an intermediate value has an external use",)
+    # The externally used value stays outside the chain, so nothing fuses.
+    assert not any(
+        candidate.executable
+        for region in graph.regions
+        for candidate in region.fusion_candidates
+    )
     assert len(graph.regions) == len(graph.ops)
 
 

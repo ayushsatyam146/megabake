@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .graph import ComputeGraph, Region, RegionCandidate, verify_compute_graph
-from .ops import attention, elementwise, gemm, norm, rope
+from .ops import attention, elementwise, gemm, linear_attention, norm, prologue, rope
 from .ops.matching import external_inputs_of, live_outputs_of
 
 
@@ -89,13 +89,20 @@ def _fusion_candidates(graph: ComputeGraph) -> dict[str, tuple[RegionCandidate, 
     """Each op's fusion candidates, in the order the planner tries them."""
     rope_candidates = rope.candidates(graph)
     norm_candidates = norm.candidates(graph)
-    chain_candidates = elementwise.candidates(graph)
+    reserved = frozenset(
+        operation_id
+        for candidate in (*rope_candidates, *norm_candidates)
+        for operation_id in candidate.source_op_ids
+    )
+    chain_candidates = elementwise.candidates(graph, reserved)
+    prologue_candidates = prologue.candidates(graph)
     declared = (
         candidate
         for operation in graph.ops.values()
         for candidate in (
             attention.stateful_candidate(operation, graph),
             attention.declared_candidate(operation, graph),
+            linear_attention.candidate(operation, graph),
         )
         if candidate is not None
     )
@@ -103,6 +110,7 @@ def _fusion_candidates(graph: ComputeGraph) -> dict[str, tuple[RegionCandidate, 
     for candidate in (
         *declared,
         *chain_candidates,
+        *prologue_candidates,
         *gemm.epilogue_candidates(graph),
         *norm_candidates,
         *rope_candidates,

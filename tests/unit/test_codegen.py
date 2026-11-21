@@ -237,7 +237,10 @@ def test_emit_cute_keeps_g0_variants_with_different_configurations(tmp_path):
     assert generated.launch.shared_memory_bytes == 444_416
 
 
-def test_emit_cute_emits_explicit_layout_conversion(tmp_path):
+def test_emit_cute_emits_explicit_layout_conversion(tmp_path, monkeypatch):
+    # relu -> sum would fuse as a reduction prologue, leaving no conversion.
+    monkeypatch.setenv("MEGABAKE_REDUCTION_PROLOGUE", "0")
+
     class Model(torch.nn.Module):
         def forward(self, value):
             return value.relu().sum(dim=-1)

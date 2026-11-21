@@ -338,12 +338,12 @@ def emit_reduction_body(
     ]
     post_domains = [domain for domain in output_domains if domain not in row_domains]
     warp_reduction = (
-        "cute.arch.warp_reduction(accumulator, exact_maximum)"
+        "cute.arch.warp_reduction(accumulator, lambda left, right: cute.arch.fmax(left, right, nan=True))"
         if reduction_operator == "maximum"
         else "cute.arch.warp_reduction_sum(accumulator)"
     )
     merge_partial = (
-        "accumulator = exact_maximum(accumulator, scratch[block, warp_index])"
+        "accumulator = cute.arch.fmax(accumulator, scratch[block, warp_index], nan=True)"
         if reduction_operator == "maximum"
         else "accumulator = accumulator + scratch[block, warp_index]"
     )
@@ -364,10 +364,6 @@ def emit_reduction_body(
         )
     source = f'''import cutlass
 import cutlass.cute as cute
-
-
-def exact_maximum(left, right):
-    return cute.arch.fmax(left, right, nan=True)
 
 
 @cute.kernel
@@ -577,21 +573,17 @@ def _emit_row_reduction_body(
     binding_type = ", ".join("cute.Tensor" for _ in range(len(input_value_ids) + 1))
     accumulator_type = _cutlass_type(program.accumulator_dtype or "")
     warp_reduction = (
-        "cute.arch.warp_reduction(accumulator, exact_maximum)"
+        "cute.arch.warp_reduction(accumulator, lambda left, right: cute.arch.fmax(left, right, nan=True))"
         if reduction_operator == "maximum"
         else "cute.arch.warp_reduction_sum(accumulator)"
     )
     merge_partial = (
-        "accumulator = exact_maximum(accumulator, scratch[block, warp_index])"
+        "accumulator = cute.arch.fmax(accumulator, scratch[block, warp_index], nan=True)"
         if reduction_operator == "maximum"
         else "accumulator = accumulator + scratch[block, warp_index]"
     )
     source = f'''import cutlass
 import cutlass.cute as cute
-
-
-def exact_maximum(left, right):
-    return cute.arch.fmax(left, right, nan=True)
 
 
 @cute.kernel
