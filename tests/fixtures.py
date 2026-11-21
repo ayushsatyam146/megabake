@@ -43,28 +43,18 @@ def rms_norm(source, weight, residual):
 
 def rotate_half(source, cosine, sine):
     half = source.shape[-1] // 2
-    first = (
-        source[..., :half] * cosine[..., :half]
-        - source[..., half:] * sine[..., :half]
-    )
-    second = (
-        source[..., half:] * cosine[..., :half]
-        + source[..., :half] * sine[..., :half]
-    )
+    first = source[..., :half] * cosine[..., :half] - source[..., half:] * sine[..., :half]
+    second = source[..., half:] * cosine[..., :half] + source[..., :half] * sine[..., :half]
     return torch.cat((first, second), dim=-1)
 
 
 def grouped_attention(query, key, value, mask):
     query = query.permute(0, 2, 1, 3)
-    grouped_key = key.permute(0, 2, 1, 3).repeat_interleave(
-        query.shape[1] // key.shape[2], dim=1
-    )
+    grouped_key = key.permute(0, 2, 1, 3).repeat_interleave(query.shape[1] // key.shape[2], dim=1)
     grouped_value = value.permute(0, 2, 1, 3).repeat_interleave(
         query.shape[1] // value.shape[2], dim=1
     )
-    scores = (
-        query @ grouped_key.transpose(-2, -1)
-    ) * query.shape[-1] ** -0.5 + mask
+    scores = (query @ grouped_key.transpose(-2, -1)) * query.shape[-1] ** -0.5 + mask
     probabilities = torch.softmax(scores.float(), dim=-1).to(query.dtype)
     return probabilities @ grouped_value
 
@@ -90,8 +80,7 @@ class TransformerBlock(torch.nn.Module):
             torch.randn(hidden_size, device=device, dtype=dtype)
         )
         self.query_weight = torch.nn.Parameter(
-            torch.randn(hidden_size, hidden_size, device=device, dtype=dtype)
-            / hidden_size**0.5
+            torch.randn(hidden_size, hidden_size, device=device, dtype=dtype) / hidden_size**0.5
         )
         self.key_weight = torch.nn.Parameter(
             torch.randn(
@@ -112,8 +101,7 @@ class TransformerBlock(torch.nn.Module):
             / hidden_size**0.5
         )
         self.output_weight = torch.nn.Parameter(
-            torch.randn(hidden_size, hidden_size, device=device, dtype=dtype)
-            / hidden_size**0.5
+            torch.randn(hidden_size, hidden_size, device=device, dtype=dtype) / hidden_size**0.5
         )
         self.post_norm_weight = torch.nn.Parameter(
             torch.randn(hidden_size, device=device, dtype=dtype)
@@ -185,9 +173,7 @@ class TransformerBlock(torch.nn.Module):
             self.output_weight,
         )
         attention_hidden = projected + source
-        normalized_hidden = rms_norm(
-            attention_hidden, self.post_norm_weight, attention_hidden
-        )
+        normalized_hidden = rms_norm(attention_hidden, self.post_norm_weight, attention_hidden)
         mlp_output, gate, activated, fused = self._mlp(normalized_hidden)
         return mlp_output + attention_hidden, gate, activated, fused
 
@@ -218,15 +204,11 @@ class StatefulTransformerBlock(TransformerBlock):
         value = torch.nn.functional.linear(normalized, self.value_weight).view(
             batch, 1, self.key_value_heads, self.head_dim
         )
-        attention = kv_attention(
-            query, key, value, key_cache, value_cache, valid_length
-        )
+        attention = kv_attention(query, key, value, key_cache, value_cache, valid_length)
         attention_flat = attention.reshape(batch, 1, -1)
         projected = torch.nn.functional.linear(attention_flat, self.output_weight)
         attention_hidden = projected + source
-        normalized_hidden = rms_norm(
-            attention_hidden, self.post_norm_weight, attention_hidden
-        )
+        normalized_hidden = rms_norm(attention_hidden, self.post_norm_weight, attention_hidden)
         mlp_output, gate, activated, fused = self._mlp(normalized_hidden)
         return mlp_output + attention_hidden, gate, activated, fused
 
@@ -267,15 +249,15 @@ class StatefulSmolLM(torch.nn.Module):
             normalized = layer.input_layernorm(hidden)
             attention = layer.self_attn
             batch, sequence, _ = normalized.shape
-            query = torch.nn.functional.linear(
-                normalized, attention.q_proj.weight
-            ).view(batch, sequence, self.query_heads, self.head_dim)
-            key = torch.nn.functional.linear(
-                normalized, attention.k_proj.weight
-            ).view(batch, sequence, self.key_value_heads, self.head_dim)
-            value = torch.nn.functional.linear(
-                normalized, attention.v_proj.weight
-            ).view(batch, sequence, self.key_value_heads, self.head_dim)
+            query = torch.nn.functional.linear(normalized, attention.q_proj.weight).view(
+                batch, sequence, self.query_heads, self.head_dim
+            )
+            key = torch.nn.functional.linear(normalized, attention.k_proj.weight).view(
+                batch, sequence, self.key_value_heads, self.head_dim
+            )
+            value = torch.nn.functional.linear(normalized, attention.v_proj.weight).view(
+                batch, sequence, self.key_value_heads, self.head_dim
+            )
             cosine, sine = self.model.rotary_emb(normalized, position_ids)
             query_cosine = cosine[:, :, None, :].expand(
                 batch, sequence, self.query_heads, self.head_dim
@@ -291,23 +273,17 @@ class StatefulSmolLM(torch.nn.Module):
             )
             query = rotate_half(query, query_cosine, query_sine)
             key = rotate_half(key, key_cosine, key_sine)
-            attended = kv_attention(
-                query, key, value, key_cache, value_cache, valid_length
-            )
+            attended = kv_attention(query, key, value, key_cache, value_cache, valid_length)
             projected = torch.nn.functional.linear(
                 attended.reshape(batch, sequence, -1), attention.o_proj.weight
             )
             hidden = residual + projected
             residual = hidden
             normalized = layer.post_attention_layernorm(hidden)
-            gate = torch.nn.functional.linear(
-                normalized, layer.mlp.gate_proj.weight
-            )
+            gate = torch.nn.functional.linear(normalized, layer.mlp.gate_proj.weight)
             up = torch.nn.functional.linear(normalized, layer.mlp.up_proj.weight)
             fused = torch.nn.functional.silu(gate) * up
-            hidden = residual + torch.nn.functional.linear(
-                fused, layer.mlp.down_proj.weight
-            )
+            hidden = residual + torch.nn.functional.linear(fused, layer.mlp.down_proj.weight)
         logits = self.lm_head(self.model.norm(hidden))
         return logits
 
@@ -342,6 +318,4 @@ def StatefulSmolLMArchitecture(
     device: str | torch.device = "cuda",
     dtype: torch.dtype = torch.bfloat16,
 ) -> StatefulSmolLM:
-    return StatefulSmolLM(
-        SmolLMArchitecture(layers=layers, device=device, dtype=dtype)
-    ).eval()
+    return StatefulSmolLM(SmolLMArchitecture(layers=layers, device=device, dtype=dtype)).eval()

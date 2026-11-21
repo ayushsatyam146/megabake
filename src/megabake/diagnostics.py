@@ -13,9 +13,7 @@ class CompilerDiagnostic:
 
 
 class CompilerError(ValueError):
-    def __init__(
-        self, diagnostic: CompilerDiagnostic, *, safe_for_fallback: bool = False
-    ):
+    def __init__(self, diagnostic: CompilerDiagnostic, *, safe_for_fallback: bool = False):
         super().__init__(diagnostic.message)
         self.diagnostic = diagnostic
         self.safe_for_fallback = safe_for_fallback

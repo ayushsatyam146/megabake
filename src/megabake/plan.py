@@ -1,14 +1,13 @@
 from __future__ import annotations
 
-from math import prod
-
 from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import product
+from math import prod
 from time import monotonic
-from typing import TYPE_CHECKING
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
+from .bodies.catalog import is_table_gemm
 from .bodies.interface import (
     AxisExpression,
     BodyConfig,
@@ -52,9 +51,7 @@ class CuTeLayout:
             raise InvalidTileMap("CuTe shape and stride ranks differ")
         if any(dimension <= 0 for dimension in self.shape):
             raise InvalidTileMap("CuTe layout dimensions must be positive")
-        if self.alignment_bytes <= 0 or self.alignment_bytes & (
-            self.alignment_bytes - 1
-        ):
+        if self.alignment_bytes <= 0 or self.alignment_bytes & (self.alignment_bytes - 1):
             raise InvalidTileMap("CuTe layout alignment must be a power of two")
         if self.swizzle is not None and (
             self.swizzle.mask <= 0
@@ -67,9 +64,7 @@ class CuTeLayout:
     def from_contract(cls, layout: TensorLayout) -> CuTeLayout:
         shape = layout.shape or (1,) * len(layout.axes)
         if len(shape) != len(layout.axes) or len(shape) != len(layout.strides):
-            raise InvalidTileMap(
-                f"layout {layout.dtype} has mismatched axes, shape, and strides"
-            )
+            raise InvalidTileMap(f"layout {layout.dtype} has mismatched axes, shape, and strides")
         return cls(layout.dtype, shape, layout.strides, layout.alignment_bytes)
 
     @property
@@ -118,10 +113,13 @@ class CuTeLayout:
             return False
         if self.dtype != other.dtype or self.shape != other.shape:
             raise InvalidTileMap("conversion layouts must have the same value domain")
-        normalize = lambda layout: tuple(
-            stride if size != 1 else 0
-            for stride, size in zip(layout.strides, layout.shape, strict=True)
-        )
+
+        def normalize(layout):
+            return tuple(
+                stride if size != 1 else 0
+                for stride, size in zip(layout.strides, layout.shape, strict=True)
+            )
+
         return (normalize(self), self.swizzle) != (normalize(other), other.swizzle)
 
 
@@ -176,9 +174,12 @@ class TileGrid:
         )
 
     def origins(self):
-        return product(*(range(0, dimension, tile) for dimension, tile in zip(
-            self.shape, self.tile_shape, strict=True
-        )))
+        return product(
+            *(
+                range(0, dimension, tile)
+                for dimension, tile in zip(self.shape, self.tile_shape, strict=True)
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -301,10 +302,7 @@ class KernelPlan:
 
 
 class PlanEvaluator(Protocol):
-    def __call__(
-        self, plan: KernelPlan, budget: SearchBudget
-    ) -> PlanMeasurement:
-        ...
+    def __call__(self, plan: KernelPlan, budget: SearchBudget) -> PlanMeasurement: ...
 
 
 @dataclass(frozen=True)
@@ -358,17 +356,11 @@ class PlanSearchResult:
 
     @property
     def measured_candidates(self) -> tuple[PlanCandidate, ...]:
-        return tuple(
-            candidate
-            for candidate in self.candidates
-            if candidate.status == "measured"
-        )
+        return tuple(candidate for candidate in self.candidates if candidate.status == "measured")
 
     def report(self) -> dict[str, Any]:
         return {
-            "selected": None
-            if self.selected_description is None
-            else self.selected_description,
+            "selected": None if self.selected_description is None else self.selected_description,
             "budget_exhausted": self.budget_exhausted,
             "provider_rejections": [
                 {
@@ -472,8 +464,7 @@ def search_plans(
     seen_selections: set[tuple[Any, ...]] = set()
     for selection in selections:
         identity = tuple(
-            (selected.region_id, selected.body.name)
-            for selected in selection.selections
+            (selected.region_id, selected.body.name) for selected in selection.selections
         )
         if identity in seen_selections:
             continue
@@ -482,11 +473,7 @@ def search_plans(
     selections = tuple(unique_selections)
 
     rejections = tuple(
-        dict.fromkeys(
-            rejection
-            for selection in selections
-            for rejection in selection.rejections
-        )
+        dict.fromkeys(rejection for selection in selections for rejection in selection.rejections)
     )
     candidates: list[PlanCandidate] = []
     seen_plans: set[tuple[Any, ...]] = set()
@@ -513,9 +500,7 @@ def search_plans(
             continue
         try:
             tile_maps = make_tile_maps(selection)
-            maximum_work = max(
-                (len(tile_map.accesses) for tile_map in tile_maps), default=0
-            )
+            maximum_work = max((len(tile_map.accesses) for tile_map in tile_maps), default=0)
             active_blocks = min(
                 (
                     selected.resources.maximum_active_blocks or 1
@@ -532,7 +517,7 @@ def search_plans(
                 worker_counts.add(max(1, default_workers // 2))
             if default_workers >= 4:
                 worker_counts.add(max(1, default_workers // 4))
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
             candidates.append(
                 PlanCandidate(
                     None,
@@ -544,9 +529,7 @@ def search_plans(
             )
             continue
 
-        counts = tuple(
-            sorted(worker_counts, reverse=selected_policy.mode != "decode")
-        )
+        counts = tuple(sorted(worker_counts, reverse=selected_policy.mode != "decode"))
         if min(selected_budget.max_plans, selected_budget.max_compilations) < len(counts):
             # A budget too small to measure every count selects the first one
             # unmeasured; decode's ascending order then left three quarters of
@@ -599,11 +582,11 @@ def search_plans(
                         (
                             f"projected shared memory {projected_shared_memory} bytes "
                             f"exceeds {target.max_shared_memory_per_cta}"
-                        )
+                        ),
                     )
                 )
                 continue
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
             candidates.append(
                 PlanCandidate(
                     None,
@@ -614,9 +597,7 @@ def search_plans(
                 )
             )
             continue
-        candidates.append(
-            PlanCandidate(plan, worker_count, description, "unmeasured")
-        )
+        candidates.append(PlanCandidate(plan, worker_count, description, "unmeasured"))
         legal_plan_count += 1
 
     if selected_policy.device is not None:
@@ -661,10 +642,8 @@ def search_plans(
 
         compiled_count += 1
         try:
-            measurement = selected_budget.evaluator(
-                candidate.plan, selected_budget
-            )
-        except Exception as error:
+            measurement = selected_budget.evaluator(candidate.plan, selected_budget)
+        except Exception as error:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
             measurement = PlanMeasurement(error=f"evaluator failed: {error}")
         status = (
             "measured"
@@ -686,8 +665,7 @@ def search_plans(
     measured = tuple(
         candidate
         for candidate in candidates
-        if candidate.status == "measured"
-        and candidate.measurement is not None
+        if candidate.status == "measured" and candidate.measurement is not None
     )
     selected = None
     if measured:
@@ -775,7 +753,7 @@ def _projected_shared_memory(plan: KernelPlan) -> int:
             phase.body.scratch.size_bytes,
         )
         for phase in plan.phases
-        if phase.body.provider == "g0_range"
+        if is_table_gemm(phase.body.provider)
     }
     g0_bytes = sum(variant[3] for variant in g0_variants)
     phase_sizes = {
@@ -786,7 +764,7 @@ def _projected_shared_memory(plan: KernelPlan) -> int:
         (
             phase_sizes.get(phase.region_id, 0)
             for phase in plan.phases
-            if phase.body.provider != "g0_range"
+            if not is_table_gemm(phase.body.provider)
         ),
         default=0,
     )
@@ -802,7 +780,7 @@ def _selection_projected_shared_memory(selection: BodySelectionPlan) -> int:
             selected.body.scratch.size_bytes,
         )
         for selected in selection.selections
-        if selected.body.provider == "g0_range"
+        if is_table_gemm(selected.body.provider)
     }
     if not g0_variants:
         return 0
@@ -811,7 +789,7 @@ def _selection_projected_shared_memory(selection: BodySelectionPlan) -> int:
         (
             selected.resources.shared_memory_bytes
             for selected in selection.selections
-            if selected.body.provider != "g0_range"
+            if not is_table_gemm(selected.body.provider)
         ),
         default=0,
     )

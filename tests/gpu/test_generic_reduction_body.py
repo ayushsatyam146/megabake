@@ -4,11 +4,11 @@ import importlib.util
 import sys
 from dataclasses import replace
 
+import cuda.bindings.driver as cuda
 import pytest
 import torch
+from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
-import cuda.bindings.driver as cuda
-import cutlass.cute as cute
 
 from megabake.bodies import emit_reduction_body
 from megabake.bodies.catalog import get_candidates
@@ -17,7 +17,6 @@ from megabake.graph import import_fx
 from megabake.ir import Accumulator, Binary, Cast, Constant, Load, Unary
 from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
-
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="reduction-body launcher requires CUDA"
@@ -45,9 +44,7 @@ def _target_and_policy():
 def _program(model, source):
     exported = torch.export.export(model, (source,))
     prepared = prepare_fx_graph(exported.graph_module, (source,))
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     region = graph.regions[0]
     target, policy = _target_and_policy()
     config = get_candidates(region, target, policy).configurations[0]
@@ -70,7 +67,7 @@ def _load_body(program, config, name, tmp_path):
 
 
 def _load_launcher(body_name, tensor_count, tmp_path):
-    source = f'''from {body_name} import run
+    source = f"""from {body_name} import run
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 
@@ -92,7 +89,7 @@ def launch(
         block=[128, 1, 1],
         stream=stream,
     )
-'''
+"""
     module_name = f"megabake_{body_name}_launcher"
     path = tmp_path / f"{module_name}.py"
     path.write_text(source, encoding="utf-8")
@@ -111,10 +108,8 @@ def _view(tensor):
 
 
 def _run_body(name, program, config, source, output, tmp_path):
-    body_module, body = _load_body(program, config, name, tmp_path)
-    launcher = _load_launcher(
-        f"megabake_{name}_body", len(program.loads) + 1, tmp_path
-    )
+    _body_module, body = _load_body(program, config, name, tmp_path)
+    launcher = _load_launcher(f"megabake_{name}_body", len(program.loads) + 1, tmp_path)
     work = torch.arange(output.numel(), device="cuda", dtype=torch.int64)
     scratch = torch.zeros(
         output.numel(),
@@ -143,9 +138,7 @@ def _l2_program(program, config):
 def _rms_program(program, config, epsilon, output_dtype):
     program, config = _square_program(program, config)
     reduction_size = next(
-        domain.size
-        for domain in program.iteration_domains
-        if domain.axis in program.reduction_axes
+        domain.size for domain in program.iteration_domains if domain.axis in program.reduction_axes
     )
     post = Cast(
         Unary(
@@ -175,14 +168,10 @@ def _rms_program(program, config, epsilon, output_dtype):
         post=post,
         store=replace(program.store, dtype=output_dtype),
     )
-    output_layout = replace(
-        config.layouts.outputs[program.store.value_id], dtype=output_dtype
-    )
+    output_layout = replace(config.layouts.outputs[program.store.value_id], dtype=output_dtype)
     config = replace(
         config,
-        layouts=replace(
-            config.layouts, outputs={program.store.value_id: output_layout}
-        ),
+        layouts=replace(config.layouts, outputs={program.store.value_id: output_layout}),
     )
     return program, config
 
@@ -214,9 +203,7 @@ def test_reduction_body_launcher_handles_sum_mean_and_norms(tmp_path):
     sum_program, sum_config = _program(Sum(), source)
     mean_program, mean_config = _program(Mean(), source)
     l2_program, l2_config = _l2_program(sum_program, sum_config)
-    rms_program, rms_config = _rms_program(
-        sum_program, sum_config, 1e-6, "torch.bfloat16"
-    )
+    rms_program, rms_config = _rms_program(sum_program, sum_config, 1e-6, "torch.bfloat16")
 
     outputs = {}
     for name, program, config, dtype in (
@@ -226,15 +213,11 @@ def test_reduction_body_launcher_handles_sum_mean_and_norms(tmp_path):
         ("rms", rms_program, rms_config, torch.bfloat16),
     ):
         output = torch.full((rows,), float("nan"), device="cuda", dtype=dtype)
-        outputs[name] = _run_body(
-            name, program, config, gpu_source, output, tmp_path
-        )
+        outputs[name] = _run_body(name, program, config, gpu_source, output, tmp_path)
 
     torch.testing.assert_close(outputs["sum"].cpu(), source.sum(dim=-1))
     torch.testing.assert_close(outputs["mean"].cpu(), source.mean(dim=-1))
-    torch.testing.assert_close(
-        outputs["l2"].cpu(), source.pow(2).sum(dim=-1).sqrt()
-    )
+    torch.testing.assert_close(outputs["l2"].cpu(), source.pow(2).sum(dim=-1).sqrt())
     expected_rms = torch.rsqrt(source.pow(2).mean(dim=-1) + 1e-6)
     torch.testing.assert_close(
         outputs["rms"].cpu(),
@@ -256,6 +239,4 @@ def test_reduction_body_launcher_handles_softmax_maximum(tmp_path):
     output = torch.full((rows, 1), float("nan"), device="cuda")
     result = _run_body("amax", program, config, source.cuda(), output, tmp_path)
 
-    torch.testing.assert_close(
-        result.cpu(), source.amax(dim=-1, keepdim=True), equal_nan=True
-    )
+    torch.testing.assert_close(result.cpu(), source.amax(dim=-1, keepdim=True), equal_nan=True)

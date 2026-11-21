@@ -60,9 +60,7 @@ def _graph(model, inputs):
         inputs,
         output_tree_spec=exported.call_spec.out_spec,
     )
-    return form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    return form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
 
 
 def _plan(graph):
@@ -128,12 +126,8 @@ def test_task28_adds_dependency_for_overlapping_state_reads_and_writes():
             value_cache,
             valid_length,
         ):
-            first = kv_attention(
-                source, key, value, key_cache, value_cache, valid_length
-            )
-            second = kv_attention(
-                source, key, value, key_cache, value_cache, valid_length
-            )
+            first = kv_attention(source, key, value, key_cache, value_cache, valid_length)
+            second = kv_attention(source, key, value, key_cache, value_cache, valid_length)
             return first, second
 
     graph = _graph(TwoStatefulCalls(), _inputs())
@@ -153,9 +147,7 @@ def test_task28_adds_dependency_for_overlapping_state_reads_and_writes():
 def test_task28_emits_runtime_length_reads_and_cache_writes():
     graph = _graph(StatefulAttention(), _inputs())
     selection = select_bodies(graph, _target(), SelectionPolicy(mode="decode"))
-    generated = emit_attention_body(
-        selection.selections[0].program, selection.selections[0].body
-    )
+    generated = emit_attention_body(selection.selections[0].program, selection.selections[0].body)
 
     assert "current_length" in generated.source
     assert "attention:valid_length" not in generated.source
@@ -171,9 +163,7 @@ def test_task28_wrapper_binds_current_cache_and_eager_state_advances():
     cache = KVCache(key_cache, value_cache, valid_length)
     bound = bind_kv_cache(StatefulAttention(), cache)
 
-    exported = torch.export.export(
-        bound, (source, key, value)
-    )
+    exported = torch.export.export(bound, (source, key, value))
     assert any(spec.target == "key_cache" for spec in exported.graph_signature.input_specs)
     assert any(spec.target == "valid_length" for spec in exported.graph_signature.input_specs)
 
@@ -190,8 +180,10 @@ def test_task28_wrapper_binds_current_cache_and_eager_state_advances():
         values = expected_value[:, :end].permute(0, 2, 1, 3)
         scores = (query @ keys.transpose(-2, -1)).float() * 8**-0.5
         expected = (
-            torch.softmax(scores, dim=-1).to(torch.bfloat16) @ values
-        ).permute(0, 2, 1, 3).reshape(2, 1, 8)
+            (torch.softmax(scores, dim=-1).to(torch.bfloat16) @ values)
+            .permute(0, 2, 1, 3)
+            .reshape(2, 1, 8)
+        )
         actual = bound(source, new_key, new_value)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
@@ -205,12 +197,8 @@ def test_task28_normal_torch_compile_frontend_preserves_state_mutation():
     expected_inputs = tuple(
         value.clone() if isinstance(value, torch.Tensor) else value for value in inputs
     )
-    backend = make_backend(
-        mode="decode", compile_kernel=False, cache=False
-    )
-    optimized = torch.compile(
-        StatefulAttention(), backend=backend, fullgraph=True, dynamic=False
-    )
+    backend = make_backend(mode="decode", compile_kernel=False, cache=False)
+    optimized = torch.compile(StatefulAttention(), backend=backend, fullgraph=True, dynamic=False)
 
     with torch.no_grad():
         actual = optimized(*inputs)
@@ -225,9 +213,7 @@ def test_task28_normal_torch_compile_frontend_preserves_state_mutation():
 def test_task28_backend_graph_drops_reinplaced_self_copies():
     inputs = _inputs(capacity=3)
     backend = make_backend(mode="decode", compile_kernel=False, cache=False)
-    optimized = torch.compile(
-        StatefulAttention(), backend=backend, fullgraph=True, dynamic=False
-    )
+    optimized = torch.compile(StatefulAttention(), backend=backend, fullgraph=True, dynamic=False)
     with torch.no_grad():
         optimized(*inputs)
 
@@ -235,13 +221,10 @@ def test_task28_backend_graph_drops_reinplaced_self_copies():
     self_copies = [
         node
         for node in prepared.graph.graph.nodes
-        if node.target is torch.ops.aten.copy_.default
-        and node.args[0] is node.args[1]
+        if node.target is torch.ops.aten.copy_.default and node.args[0] is node.args[1]
     ]
     assert self_copies
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     assert not any(
         operation.attributes.get("target") == "aten.copy_.default"
         for operation in graph.ops.values()

@@ -54,8 +54,15 @@ def megabake_attention_forward(
         # Not covered by the declared op yet: keep the model's own eager path.
         eager = sys.modules[type(module).__module__].eager_attention_forward
         return eager(
-            module, query, key, value, attention_mask,
-            dropout=dropout, scaling=scaling, softcap=softcap, **kwargs,
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=dropout,
+            scaling=scaling,
+            softcap=softcap,
+            **kwargs,
         )
     if scaling is None:
         scaling = query.shape[-1] ** -0.5
@@ -127,8 +134,15 @@ def megabake_decode_attention(
     cache. The cache holds every earlier token, so the causal mask is implied."""
     if megabake_state is None:
         return megabake_attention_forward(
-            module, query, key, value, attention_mask,
-            dropout=dropout, scaling=scaling, softcap=softcap, **kwargs,
+            module,
+            query,
+            key,
+            value,
+            attention_mask,
+            dropout=dropout,
+            scaling=scaling,
+            softcap=softcap,
+            **kwargs,
         )
     if kwargs.get("s_aux") is not None:
         raise NotImplementedError("decode attention with sinks is not declared yet")

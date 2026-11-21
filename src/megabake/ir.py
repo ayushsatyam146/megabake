@@ -117,16 +117,7 @@ class Cast:
     rounding: str
 
 
-ScalarExpression = (
-    Constant
-    | Load
-    | Accumulator
-    | Unary
-    | AxisIndex
-    | Binary
-    | Where
-    | Cast
-)
+ScalarExpression = Constant | Load | Accumulator | Unary | AxisIndex | Binary | Where | Cast
 
 AxisExpression = str | int | AxisAffine | DataIndex
 

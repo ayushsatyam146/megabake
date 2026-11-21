@@ -61,8 +61,6 @@ def test_bucketed_rejects_outputs_that_read_the_padded_shape():
 
 
 def test_bucketed_rejects_lengths_past_the_largest_bucket():
-    wrapper = bucketed(
-        CausalMix(), backend="eager", sequence_args={"tokens": 1}, buckets=(4,)
-    )
+    wrapper = bucketed(CausalMix(), backend="eager", sequence_args={"tokens": 1}, buckets=(4,))
     with pytest.raises(ValueError, match="largest bucket"):
         wrapper.bucket_for(5)

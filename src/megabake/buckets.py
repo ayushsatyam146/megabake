@@ -155,8 +155,12 @@ class bucketed:
 
     def _verify(self, arguments: Mapping[str, Any], length: int, bucket: int) -> None:
         with torch.no_grad():
-            first = self._cut(self.module(**self._pad(arguments, length, bucket, None)), length, bucket)
-            second = self._cut(self.module(**self._pad(arguments, length, bucket, 1)), length, bucket)
+            first = self._cut(
+                self.module(**self._pad(arguments, length, bucket, None)), length, bucket
+            )
+            second = self._cut(
+                self.module(**self._pad(arguments, length, bucket, 1)), length, bucket
+            )
             reference = self.module(**arguments)
         if not all(
             torch.equal(left, right)

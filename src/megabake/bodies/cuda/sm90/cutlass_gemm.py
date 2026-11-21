@@ -34,26 +34,25 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from collections.abc import Sequence
 import contextlib
 import os
-from typing import Optional, Tuple, Type
+from typing import Tuple
 import math
-from math import prod
-import re
-import cuda.bindings.driver as cuda
 
-import cutlass
-import cutlass.cute as cute
-import cutlass.pipeline as pipeline
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
-from cutlass.pipeline.helpers import MbarrierArray
-import cutlass.utils as utils
-import cutlass.utils.hopper_helpers as sm90_utils
-from cutlass.tensor_utils import TensorMapManager, TensorMapUpdateMode
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import dsl_user_op
+from ....platform import (
+    MbarrierArray,
+    cuda,
+    cute,
+    cutlass,
+    dsl_user_op,
+    ir,
+    llvm,
+    pipeline,
+    pipeline_init_arrive,
+    pipeline_init_wait,
+    sm90_utils,
+    utils,
+)
 
 """
 A high-performance batched dense GEMM (C = A * B) example for the NVIDIA Hopper architecture
@@ -186,7 +185,9 @@ def store_bf16_if(address, value, predicate, *, loc=None, ip=None):
     ``predicate`` holds, as one predicated instruction rather than a branch.
     Divergent branches around the direct-store epilogue can make ptxas
     serialize every wgmma of the kernel (C7519)."""
-    bits = llvm.bitcast(ir.IntegerType.get_signless(16), value.ir_value(loc=loc, ip=ip), loc=loc, ip=ip)
+    bits = llvm.bitcast(
+        ir.IntegerType.get_signless(16), value.ir_value(loc=loc, ip=ip), loc=loc, ip=ip
+    )
     llvm.inline_asm(
         res=None,
         operands_=[
@@ -290,9 +291,7 @@ class HopperWgmmaGemmPersistentKernel:
         # For large tile size, using two warp groups is preferred because using only one warp
         # group may result in register spill
         self.atom_layout_mnk = (
-            (2, 1, 1)
-            if self.tile_shape_mnk[0] > 64 and self.tile_shape_mnk[1] > 128
-            else (1, 1, 1)
+            (2, 1, 1) if self.tile_shape_mnk[0] > 64 and self.tile_shape_mnk[1] > 128 else (1, 1, 1)
         )
         self.num_mcast_ctas_a = None
         self.num_mcast_ctas_b = None
@@ -309,9 +308,7 @@ class HopperWgmmaGemmPersistentKernel:
             self.num_dma_warp_groups + self.num_mma_warp_groups
         ) * self.num_threads_per_warp_group
         self.load_warp_id = 0
-        self.epi_store_warp_id = (
-            self.num_dma_warp_groups * self.num_warps_per_warp_group
-        )
+        self.epi_store_warp_id = self.num_dma_warp_groups * self.num_warps_per_warp_group
         self.load_register_requirement = 40
         self.mma_register_requirement = 232
         # MegaBake: a mixed megakernel shares shared memory with other bodies,
@@ -392,9 +389,7 @@ class HopperWgmmaGemmPersistentKernel:
         self.shared_storage = None
         self.buffer_align_bytes = 1024
 
-        self.num_mma_threads = (
-            self.num_mma_warp_groups * self.num_threads_per_warp_group
-        )
+        self.num_mma_threads = self.num_mma_warp_groups * self.num_threads_per_warp_group
         self.epilog_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=self.num_mma_threads
         )
@@ -552,14 +547,10 @@ class HopperWgmmaGemmPersistentKernel:
         self.b_layout = utils.LayoutEnum.from_tensor(b)
         self.c_layout = utils.LayoutEnum.from_tensor(c)
 
-        if cutlass.const_expr(
-            self.a_dtype.width == 16 and self.a_dtype != self.b_dtype
-        ):
+        if cutlass.const_expr(self.a_dtype.width == 16 and self.a_dtype != self.b_dtype):
             raise TypeError(f"Type mismatch: {self.a_dtype} != {self.b_dtype}")
         if cutlass.const_expr(self.a_dtype.width != self.b_dtype.width):
-            raise TypeError(
-                f"Type width mismatch: {self.a_dtype.width} != {self.b_dtype.width}"
-            )
+            raise TypeError(f"Type width mismatch: {self.a_dtype.width} != {self.b_dtype.width}")
         if cutlass.const_expr(self.a_dtype.width != 16 and self.a_dtype.width != 8):
             raise TypeError("a_dtype should be float16, float8, or int8 ")
 
@@ -585,7 +576,7 @@ class HopperWgmmaGemmPersistentKernel:
             self.epi_tile,
         )
 
-        tile_sched_params, grid = self._compute_grid(
+        tile_sched_params, _ = self._compute_grid(
             c,
             self.schedule_tile_mnk,
             self.cluster_shape_mn,
@@ -605,15 +596,11 @@ class HopperWgmmaGemmPersistentKernel:
             # 3; see stream_stages).
             split_arrival: cute.struct.MemRange[cutlass.Int32, 4]
             sA: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.a_dtype, cute.cosize(self.a_smem_layout_staged)
-                ],
+                cute.struct.MemRange[self.a_dtype, cute.cosize(self.a_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
             sB: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.b_dtype, cute.cosize(self.b_smem_layout_staged)
-                ],
+                cute.struct.MemRange[self.b_dtype, cute.cosize(self.b_smem_layout_staged)],
                 self.buffer_align_bytes,
             ]
             sC: cute.struct.Align[
@@ -657,9 +644,7 @@ class HopperWgmmaGemmPersistentKernel:
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
-        tensor_bindings, epilogue, tile_sched_params = self.prepare(
-            a, b, c, max_active_clusters
-        )
+        tensor_bindings, epilogue, tile_sched_params = self.prepare(a, b, c, max_active_clusters)
         (
             tma_atom_a,
             tma_tensor_a,
@@ -694,7 +679,6 @@ class HopperWgmmaGemmPersistentKernel:
             min_blocks_per_mp=1,
             stream=stream,
         )
-        return
 
     @cute.jit
     def run(
@@ -882,9 +866,7 @@ class HopperWgmmaGemmPersistentKernel:
                         tma_atom_a,
                         tAgA_mkl[(None, producer_state.count)],
                         tAsA[(None, a_stage + 1)],
-                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(
-                            producer_state
-                        ),
+                        tma_bar_ptr=mainloop_pipeline.producer_get_barrier(producer_state),
                         mcast_mask=0,
                         tma_desc_ptr=desc_a2,
                     )
@@ -1095,14 +1077,10 @@ class HopperWgmmaGemmPersistentKernel:
         under a run-time condition (see ``kernel``)."""
         # Each warp will constribute to the arrive count with the number of mcast size
         mcast_size = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
-        consumer_arrive_cnt = (
-            mcast_size * self.num_mma_warp_groups * self.num_warps_per_warp_group
-        )
+        consumer_arrive_cnt = mcast_size * self.num_mma_warp_groups * self.num_warps_per_warp_group
         tma_copy_bytes = cute.size_in_bytes(
             self.a_dtype, cute.slice_(a_smem_layout_staged, (None, None, 0))
-        ) + cute.size_in_bytes(
-            self.b_dtype, cute.slice_(b_smem_layout_staged, (None, None, 0))
-        )
+        ) + cute.size_in_bytes(self.b_dtype, cute.slice_(b_smem_layout_staged, (None, None, 0)))
         with contextlib.nullcontext() if initialize else _without_mbarrier_init():
             return pipeline.PipelineTmaAsync.create(
                 barrier_storage=storage.mainloop_pipeline_array_ptr.data_ptr(),
@@ -1216,7 +1194,7 @@ class HopperWgmmaGemmPersistentKernel:
         # different CTAs, so the scheduler sees a rotated block index.
         schedule_block = cute.arch.block_idx()
         if cutlass.const_expr(rotated_block is not None):
-            block_x, block_y, block_z = schedule_block
+            block_x, block_y, _ = schedule_block
             schedule_block = (block_x, block_y, rotated_block)
 
         # MegaBake: table launches pass per-phase descriptors in global
@@ -1235,17 +1213,11 @@ class HopperWgmmaGemmPersistentKernel:
                 cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_b)
                 cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_c)
 
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
-        )
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         cluster_coord_mnk = cta_layout_mnk.get_flat_coord(cta_rank_in_cluster)
 
-        a_mcast_mask = cute.make_layout_image_mask(
-            cta_layout_mnk, cluster_coord_mnk, mode=1
-        )
-        b_mcast_mask = cute.make_layout_image_mask(
-            cta_layout_mnk, cluster_coord_mnk, mode=0
-        )
+        a_mcast_mask = cute.make_layout_image_mask(cta_layout_mnk, cluster_coord_mnk, mode=1)
+        b_mcast_mask = cute.make_layout_image_mask(cta_layout_mnk, cluster_coord_mnk, mode=0)
 
         a_mcast_mask = a_mcast_mask if self.is_a_mcast else 0
         b_mcast_mask = b_mcast_mask if self.is_b_mcast else 0
@@ -1292,9 +1264,7 @@ class HopperWgmmaGemmPersistentKernel:
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
         # Generate smem tensor A/B
-        sA = storage.sA.get_tensor(
-            a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner
-        )
+        sA = storage.sA.get_tensor(a_smem_layout_staged.outer, swizzle=a_smem_layout_staged.inner)
         # The same memory as TMA writes it (64-row half-stages when paired).
         # Layouts built in prepare belong to the host function, so the kernel
         # rebuilds the paired one.
@@ -1304,9 +1274,7 @@ class HopperWgmmaGemmPersistentKernel:
         sA_tma = storage.sA.get_tensor(
             a_tma_smem_layout_staged.outer, swizzle=a_tma_smem_layout_staged.inner
         )
-        sB = storage.sB.get_tensor(
-            b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner
-        )
+        sB = storage.sB.get_tensor(b_smem_layout_staged.outer, swizzle=b_smem_layout_staged.inner)
         sC = storage.sC.get_tensor(
             epi_smem_layout_staged.outer, swizzle=epi_smem_layout_staged.inner
         )
@@ -1355,9 +1323,7 @@ class HopperWgmmaGemmPersistentKernel:
         )
 
         # Partition global tensor for TiledMMA_A/B/C
-        warp_group_idx = cute.arch.make_warp_uniform(
-            tidx // self.num_threads_per_warp_group
-        )
+        warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         mma_warp_group_thread_layout = cute.make_layout(
             self.num_mma_warp_groups, stride=self.num_threads_per_warp_group
         )
@@ -2036,9 +2002,7 @@ class HopperWgmmaGemmPersistentKernel:
 
         epi_tile_num = cute.size(tCgC_for_tma_partition, mode=[1])
         epi_tile_shape = tCgC_for_tma_partition.shape[1]
-        epi_tile_layout = cute.make_layout(
-            epi_tile_shape, stride=(epi_tile_shape[1], 1)
-        )
+        epi_tile_layout = cute.make_layout(epi_tile_shape, stride=(epi_tile_shape[1], 1))
 
         num_prev_epi_tiles = tile_sched.num_tiles_executed * epi_tile_num
         if cutlass.const_expr(self.bias_features > 0 or self.direct_store):
@@ -2047,9 +2011,7 @@ class HopperWgmmaGemmPersistentKernel:
             # register in the epilogue subtile. (The MMA slice is per
             # warpgroup, and the stmatrix destination side names the rows a
             # thread addresses, not the values it holds.)
-            epi_coordinates = thr_copy_r2s.partition_S(
-                cute.make_identity_tensor(self.epi_tile)
-            )
+            epi_coordinates = thr_copy_r2s.partition_S(cute.make_identity_tensor(self.epi_tile))
         if cutlass.const_expr(self.bias_features > 0):
             bias = cute.make_tensor(
                 cute.make_ptr(
@@ -2116,9 +2078,7 @@ class HopperWgmmaGemmPersistentKernel:
                 continue
 
             # Copy from D registers to shared memory
-            epi_buffer = (num_prev_epi_tiles + epi_idx) % cute.size(
-                tRS_sD, mode=[3]
-            )
+            epi_buffer = (num_prev_epi_tiles + epi_idx) % cute.size(tRS_sD, mode=[3])
             cute.copy(
                 tiled_copy_r2s,
                 tRS_rD_out,
@@ -2149,7 +2109,6 @@ class HopperWgmmaGemmPersistentKernel:
             # MegaBake: reconverge the MMA warpgroup after its per-element
             # stores before the next tile's wgmma.
             self.epilog_sync_barrier.arrive_and_wait()
-
 
     @cute.jit
     def _store_paired_tile(
@@ -2201,9 +2160,7 @@ class HopperWgmmaGemmPersistentKernel:
         self.epilog_sync_barrier.arrive_and_wait()
 
     @cute.jit
-    def _apply_epilogue(
-        self, plain, accumulator, accumulator_1, token, feature, epilogue_state
-    ):
+    def _apply_epilogue(self, plain, accumulator, accumulator_1, token, feature, epilogue_state):
         """``plain`` for epilogue kind 0, else epilogue ``kind`` of this
         output element; every kind is one branch of the same body."""
         kind, tensors = epilogue_state
@@ -2250,8 +2207,7 @@ class HopperWgmmaGemmPersistentKernel:
         a_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
         b_shape = cute.slice_(tile_shape_mnk, (0, None, None))
         ab_bytes_per_stage = (
-            cute.size(a_shape) * a_dtype.width // 8
-            + cute.size(b_shape) * b_dtype.width // 8
+            cute.size(a_shape) * a_dtype.width // 8 + cute.size(b_shape) * b_dtype.width // 8
         )
         c_bytes_per_stage = cute.size(epi_tile) * c_dtype.width // 8
         epi_stage = 4
@@ -2269,7 +2225,7 @@ class HopperWgmmaGemmPersistentKernel:
         tile_shape_mnk: tuple[int, int, int],
         element_type: type[cutlass.Numeric],
         is_cooperative: bool = False,
-        epi_tile_override: Optional[tuple[int, int]] = None,
+        epi_tile_override: tuple[int, int] | None = None,
     ) -> tuple[int, int]:
         """Compute the epilogue tile shape or use override if provided.
 
@@ -2339,12 +2295,8 @@ class HopperWgmmaGemmPersistentKernel:
         """
         a_smem_shape = cute.slice_(tile_shape_mnk, (None, 0, None))
 
-        a_is_k_major = (
-            a_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
-        )
-        b_is_k_major = (
-            b_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
-        )
+        a_is_k_major = a_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
+        b_is_k_major = b_layout.sm90_mma_major_mode() == cute.nvgpu.warpgroup.OperandMajorMode.K
         a_major_mode_size = tile_shape_mnk[2 if a_is_k_major else 0]
         a_smem_layout_atom = cute.nvgpu.warpgroup.make_smem_layout_atom(
             sm90_utils.get_smem_layout_atom(
@@ -2404,7 +2356,7 @@ class HopperWgmmaGemmPersistentKernel:
         raster_along_m: bool,
         max_active_clusters: cutlass.Constexpr,
         splits: int = 1,
-    ) -> tuple[int, int, int]:
+    ) -> tuple[int, int]:
         """Compute grid shape for the output tensor C.
 
         :param c: The output tensor C
@@ -2506,10 +2458,10 @@ class HopperWgmmaGemmPersistentKernel:
 
     @staticmethod
     def is_valid_dtypes(
-        a_dtype: Type[cutlass.Numeric],
-        b_dtype: Type[cutlass.Numeric],
-        acc_dtype: Type[cutlass.Numeric],
-        c_dtype: Type[cutlass.Numeric],
+        a_dtype: type[cutlass.Numeric],
+        b_dtype: type[cutlass.Numeric],
+        acc_dtype: type[cutlass.Numeric],
+        c_dtype: type[cutlass.Numeric],
         a_major: str,
         b_major: str,
     ) -> bool:
@@ -2555,9 +2507,7 @@ class HopperWgmmaGemmPersistentKernel:
             is_valid = False
 
         # for 8-bit types, this implementation only supports k-major layout
-        if (a_dtype.width == 8 and a_major != "k") or (
-            b_dtype.width == 8 and b_major != "k"
-        ):
+        if (a_dtype.width == 8 and a_major != "k") or (b_dtype.width == 8 and b_major != "k"):
             is_valid = False
 
         # Define compatibility mapping between accumulator type and AB type
@@ -2612,8 +2562,8 @@ class HopperWgmmaGemmPersistentKernel:
         n: int,
         k: int,
         l: int,
-        ab_dtype: Type[cutlass.Numeric],
-        c_dtype: Type[cutlass.Numeric],
+        ab_dtype: type[cutlass.Numeric],
+        c_dtype: type[cutlass.Numeric],
         a_major: str,
         b_major: str,
         c_major: str,

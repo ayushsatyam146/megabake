@@ -130,7 +130,11 @@ def _rotate_half_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate |
         return None
     if any(
         len(program.iteration_domains) != rank
-        for program in (x_multiply.tensor_program, rotate_multiply.tensor_program, add.tensor_program)
+        for program in (
+            x_multiply.tensor_program,
+            rotate_multiply.tensor_program,
+            add.tensor_program,
+        )
     ):
         return None
 
@@ -146,7 +150,9 @@ def _rotate_half_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate |
     leaf_loads: list[IndexedLoad] = []
     leaf_ids: dict[tuple[str, tuple[Any, ...]], str] = {}
 
-    def leaf(value_id: str, axes: tuple[Any, ...], strides: tuple[int, ...], dtype: str, shape) -> Load:
+    def leaf(
+        value_id: str, axes: tuple[Any, ...], strides: tuple[int, ...], dtype: str, shape
+    ) -> Load:
         key = (value_id, axes)
         if key not in leaf_ids:
             leaf_ids[key] = f"load:{len(leaf_loads)}"
@@ -169,7 +175,11 @@ def _rotate_half_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate |
                 axis in output_axes or isinstance(axis, int) for axis in load.axes
             ):
                 replacements[load.id] = leaf(
-                    load.value_id, tuple(load.axes), tuple(load.strides), load.dtype, load.source_shape
+                    load.value_id,
+                    tuple(load.axes),
+                    tuple(load.strides),
+                    load.dtype,
+                    load.source_shape,
                 )
             else:
                 return None
@@ -245,11 +255,7 @@ def _split_halves_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate 
     if not isinstance(program, TensorProgram):
         return None
     concat_axis = next(
-        (
-            index
-            for index, axis in enumerate(program.loads[0].axes)
-            if isinstance(axis, AxisAffine)
-        ),
+        (index for index, axis in enumerate(program.loads[0].axes) if isinstance(axis, AxisAffine)),
         None,
     )
     if concat_axis != len(graph.values[concat.results[0]].shape or ()) - 1:
@@ -289,9 +295,7 @@ def _split_halves_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate 
     trig_ids = tuple(value_id for value_id, count in roots.items() if count == 2)
     cos_id, sin_id = trig_ids
     if any(
-        (
-            producer := producer_of(root_id, graph)
-        ) is not None
+        (producer := producer_of(root_id, graph)) is not None
         and matches_target(producer, "prims.convert_element_type.default")
         for root_id in roots
     ):
@@ -315,17 +319,14 @@ def _split_halves_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate 
         or cos.shape[-1] % 2
         or output.shape[-1] < cos.shape[-1]
         or output.dtype not in {"torch.float32", "torch.bfloat16"}
-        or not {x.dtype, cos.dtype, sin.dtype, output.dtype} == {output.dtype}
+        or {x.dtype, cos.dtype, sin.dtype, output.dtype} != {output.dtype}
         or any(stride < 0 for stride in (*x.strides, *cos.strides, *sin.strides, *output.strides))
     ):
         return None
     rank = len(output.shape)
     rotary_width = cos.shape[-1]
     half_width = rotary_width // 2
-    if any(
-        cos.shape[index] != output.shape[index]
-        for index in range(len(cos.shape) - 1)
-    ):
+    if any(cos.shape[index] != output.shape[index] for index in range(len(cos.shape) - 1)):
         return None
 
     output_axes = tuple(f"o{index}" for index in range(rank))
@@ -351,11 +352,7 @@ def _split_halves_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate 
         key = (root_id, offset)
         if key not in load_ids:
             load_ids[key] = f"load:{len(loads_list)}"
-            axis = (
-                final_axis
-                if offset == 0
-                else AxisAffine((AxisTerm(final_axis),), offset=offset)
-            )
+            axis = final_axis if offset == 0 else AxisAffine((AxisTerm(final_axis),), offset=offset)
             loads_list.append(
                 IndexedLoad(
                     load_ids[key],
@@ -370,9 +367,7 @@ def _split_halves_candidate(concat: Op, graph: ComputeGraph) -> RegionCandidate 
 
     branch_loads = []
     for multiply, branch_start in zip(multiplies, (0, 0, half_width, half_width)):
-        operands = tuple(
-            operand_load(operand_id, branch_start) for operand_id in multiply.operands
-        )
+        operands = tuple(operand_load(operand_id, branch_start) for operand_id in multiply.operands)
         if any(operand is None for operand in operands):
             return None
         branch_loads.append(operands)
@@ -512,7 +507,7 @@ def _last_axis_slice(value_id: str, graph: ComputeGraph) -> tuple[str, int] | No
             arguments = tuple(producer.attributes.get("fx_args", ()))
             dimension, slice_start, _, step = (
                 *arguments[1:5],
-                *(0, 0, None, 1)[len(arguments[1:5]):],
+                *(0, 0, None, 1)[len(arguments[1:5]) :],
             )
             slice_start = 0 if slice_start is None else slice_start
             if (
@@ -541,4 +536,3 @@ def _view_root(value_id: str, graph: ComputeGraph) -> str | None:
         ):
             return value_id
         value_id = producer.operands[0]
-

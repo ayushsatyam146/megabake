@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-
 import os
 
 import pytest
@@ -9,7 +8,6 @@ import torch
 from torch.autograd import DeviceType
 
 from tests.fixtures import SmolLMArchitecture, StatefulSmolLMArchitecture
-
 
 
 def _sm90_available() -> bool:
@@ -30,8 +28,7 @@ def _assert_tuned_projections(compiled, layers: int = 30) -> None:
     # up run as one paired GEMM.
     assert compiled.generated.launch.launch_policy == "megabake_cooperative_table"
     assert (
-        sum(phase.body.provider == "g0_range" for phase in compiled.plan.phases)
-        == 6 * layers + 1
+        sum(phase.body.provider == "g0_range" for phase in compiled.plan.phases) == 6 * layers + 1
     )
     assert compiled.plan.launch.grid_size == compiled.resources.max_cooperative_workers
 
@@ -44,9 +41,7 @@ def test_task31_compiles_complete_smollm_architecture(tmp_path):
     input_ids = torch.tensor([[1, 2, 3, 4]], device="cuda")
     second_input_ids = torch.tensor([[5, 6, 7, 8]], device="cuda")
     attention_mask = torch.ones(1, 4, dtype=torch.int64, device="cuda")
-    second_attention_mask = torch.tensor(
-        [[1, 1, 1, 0]], dtype=torch.int64, device="cuda"
-    )
+    second_attention_mask = torch.tensor([[1, 1, 1, 0]], dtype=torch.int64, device="cuda")
 
     backend = make_backend(
         mode="prefill",
@@ -92,44 +87,32 @@ def test_task31_compiles_complete_smollm_architecture(tmp_path):
     assert trace.workload_kernel_launches == 1
     assert trace.recurring_gpu_operations == (("workload_kernel", 1),)
 
-    with torch.profiler.profile(
-        activities=[
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ]
-    ) as profiler, torch.no_grad():
+    with (
+        torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ]
+        ) as profiler,
+        torch.no_grad(),
+    ):
         optimized(*second_inputs)
         torch.cuda.synchronize()
-    assert (
-        len(
-            [
-                event
-                for event in profiler.events()
-                if event.device_type == DeviceType.CUDA
-            ]
-        )
-        == 1
-    )
+    assert len([event for event in profiler.events() if event.device_type == DeviceType.CUDA]) == 1
 
 
 def test_task31_compiles_complete_stateful_smollm_decode(tmp_path):
     from megabake import make_backend, verify_plan
 
     torch.manual_seed(31)
-    model = StatefulSmolLMArchitecture(
-        layers=30, device="cuda", dtype=torch.bfloat16
-    )
+    model = StatefulSmolLMArchitecture(layers=30, device="cuda", dtype=torch.bfloat16)
     key_caches = tuple(
-        torch.zeros(1, 4, 3, 64, device="cuda", dtype=torch.bfloat16)
-        for _ in range(30)
+        torch.zeros(1, 4, 3, 64, device="cuda", dtype=torch.bfloat16) for _ in range(30)
     )
     value_caches = tuple(
-        torch.zeros(1, 4, 3, 64, device="cuda", dtype=torch.bfloat16)
-        for _ in range(30)
+        torch.zeros(1, 4, 3, 64, device="cuda", dtype=torch.bfloat16) for _ in range(30)
     )
-    valid_lengths = tuple(
-        torch.zeros(1, device="cuda", dtype=torch.int32) for _ in range(30)
-    )
+    valid_lengths = tuple(torch.zeros(1, device="cuda", dtype=torch.int32) for _ in range(30))
     reference_key_caches = tuple(cache.clone() for cache in key_caches)
     reference_value_caches = tuple(cache.clone() for cache in value_caches)
     reference_lengths = tuple(length.clone() for length in valid_lengths)
@@ -140,9 +123,7 @@ def test_task31_compiles_complete_stateful_smollm_decode(tmp_path):
     exact_lengths = tuple(length.clone() for length in valid_lengths)
 
     def advance_exact(token, position_ids):
-        exact_model(
-            token, position_ids, *exact_key_caches, *exact_value_caches, *exact_lengths
-        )
+        exact_model(token, position_ids, *exact_key_caches, *exact_value_caches, *exact_lengths)
 
     backend = make_backend(
         mode="decode",
@@ -182,9 +163,7 @@ def test_task31_compiles_complete_stateful_smollm_decode(tmp_path):
                 torch.profiler.ProfilerActivity.CUDA,
             ]
         ) as profiler:
-            actual = optimized(
-                tokens[3], position_ids, *key_caches, *value_caches, *valid_lengths
-            )
+            actual = optimized(tokens[3], position_ids, *key_caches, *value_caches, *valid_lengths)
             torch.cuda.synchronize()
         expected = model(
             tokens[3],
@@ -210,9 +189,7 @@ def test_task31_compiles_complete_stateful_smollm_decode(tmp_path):
         assert relative(actual_cache, exact_cache) <= (
             1.25 * relative(reference_cache, exact_cache) + 1e-3
         )
-    for actual_length, reference_length in zip(
-        valid_lengths, reference_lengths, strict=True
-    ):
+    for actual_length, reference_length in zip(valid_lengths, reference_lengths, strict=True):
         torch.testing.assert_close(actual_length, reference_length, rtol=0, atol=0)
         assert int(actual_length.item()) == 4
 
@@ -226,13 +203,7 @@ def test_task31_compiles_complete_stateful_smollm_decode(tmp_path):
     trace = backend.megabake_last_trace[-1]
     assert trace.workload_kernel_launches == 1
     assert trace.recurring_gpu_operations == (("workload_kernel", 1),)
-    assert len(
-        [
-            event
-            for event in profiler.events()
-            if event.device_type == DeviceType.CUDA
-        ]
-    ) == 1
+    assert len([event for event in profiler.events() if event.device_type == DeviceType.CUDA]) == 1
 
 
 def _pinned_smollm():

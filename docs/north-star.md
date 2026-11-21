@@ -1,6 +1,6 @@
 # MegaBake North Star
 
-MegaBake turns a captured PyTorch model into a planned, composable CUDA megakernel. PyTorch and Hugging Face remain the model, parameter, and runtime interface; MegaBake owns graph-region fusion, device-body selection, scheduling, and execution planning and everything else and is responsible for giving the final megakernel. 
+MegaBake turns a captured PyTorch model into a planned, composable CUDA megakernel. PyTorch and Hugging Face remain the model, parameter, and runtime interface; MegaBake owns graph-region fusion, device-body selection, scheduling, and execution planning and everything else and is responsible for giving the final megakernel.
 
 ## Compilation path
 

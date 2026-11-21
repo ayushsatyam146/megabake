@@ -1,19 +1,15 @@
 from __future__ import annotations
 
 import contextlib
-from dataclasses import dataclass
 import os
+from dataclasses import dataclass
 from typing import Protocol
 
-import cutlass
-import cutlass.cute as cute
 import torch
-from cuda.bindings import driver as cuda
-from cutlass._mlir.dialects import llvm
-from cutlass.cutlass_dsl import dsl_user_op
 
 from .memory import verify_plan
 from .plan import KernelPlan
+from .platform import cuda, cute, cutlass, dsl_user_op, llvm
 from .schedule import EventSchedule, simulate_event_schedule
 
 
@@ -63,7 +59,7 @@ def ready_slots(workers: int) -> int:
 # 60-SM H200 slice (artifacts/step3_2026-10-21). Issuing them blocks warp 0
 # once the SM's TMA queue is full, so they overlap little beyond the barrier
 # wait.
-WEIGHT_STREAM_STAGES = int(os.environ.get("MEGABAKE_WEIGHT_STREAM_STAGES", 0))
+WEIGHT_STREAM_STAGES = int(os.environ.get("MEGABAKE_WEIGHT_STREAM_STAGES", "0"))
 
 
 # Host-mapped buffers holding table launches' per-call boundary addresses;
@@ -395,9 +391,7 @@ def checked_mbarrier_wait(
 
 
 @cute.jit
-def counting_grid_barrier(
-    ready: cute.Tensor, workers: cutlass.Int32, ordinal: cutlass.Int32
-):
+def counting_grid_barrier(ready: cute.Tensor, workers: cutlass.Int32, ordinal: cutlass.Int32):
     """Grid barrier on an arrival counter that only grows.
 
     Barrier ``ordinal`` (counted densely from the last ready reset) completes
@@ -425,9 +419,7 @@ def counting_grid_arrive(ready: cute.Tensor, workers: cutlass.Int32):
 
 
 @cute.jit
-def counting_grid_wait(
-    ready: cute.Tensor, workers: cutlass.Int32, ordinal: cutlass.Int32
-):
+def counting_grid_wait(ready: cute.Tensor, workers: cutlass.Int32, ordinal: cutlass.Int32):
     """The waiting half of ``counting_grid_barrier``."""
     thread, _, _ = cute.arch.thread_idx()
     if thread == 0:
@@ -758,9 +750,7 @@ def admit_runtime(plan: KernelPlan) -> RuntimeAdmission:
 
     if plan.launch.max_active_blocks_per_sm is None:
         raise InvalidRuntime("plan has no compiled active-block capacity")
-    max_workers = (
-        plan.launch.max_active_blocks_per_sm * properties.multi_processor_count
-    )
+    max_workers = plan.launch.max_active_blocks_per_sm * properties.multi_processor_count
     if plan.launch.grid_size > max_workers:
         raise InvalidRuntime(
             f"cooperative grid {plan.launch.grid_size} exceeds capacity {max_workers}"
@@ -797,9 +787,7 @@ def execute_phase_plan(
     if not capturable and _stream_is_capturing(active_stream):
         raise InvalidRuntime("CUDA Graph capture is not supported for phase plans")
     with torch.cuda.stream(active_stream):
-        selected_ready = (
-            ready if ready is not None else make_ready(plan.launch.grid_size, device)
-        )
+        selected_ready = ready if ready is not None else make_ready(plan.launch.grid_size, device)
         selected_epoch = 0 if epoch is None else epoch
         kernel(selected_ready, selected_epoch, active_stream)
         if synchronize:
@@ -818,10 +806,7 @@ def admit_event_runtime(schedule: EventSchedule) -> EventRuntimeAdmission:
     if any(event.trigger_count < 1 for event in schedule.events):
         raise InvalidRuntime("event plans require at least one producer per event")
     max_invocations = min(
-        (
-            _MAX_INT32 // event.trigger_count
-            for event in schedule.events
-        ),
+        (_MAX_INT32 // event.trigger_count for event in schedule.events),
         default=_MAX_INT32,
     )
     if max_invocations < 1:
@@ -850,27 +835,26 @@ def execute_event_plan(
     if _stream_is_capturing(active_stream):
         raise InvalidRuntime("CUDA Graph capture is not supported for event plans")
     with torch.cuda.stream(active_stream):
-        selected_events = events if events is not None else torch.zeros(
-            selected_admission.event_count,
-            dtype=torch.int32,
-            device=device,
+        selected_events = (
+            events
+            if events is not None
+            else torch.zeros(
+                selected_admission.event_count,
+                dtype=torch.int32,
+                device=device,
+            )
         )
         if tuple(selected_events.shape) != (selected_admission.event_count,):
             raise InvalidRuntime("event tensor shape does not match the event plan")
         if selected_events.dtype != torch.int32 or selected_events.device != device:
             raise InvalidRuntime("event tensor must be an int32 tensor on the stream device")
-        if (
-            epoch is not None
-            and not 0 <= epoch < selected_admission.max_invocations
-        ):
+        if epoch is not None and not 0 <= epoch < selected_admission.max_invocations:
             raise InvalidRuntime("event epoch would overflow int32 counters")
         selected_epoch = 0 if epoch is None else epoch
         if events is not None and validate_counters:
             if selected_epoch == 0:
                 if selected_events.count_nonzero():
-                    raise InvalidRuntime(
-                        "the first event invocation requires zeroed counters"
-                    )
+                    raise InvalidRuntime("the first event invocation requires zeroed counters")
             else:
                 for event in schedule.events:
                     if selected_events[event.id].item() != selected_epoch * event.trigger_count:
@@ -902,6 +886,6 @@ def _cooperative_launch_supported() -> bool:
 
 def _stream_is_capturing(stream: torch.cuda.Stream) -> bool:
     status, capture = cuda.cuStreamIsCapturing(cuda.CUstream(stream.cuda_stream))
-    return int(status) == 0 and int(
-        capture
-    ) == int(cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE)
+    return int(status) == 0 and int(capture) == int(
+        cuda.CUstreamCaptureStatus.CU_STREAM_CAPTURE_STATUS_ACTIVE
+    )

@@ -131,7 +131,9 @@ def main() -> None:
     divergent = [row for row in rows if row.relative_error > arguments.tolerance]
     print(f"compared {len(rows)} values; {len(divergent)} exceed {arguments.tolerance}")
     for row in divergent[:20]:
-        print(f"phase {row.phase:5d}  {row.region_id:45s} {row.value_id:35s} {row.relative_error:.4g}")
+        print(
+            f"phase {row.phase:5d}  {row.region_id:45s} {row.value_id:35s} {row.relative_error:.4g}"
+        )
 
 
 if __name__ == "__main__":

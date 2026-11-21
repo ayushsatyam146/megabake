@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 from dataclasses import replace
 
 import pytest
@@ -13,12 +14,11 @@ from megabake import (
     verify_plan,
 )
 from megabake.bodies import TargetFacts
+from megabake.compiler import _workspace_view
 from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
-from megabake.memory import InvalidStorage
-from megabake.memory import _allocate_workspace, _make_workspace_request
-from megabake.compiler import _workspace_view
+from megabake.memory import InvalidStorage, _allocate_workspace, _make_workspace_request
 from megabake.regions import form_regions
 
 
@@ -38,9 +38,7 @@ def _target() -> TargetFacts:
 def _graph(model, *inputs):
     exported = torch.export.export(model, inputs)
     prepared = prepare_fx_graph(exported.graph_module, inputs)
-    return form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    return form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
 
 
 def _kernel_plan(model, *inputs):
@@ -65,23 +63,17 @@ def test_assign_storage_separates_live_intermediates_and_boundary_outputs():
     assert second.offset_bytes == 128
     assert first.size_bytes == second.size_bytes == 128
     assert plan.storage.workspace_bytes == 256
-    workspace_values = {
-        assignment.value_id for assignment in plan.storage.workspace
-    }
+    workspace_values = {assignment.value_id for assignment in plan.storage.workspace}
     assert all(
         binding.kind == "workspace"
         for binding in plan.storage.bindings
         if binding.value_id in workspace_values
     )
     output = next(
-        binding
-        for binding in plan.storage.bindings
-        if binding.value_id == plan.graph.outputs[0]
+        binding for binding in plan.storage.bindings if binding.value_id == plan.graph.outputs[0]
     )
     assert output.kind == "output"
-    assert output.storage_id not in {
-        assignment.storage_id for assignment in plan.storage.workspace
-    }
+    assert output.storage_id not in {assignment.storage_id for assignment in plan.storage.workspace}
 
     scratch = plan.storage.worker_scratch[0]
     assert len(scratch.phases) == len(plan.phases)
@@ -132,9 +124,7 @@ def test_assign_storage_extends_producer_lifetime_through_aliased_reader():
     verify_plan(plan)
 
     (producer,) = plan.storage.workspace
-    reader_phase = next(
-        phase.index for phase in plan.phases if phase.region_id == "region:relu"
-    )
+    reader_phase = next(phase.index for phase in plan.phases if phase.region_id == "region:relu")
     assert producer.value_id == "value:mm"
     assert producer.lifetime.reader_region_ids == ("region:relu",)
     assert producer.lifetime.end_phase == reader_phase + 1
@@ -306,9 +296,7 @@ def test_assign_storage_keeps_output_viewed_values_out_of_workspace():
     plan = _kernel_plan(Model(), torch.randn(4, 8))
     verify_plan(plan)
 
-    assert "value:relu" not in {
-        assignment.value_id for assignment in plan.storage.workspace
-    }
+    assert "value:relu" not in {assignment.value_id for assignment in plan.storage.workspace}
     assert any(
         binding.value_id == "value:relu" and binding.kind == "output"
         for binding in plan.storage.bindings
@@ -333,5 +321,5 @@ def test_assign_storage_can_keep_every_intermediate_distinct():
         (assignment.offset_bytes, assignment.offset_bytes + assignment.size_bytes)
         for assignment in distinct.storage.workspace
     )
-    assert all(end <= start for (_, end), (start, _) in zip(slices, slices[1:]))
+    assert all(end <= start for (_, end), (start, _) in itertools.pairwise(slices))
     assert distinct.storage.workspace_bytes >= reused.storage.workspace_bytes

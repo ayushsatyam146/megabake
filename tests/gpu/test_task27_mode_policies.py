@@ -5,7 +5,6 @@ import torch
 
 from megabake import make_backend
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),
     reason="task 27 requires an SM90 CUDA device",
@@ -14,15 +13,11 @@ pytestmark = pytest.mark.skipif(
 
 def grouped_attention(source, key, value, mask):
     query = source.permute(0, 2, 1, 3)
-    grouped_key = key.permute(0, 2, 1, 3).repeat_interleave(
-        source.shape[2] // key.shape[2], dim=1
-    )
+    grouped_key = key.permute(0, 2, 1, 3).repeat_interleave(source.shape[2] // key.shape[2], dim=1)
     grouped_value = value.permute(0, 2, 1, 3).repeat_interleave(
         source.shape[2] // value.shape[2], dim=1
     )
-    scores = (
-        query @ grouped_key.transpose(-2, -1)
-    ) * source.shape[-1] ** -0.5 + mask
+    scores = (query @ grouped_key.transpose(-2, -1)) * source.shape[-1] ** -0.5 + mask
     probabilities = torch.softmax(scores.float(), dim=-1).to(source.dtype)
     return probabilities @ grouped_value
 
@@ -65,9 +60,7 @@ def attention_inputs(batch, query_length):
         torch.randn(batch, query_length, 4, 8, device="cuda", dtype=torch.bfloat16),
         torch.randn(batch, 7, 2, 8, device="cuda", dtype=torch.bfloat16),
         torch.randn(batch, 7, 2, 8, device="cuda", dtype=torch.bfloat16),
-        torch.randn(
-            batch, 1, query_length, 7, device="cuda", dtype=torch.bfloat16
-        ),
+        torch.randn(batch, 1, query_length, 7, device="cuda", dtype=torch.bfloat16),
     )
 
 
@@ -95,9 +88,7 @@ def test_task27_larger_decode_batch_uses_decode_attention(tmp_path):
 
 def test_task27_large_decode_batch_keeps_throughput_gemm(tmp_path):
     torch.manual_seed(27)
-    source = torch.randn(
-        128, 576, device="cuda", dtype=torch.bfloat16
-    )
+    source = torch.randn(128, 576, device="cuda", dtype=torch.bfloat16)
     backend = compile_and_compare(
         Projection().eval(),
         "decode",

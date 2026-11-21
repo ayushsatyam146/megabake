@@ -12,6 +12,7 @@ error and the run continues.
     .venv/bin/python benchmarks/full_model.py --modes decode --capacity 256
     .venv/bin/python benchmarks/full_model.py --model Qwen/Qwen3.5-0.8B google/gemma-3-270m
     .venv/bin/python benchmarks/full_model.py --modes decode --decode-contexts 512 2048
+    .venv/bin/python benchmarks/full_model.py --modes decode-audit --model Qwen/Qwen2.5-0.5B-Instruct --capacity 192 --warmup 5 --samples 24
 
 The Inductor decode baseline is ``inductor_hf``: the unmodified Hugging Face
 model, its own attention and a static cache, compiled end to end with CUDA
@@ -25,10 +26,12 @@ from __future__ import annotations
 import argparse
 import contextlib
 import gc
+import importlib.metadata
 import json
-import statistics
-import sys
 import os
+import statistics
+import subprocess
+import sys
 import time
 import traceback
 from pathlib import Path
@@ -41,17 +44,17 @@ if __package__ in {None, ""}:
     # installed (an editable install points at one tree only).
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from megabake import graphed, make_backend  # noqa: E402
-from benchmarks.measure import kernel_trace  # noqa: E402
-from benchmarks.stateful_models import StatefulCausalLM, layer_types, text_config  # noqa: E402
-from megabake.fx_handler.hf_attention import (  # noqa: E402
+from benchmarks.measure import kernel_trace
+from benchmarks.stateful_models import StatefulCausalLM, layer_types, text_config
+from megabake import graphed, make_backend
+from megabake.fx_handler.hf_attention import (
     ATTENTION_IMPLEMENTATION,
     DecodeStep,
     mixer_of,
     register_transformers_attention,
 )
-from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION, StatefulSmolLM  # noqa: E402
-from megabake.ops.attention import kv_attention  # noqa: E402
+from megabake.ops.attention import kv_attention
+from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION, StatefulSmolLM
 
 PROMPT = [1, 504, 3458, 314]
 VARIANTS = (
@@ -130,14 +133,16 @@ def _pipelined_calls(calls) -> float:
 
 
 def _measure(
-    name: str, build, step, args: argparse.Namespace, traces: Path, pipelined=None
+    name: str, build, step, args: argparse.Namespace, traces: Path, pipelined=None, validate=None
 ) -> dict:
     torch._dynamo.reset()
     function = build()
     started = time.perf_counter()
-    step(function)
+    first_result = step(function)
     torch.cuda.synchronize()
     first_call = time.perf_counter() - started
+    correctness = validate(first_result) if validate is not None else None
+    del first_result
     for _ in range(args.warmup):
         step(function)
     entry = _time_calls(lambda: step(function), args.samples)
@@ -151,16 +156,18 @@ def _measure(
         launch_count=trace["launch_count"],
         kernel_duration_us=trace["kernel_duration_us"],
     )
+    if correctness is not None:
+        entry["correctness"] = correctness
     summary = {key: value for key, value in entry.items() if not key.endswith("samples_us")}
     print(f"{name}: {json.dumps(summary)}", flush=True)
     return entry
 
 
 def _measure_or_error(
-    name: str, build, step, args: argparse.Namespace, traces: Path, pipelined=None
+    name: str, build, step, args: argparse.Namespace, traces: Path, pipelined=None, validate=None
 ) -> dict:
     try:
-        return _measure(name, build, step, args, traces, pipelined)
+        return _measure(name, build, step, args, traces, pipelined, validate)
     except Exception as error:  # noqa: BLE001 - keep benchmarking the other variants
         traceback.print_exc()
         print(f"{name}: FAILED {type(error).__name__}: {error}", flush=True)
@@ -169,8 +176,26 @@ def _measure_or_error(
 
 def _megabake(mode: str, out: Path):
     return make_backend(
-        mode=mode, compile_kernel=True, cache=False, dump_dir=out / "dumps" / mode, scheduler="phase"
+        mode=mode,
+        compile_kernel=True,
+        cache=False,
+        dump_dir=out / "dumps" / mode,
+        scheduler="phase",
     )
+
+
+class GraphedPrefill:
+    """Capture one MegaBake prefill with stable input and mask buffers."""
+
+    def __init__(self, function, ids, mask):
+        self.graph = graphed(
+            lambda tokens, attention_mask: function(tokens, attention_mask=attention_mask),
+            ids,
+            mask,
+        )
+
+    def __call__(self, ids, attention_mask):
+        return self.graph(ids, attention_mask)
 
 
 def bench_prefill(model, args) -> dict:
@@ -187,8 +212,32 @@ def bench_prefill(model, args) -> dict:
         "megabake": lambda: torch.compile(
             model, backend=_megabake("prefill", args.out), fullgraph=True, dynamic=False
         ),
+        "megabake_graphed": lambda: GraphedPrefill(
+            torch.compile(
+                model, backend=_megabake("prefill", args.out), fullgraph=True, dynamic=False
+            ),
+            ids,
+            mask,
+        ),
     }
     with torch.no_grad():
+        reference = (
+            model(ids, attention_mask=mask).logits.detach().float()
+            if getattr(args, "check_prefill_correctness", False)
+            else None
+        )
+
+        def validate(output):
+            actual = output.logits.detach().float()
+            difference = actual - reference
+            return {
+                "relative_l2_vs_eager": (difference.norm() / reference.norm()).item(),
+                "max_abs_vs_eager": difference.abs().max().item(),
+                "top_token_matches": int((actual.argmax(-1) == reference.argmax(-1)).sum().item()),
+                "positions": int(reference.shape[-2]),
+                "finite": bool(torch.isfinite(actual).all().item()),
+            }
+
         return {
             "prompt_tokens": len(prompt),
             **{
@@ -198,6 +247,7 @@ def bench_prefill(model, args) -> dict:
                     lambda function: function(ids, attention_mask=mask),
                     args,
                     args.out / "traces",
+                    validate=validate if reference is not None else None,
                 )
                 for name, build in variants.items()
                 if name in args.variants
@@ -314,6 +364,7 @@ class GraphedStep:
 
     def __init__(self, function, token, state, warmup: int = 3):
         self.state = state
+        self.token = token
         self.position = torch.zeros((1, 1), dtype=torch.long, device="cuda")
         with _graphable_kv_attention():
             side = torch.cuda.Stream()
@@ -333,6 +384,8 @@ class GraphedStep:
     def __call__(self, token, position_ids, *state):
         if any(given is not captured for given, captured in zip(state, self.state, strict=True)):
             raise ValueError("a graphed decode step must reuse its captured state tensors")
+        if token is not self.token:
+            self.token.copy_(token)
         self.position.copy_(position_ids)
         self.graph.replay()
         return self.output
@@ -372,7 +425,7 @@ def bench_decode(model, args) -> dict:
             ]
             position = [0]
             if name == "inductor_graphed":
-                build = lambda state=state: GraphedStep(  # noqa: E731
+                build = lambda state=state: GraphedStep(
                     torch.compile(stateful, fullgraph=True, dynamic=False), token, state
                 )
             if name == "inductor_autotune_graphed":
@@ -384,9 +437,12 @@ def bench_decode(model, args) -> dict:
                     args.model_name, args.model_revision, args.capacity, args.batch, args.hf_attention
                 )
             if name == "megabake_graphed":
-                build = lambda state=state: graphed(  # noqa: E731
+                build = lambda state=state: graphed(
                     torch.compile(
-                        stateful, backend=_megabake("decode", args.out), fullgraph=True, dynamic=False
+                        stateful,
+                        backend=_megabake("decode", args.out),
+                        fullgraph=True,
+                        dynamic=False,
                     ),
                     token,
                     torch.zeros((1, 1), dtype=torch.long, device="cuda"),
@@ -606,7 +662,10 @@ def bench_decode_contexts(model, args) -> dict:
                 elif name == "megabake_graphed":
                     function = graphed(
                         torch.compile(
-                            stateful, backend=_megabake("decode", args.out), fullgraph=True, dynamic=False
+                            stateful,
+                            backend=_megabake("decode", args.out),
+                            fullgraph=True,
+                            dynamic=False,
                         ),
                         token,
                         torch.tensor([[0]], device="cuda"),
@@ -627,13 +686,308 @@ def bench_decode_contexts(model, args) -> dict:
                 summary = {
                     context: round(row["pipelined_call_us"]) for context, row in rows.items()
                 }
-                print(f"decode_contexts_{name} pipelined_call_us: {json.dumps(summary)}", flush=True)
+                print(
+                    f"decode_contexts_{name} pipelined_call_us: {json.dumps(summary)}", flush=True
+                )
             except Exception as error:  # noqa: BLE001 - keep benchmarking the other variants
                 traceback.print_exc()
                 print(f"decode_contexts_{name}: FAILED {type(error).__name__}: {error}", flush=True)
                 results[name] = {"error": f"{type(error).__name__}: {error}"}
             torch.cuda.empty_cache()
     return results
+
+
+def bench_decode_audit(model, name: str, revision: str | None, args) -> dict:
+    """Compare decode graphs and prompt continuations with native eager."""
+    warmups, samples, capacity = args.warmup, args.samples, args.capacity
+    generated_tokens = args.audit_generated_tokens
+    if warmups < 0 or samples < 1 or generated_tokens < 1 or capacity < warmups + samples:
+        raise ValueError("capacity must hold warmup and sample positions; counts must be positive")
+    if args.attention != "eager":
+        raise ValueError("decode-audit requires --attention eager")
+    if not 0 <= args.audit_teacher_steps <= capacity:
+        raise ValueError("teacher-forced steps must fit in the cache")
+    if args.audit_fp32 and not args.audit_teacher_steps:
+        raise ValueError("--audit-fp32 requires --audit-teacher-steps")
+    from transformers import AutoTokenizer
+
+    prompts = [
+        "The capital of France is",
+        "Explain why the sky appears blue.",
+        "Write a Python function to add two numbers.",
+        "2 + 2 =",
+        "Once upon a time in a distant village,",
+    ]
+    tokenizer = AutoTokenizer.from_pretrained(name, revision=revision)
+    prompt_ids = [tokenizer(p, add_special_tokens=True)["input_ids"] for p in prompts]
+    if any(not ids or len(ids) + generated_tokens >= capacity for ids in prompt_ids):
+        raise ValueError("a prompt is empty or does not fit the audit cache")
+    token = torch.tensor([[504]], device="cuda", dtype=torch.long)
+    positions = [
+        torch.tensor([[i]], device="cuda", dtype=torch.long) for i in range(warmups + samples)
+    ]
+
+    def timed(label, step):
+        for index in range(warmups):
+            step(index)
+        torch.cuda.synchronize()
+        wall, event = [], []
+        for index in range(warmups, warmups + samples):
+            torch.cuda.synchronize()
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            t0 = time.perf_counter_ns()
+            start.record()
+            step(index)
+            end.record()
+            end.synchronize()
+            wall.append((time.perf_counter_ns() - t0) / 1_000_000)
+            event.append(start.elapsed_time(end))
+        return {
+            "name": label,
+            "samples": samples,
+            "warmups": warmups,
+            "wall_median_ms": statistics.median(wall),
+            "event_span_median_ms": statistics.median(event),
+            "wall_samples_ms": wall,
+            "event_samples_ms": event,
+        }
+
+    def native_reference(ids):
+        cache = None
+        prompt_logits = []
+        for token_id in ids:
+            out = model(
+                input_ids=torch.tensor([[token_id]], device="cuda"),
+                past_key_values=cache,
+                use_cache=True,
+            )
+            cache = out.past_key_values
+            prompt_logits.append(out.logits[0, -1].detach().float().cpu())
+        next_token = int(prompt_logits[-1].argmax().item())
+        sequence = []
+        for index in range(generated_tokens):
+            sequence.append(next_token)
+            if index + 1 < generated_tokens:
+                out = model(
+                    input_ids=torch.tensor([[next_token]], device="cuda"),
+                    past_key_values=cache,
+                    use_cache=True,
+                )
+                cache = out.past_key_values
+                next_token = int(out.logits[0, -1].argmax().item())
+        return prompt_logits, sequence
+
+    report = {
+        "model": name,
+        "gpu": torch.cuda.get_device_name(),
+        "capability": list(torch.cuda.get_device_capability()),
+        "dtype": str(next(model.parameters()).dtype),
+        "capacity": capacity,
+        "warmups": warmups,
+        "samples": samples,
+        "generated_tokens": generated_tokens,
+        "timing_notes": "Synchronized host wall time, with device positions prepared before timing. "
+        f"Native eager uses HF's growing cache; other variants use capacity-{capacity} "
+        "explicit state. CUDA event spans include device idle gaps from host work.",
+        "timings": {},
+        "prompts": [],
+    }
+
+    with torch.no_grad():
+        holder = {"cache": None}
+
+        def native_step(_index, holder=holder):
+            out = model(input_ids=token, past_key_values=holder["cache"], use_cache=True)
+            holder["cache"] = out.past_key_values
+            return out.logits
+
+        report["timings"]["native_hf_eager"] = timed("native_hf_eager", native_step)
+        del native_step, holder
+        native = [native_reference(ids) for ids in prompt_ids]
+        print("Native eager timing and prompt references complete", flush=True)
+
+        eager, shapes = decode_module(model, capacity)
+
+        def make_state():
+            return [
+                torch.zeros(shape, dtype=dtype, device="cuda")
+                for layer in shapes
+                for shape, dtype in layer
+            ]
+
+        eager_state, torch_state, megabake_state = make_state(), make_state(), make_state()
+        report["timings"]["wrapper_eager"] = timed(
+            "wrapper_eager", lambda i: eager(token, positions[i], *eager_state)
+        )
+        for value in eager_state:
+            value.zero_()
+
+        torch_graph = GraphedStep(
+            torch.compile(eager, fullgraph=True, dynamic=False), token.clone(), torch_state
+        )
+        report["timings"]["torch_graph"] = timed(
+            "torch_graph", lambda i: torch_graph(token, positions[i], *torch_state)
+        )
+        print("PyTorch graph timing complete", flush=True)
+
+        backend = make_backend(mode="decode", compile_kernel=True, cache=False, scheduler="phase")
+        compiled = torch.compile(eager, backend=backend, fullgraph=True, dynamic=False)
+        megabake_graph = graphed(compiled, token.clone(), positions[0].clone(), *megabake_state)
+        report["timings"]["megabake_graph"] = timed(
+            "megabake_graph", lambda i: megabake_graph(token, positions[i], *megabake_state)
+        )
+        print("MegaBake graph timing complete", flush=True)
+
+        variants = (
+            ("wrapper_eager", eager, eager_state),
+            ("torch_graph", torch_graph, torch_state),
+            ("megabake_graph", megabake_graph, megabake_state),
+        )
+        for prompt, ids, (native_logits, native_sequence) in zip(
+            prompts, prompt_ids, native, strict=True
+        ):
+            case = {
+                "prompt": prompt,
+                "tokens": len(ids),
+                "native_greedy_ids": native_sequence,
+                "variants": {},
+            }
+            for variant, function, state in variants:
+                for value in state:
+                    value.zero_()
+                rels, matches, finite, out = [], 0, True, None
+                for position, (token_id, ref) in enumerate(zip(ids, native_logits, strict=True)):
+                    out = function(
+                        torch.tensor([[token_id]], device="cuda"),
+                        torch.tensor([[position]], device="cuda"),
+                        *state,
+                    )
+                    actual = out[0, -1].detach().float().cpu()
+                    finite &= bool(torch.isfinite(actual).all())
+                    rels.append(float((actual - ref).norm() / ref.norm()))
+                    matches += int(actual.argmax().item() == ref.argmax().item())
+                next_token = int(actual.argmax().item())
+                sequence = []
+                for index in range(generated_tokens):
+                    sequence.append(next_token)
+                    if index + 1 < generated_tokens:
+                        output = function(
+                            torch.tensor([[next_token]], device="cuda"),
+                            torch.tensor([[len(ids) + index]], device="cuda"),
+                            *state,
+                        )
+                        finite &= bool(torch.isfinite(output).all().item())
+                        next_token = int(output.argmax().item())
+                mismatch = next(
+                    (
+                        i + 1
+                        for i, (a, b) in enumerate(zip(native_sequence, sequence, strict=True))
+                        if a != b
+                    ),
+                    None,
+                )
+                case["variants"][variant] = {
+                    "prompt_top_matches_native": matches,
+                    "prompt_positions": len(ids),
+                    "prompt_relative_l2_median_vs_native": statistics.median(rels),
+                    "prompt_relative_l2_max_vs_native": max(rels),
+                    "all_logits_finite": finite,
+                    "greedy_first_difference_vs_native": mismatch,
+                    "greedy_ids": sequence,
+                }
+            report["prompts"].append(case)
+            print(f"Prompt check complete: {prompt}", flush=True)
+        if args.audit_teacher_steps:
+            normal_state = make_state()
+            for values in (eager_state, megabake_state):
+                for value in values:
+                    value.zero_()
+            relatives, mismatches = [], []
+            max_graph_normal = 0.0
+            finite = {"eager": True, "megabake": True, "megabake_graph": True}
+            for index in range(args.audit_teacher_steps):
+                current_token = torch.tensor([[PROMPT[index % len(PROMPT)]]], device="cuda")
+                position = torch.tensor([[index]], device="cuda")
+                reference = eager(current_token, position, *eager_state).float()
+                normal = compiled(current_token, position, *normal_state).float()
+                actual = megabake_graph(current_token, position, *megabake_state).float()
+                for label, value in (
+                    ("eager", reference),
+                    ("megabake", normal),
+                    ("megabake_graph", actual),
+                ):
+                    finite[label] &= bool(torch.isfinite(value).all().item())
+                relatives.append(float((actual - reference).norm() / reference.norm()))
+                if actual.argmax(-1).item() != reference.argmax(-1).item():
+                    mismatches.append(index)
+                max_graph_normal = max(max_graph_normal, (actual - normal).abs().max().item())
+            report["teacher_forced"] = {
+                "steps": args.audit_teacher_steps,
+                "relative_l2_median_vs_wrapper_eager": statistics.median(relatives),
+                "relative_l2_max_vs_wrapper_eager": max(relatives),
+                "top_mismatch_positions": mismatches,
+                "finite": finite,
+                "graph_vs_non_graph_max_abs": max_graph_normal,
+                "graph_vs_non_graph_state_equal": all(
+                    torch.equal(a, b) for a, b in zip(megabake_state, normal_state, strict=True)
+                ),
+            }
+            if args.audit_fp32:
+                import copy
+
+                fp32_model = copy.deepcopy(model).float().eval()
+                fp32, fp32_shapes = decode_module(fp32_model, capacity)
+                fp32_state = [
+                    torch.zeros(
+                        shape,
+                        device="cuda",
+                        dtype=torch.float32 if dtype == torch.bfloat16 else dtype,
+                    )
+                    for layer in fp32_shapes
+                    for shape, dtype in layer
+                ]
+                comparisons = (
+                    ("wrapper_eager", eager, eager_state),
+                    ("torch_graph", torch_graph, torch_state),
+                    ("megabake", compiled, normal_state),
+                    ("megabake_graph", megabake_graph, megabake_state),
+                )
+                for _, _, state in comparisons:
+                    for value in state:
+                        value.zero_()
+                scores = {
+                    name: {"relative_l2": [], "mismatch_positions": []}
+                    for name, _, _ in comparisons
+                }
+                old_tf32 = torch.backends.cuda.matmul.allow_tf32
+                try:
+                    torch.backends.cuda.matmul.allow_tf32 = False
+                    for index in range(args.audit_teacher_steps):
+                        current_token = torch.tensor([[PROMPT[index % len(PROMPT)]]], device="cuda")
+                        position = torch.tensor([[index]], device="cuda")
+                        reference = fp32(current_token, position, *fp32_state).float()
+                        for label, function, state in comparisons:
+                            actual = function(current_token, position, *state).float()
+                            scores[label]["relative_l2"].append(
+                                float((actual - reference).norm() / reference.norm())
+                            )
+                            if actual.argmax(-1).item() != reference.argmax(-1).item():
+                                scores[label]["mismatch_positions"].append(index)
+                finally:
+                    torch.backends.cuda.matmul.allow_tf32 = old_tf32
+                for score in scores.values():
+                    values = score["relative_l2"]
+                    score["median_relative_l2"] = statistics.median(values)
+                    score["max_relative_l2"] = max(values)
+                    score["top_matches"] = args.audit_teacher_steps - len(
+                        score["mismatch_positions"]
+                    )
+                report["fp32_teacher_forced"] = {
+                    "reference": "FP32 arithmetic on BF16-rounded weights with TF32 disabled",
+                    "steps": args.audit_teacher_steps,
+                    "results": scores,
+                }
+    return report
 
 
 def _bench_model(name: str, revision: str | None, args: argparse.Namespace) -> None:
@@ -648,8 +1002,41 @@ def _bench_model(name: str, revision: str | None, args: argparse.Namespace) -> N
         "gpu": torch.cuda.get_device_name(),
         "samples": args.samples,
     }
+    if "decode-audit" in args.modes:
+        root = Path(__file__).resolve().parents[1]
+        commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=False
+        )
+        changes = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        packages = {}
+        for package in ("torch", "transformers", "nvidia-cutlass-dsl"):
+            try:
+                packages[package] = importlib.metadata.version(package)
+            except importlib.metadata.PackageNotFoundError:
+                packages[package] = None
+        settings = {
+            key: value if value.isdecimal() or value in {"auto", "cta"} else "<set>"
+            for key, value in os.environ.items()
+            if key.startswith("MEGABAKE_")
+        }
+        report["environment"] = {
+            "commit": commit.stdout.strip() if commit.returncode == 0 else None,
+            "tracked_files_changed": bool(changes.stdout) if changes.returncode == 0 else None,
+            "packages": packages,
+            "cuda_runtime": torch.version.cuda,
+            "settings": settings,
+        }
     for mode in args.modes:
-        report[mode] = (bench_prefill if mode == "prefill" else bench_decode)(model, args)
+        if mode == "decode-audit":
+            report[mode] = bench_decode_audit(model, name, revision, args)
+        else:
+            report[mode] = (bench_prefill if mode == "prefill" else bench_decode)(model, args)
         (args.out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     if args.decode_contexts:
         report["decode_contexts"] = bench_decode_contexts(model, args)
@@ -673,7 +1060,8 @@ def main() -> None:
         "--model", nargs="+", default=[SMOLLM_MODEL_NAME], help="Hugging Face causal LM id(s)"
     )
     parser.add_argument(
-        "--revision", help=f"checkpoint revision (default: pinned for {SMOLLM_MODEL_NAME}, else main)"
+        "--revision",
+        help=f"checkpoint revision (default: pinned for {SMOLLM_MODEL_NAME}, else main)",
     )
     parser.add_argument(
         "--attention",
@@ -681,7 +1069,12 @@ def main() -> None:
         default="eager",
         help="prefill attention: eager (pattern-matched by MegaBake) or the declared megabake op",
     )
-    parser.add_argument("--modes", nargs="*", choices=("prefill", "decode"), default=["prefill", "decode"])
+    parser.add_argument(
+        "--modes",
+        nargs="*",
+        choices=("prefill", "decode", "decode-audit"),
+        default=["prefill", "decode"],
+    )
     parser.add_argument(
         "--variants",
         nargs="+",
@@ -693,7 +1086,22 @@ def main() -> None:
     parser.add_argument(
         "--prompt-tokens", type=int, default=len(PROMPT), help="prefill prompt length"
     )
+    parser.add_argument(
+        "--check-prefill-correctness",
+        action="store_true",
+        help="compare each prefill variant's logits with BF16 eager",
+    )
     parser.add_argument("--warmup", type=int, default=5)
+    parser.add_argument("--audit-generated-tokens", type=int, default=16)
+    parser.add_argument(
+        "--audit-teacher-steps",
+        type=int,
+        default=0,
+        help="also compare this many teacher-forced decode steps and graph state",
+    )
+    parser.add_argument(
+        "--audit-fp32", action="store_true", help="also compare teacher-forced steps with FP32"
+    )
     parser.add_argument("--capacity", type=int, default=128, help="decode KV cache capacity")
     parser.add_argument("--batch", type=int, default=1, help="decode batch size (sequences in lockstep)")
     parser.add_argument(
@@ -711,6 +1119,49 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=Path("artifacts/full_model"))
     args = parser.parse_args()
     root = args.out
+    if len(args.model) > 1 and "decode-audit" in args.modes:
+        failures = []
+        for name in args.model:
+            command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--model",
+                name,
+                "--modes",
+                *args.modes,
+                "--variants",
+                *args.variants,
+                "--attention",
+                args.attention,
+                "--samples",
+                str(args.samples),
+                "--prompt-tokens",
+                str(args.prompt_tokens),
+                "--warmup",
+                str(args.warmup),
+                "--capacity",
+                str(args.capacity),
+                "--audit-generated-tokens",
+                str(args.audit_generated_tokens),
+                "--audit-teacher-steps",
+                str(args.audit_teacher_steps),
+                "--out",
+                str(root / name.replace("/", "--")),
+            ]
+            if args.revision:
+                command.extend(("--revision", args.revision))
+            if args.check_prefill_correctness:
+                command.append("--check-prefill-correctness")
+            if args.audit_fp32:
+                command.append("--audit-fp32")
+            if args.decode_contexts:
+                command.extend(("--decode-contexts", *map(str, args.decode_contexts)))
+            completed = subprocess.run(command, check=False)
+            if completed.returncode:
+                failures.append(name)
+        if failures:
+            raise SystemExit(f"Benchmark failed for: {', '.join(failures)}")
+        return
     for name in args.model:
         revision = args.revision or (SMOLLM_REVISION if name == SMOLLM_MODEL_NAME else None)
         args.out = root / name.replace("/", "--") if len(args.model) > 1 else root

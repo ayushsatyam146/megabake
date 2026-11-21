@@ -89,9 +89,7 @@ def cast_rounding_for(dtype: str) -> str:
 def ordered_operations(operations: tuple[Op, ...], graph: ComputeGraph) -> tuple[Op, ...]:
     by_id = {operation.id: operation for operation in operations}
     return tuple(
-        operation
-        for operation_id, operation in graph.ops.items()
-        if operation_id in by_id
+        operation for operation_id, operation in graph.ops.items() if operation_id in by_id
     )
 
 
@@ -101,14 +99,14 @@ def value_bytes(value_id: str, graph: ComputeGraph) -> int:
 
 
 def has_illegal_effects(operation: Op) -> bool:
-    return bool(
-        operation.effects.get("unknown")
-        or operation.effects.get("mutates_inputs")
-    )
+    return bool(operation.effects.get("unknown") or operation.effects.get("mutates_inputs"))
 
 
 def is_contraction(operation: Op) -> bool:
-    return isinstance(operation.tensor_program, TensorProgram) and operation.tensor_program.family == "contraction"
+    return (
+        isinstance(operation.tensor_program, TensorProgram)
+        and operation.tensor_program.family == "contraction"
+    )
 
 
 def producing_view(value_id: str, graph: ComputeGraph) -> Op | None:
@@ -155,4 +153,3 @@ def substitute_loads(
             false_value=substitute_loads(expression.false_value, replacements),
         )
     raise ValueError(f"unsupported scalar expression {expression!r}")
-

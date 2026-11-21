@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import re
-
+from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from math import prod
-from typing import Any, Mapping, Sequence
+from typing import Any
 
 from ...graph import DTYPE_BYTES, Region
 from ...ir import (
@@ -103,9 +103,7 @@ class GeneratedContractionBody:
     # Work-iterator stride between tiles (``GeneratedBody.work_step``).
     work_step: int = 1
     work_iterator_dtype: str = "torch.int64"
-    work_iterator_encoding: str = (
-        "one flat output-tile base index per CTA; thread adds its lane"
-    )
+    work_iterator_encoding: str = "one flat output-tile base index per CTA; thread adds its lane"
     phases: tuple[str, ...] = (
         "output_tile",
         "bounded_reduction",
@@ -133,8 +131,8 @@ UnsupportedReductionBody = UnsupportedMapBody
 UnsupportedContractionBody = UnsupportedMapBody
 
 
-_HOISTED_LOADS: ContextVar[Mapping[str, str]] = ContextVar(
-    "megabake_hoisted_loads", default={}
+_HOISTED_LOADS: ContextVar[Mapping[str, str] | None] = ContextVar(
+    "megabake_hoisted_loads", default=None
 )
 
 _CUTLASS_TYPES = {
@@ -188,14 +186,9 @@ def emit_map_body(program: TensorProgram, config: BodyConfig) -> GeneratedMapBod
     # preprocessor's recursion limit.
     hoisted_names = {load.id: f"load_{index}" for index, load in enumerate(program.loads)}
     index_load_ids = {
-        axis.load_id
-        for load in program.loads
-        for axis in load.axes
-        if isinstance(axis, DataIndex)
+        axis.load_id for load in program.loads for axis in load.axes if isinstance(axis, DataIndex)
     }
-    ordered_loads = sorted(
-        program.loads, key=lambda load: load.id not in index_load_ids
-    )
+    ordered_loads = sorted(program.loads, key=lambda load: load.id not in index_load_ids)
     # Each thread covers MAP_ELEMENTS_PER_THREAD elements of a tile, strided by
     # the CTA size. Every element's loads are issued before any store, so a
     # tile costs one round of memory latency; a store between them would
@@ -221,9 +214,11 @@ def emit_map_body(program: TensorProgram, config: BodyConfig) -> GeneratedMapBod
         )
         for load in ordered_loads:
             if load.id not in index_load_ids:
-                load_lines += _gather_bounds_lines(load, hoisted).replace(
-                    "            ", "        ", 1
-                ).replace("\n            ", "\n        ")
+                load_lines += (
+                    _gather_bounds_lines(load, hoisted)
+                    .replace("            ", "        ", 1)
+                    .replace("\n            ", "\n        ")
+                )
             load_lines += (
                 f"        {hoisted[load.id]} = "
                 f"{_load_access(load, load_indices[load.id], program.loads, names).code}\n"
@@ -235,21 +230,15 @@ def emit_map_body(program: TensorProgram, config: BodyConfig) -> GeneratedMapBod
             _HOISTED_LOADS.reset(token)
         value = _cast_expression(value, program.store.dtype)
         value_lines += f"        value_{element} = {value.code}\n"
-        output_index = ", ".join(
-            names[domain.axis] for domain in program.iteration_domains
-        ) or "0"
+        output_index = ", ".join(names[domain.axis] for domain in program.iteration_domains) or "0"
         store_lines += (
             f"        if {index} < output_count:\n"
             f"            output[{output_index}] = value_{element}\n"
         )
 
-    binding_type = ", ".join(
-        "cute.Tensor" for _ in range(len(input_value_ids) + 1)
-    )
-    trap_import = (
-        "from megabake.runtime import trap_if\n" if index_load_ids else ""
-    )
-    source = f'''import cutlass
+    binding_type = ", ".join("cute.Tensor" for _ in range(len(input_value_ids) + 1))
+    trap_import = "from megabake.runtime import trap_if\n" if index_load_ids else ""
+    source = f"""import cutlass
 import cutlass.cute as cute
 {trap_import}
 
@@ -267,7 +256,7 @@ def run(
     output_count = cute.size(output)
     for tile in cutlass.range(block, cute.size(work_iterator), workers):
         base = work_iterator[tile] + thread
-{load_lines}{value_lines}{store_lines}'''
+{load_lines}{value_lines}{store_lines}"""
     element_count = 1
     for size in program.store.shape:
         element_count *= size
@@ -281,24 +270,18 @@ def run(
     )
 
 
-def emit_reduction_body(
-    program: TensorProgram, config: BodyConfig
-) -> GeneratedReductionBody:
+def emit_reduction_body(program: TensorProgram, config: BodyConfig) -> GeneratedReductionBody:
     _validate_reduction_body(program, config)
 
     threads = config.participants.participating_threads
     warps = threads // 32
     output_domains = [
-        domain
-        for domain in program.iteration_domains
-        if domain.axis not in program.reduction_axes
+        domain for domain in program.iteration_domains if domain.axis not in program.reduction_axes
     ]
     reduction_domain = next(
         domain for domain in program.iteration_domains if domain.axis in program.reduction_axes
     )
-    axis_coordinates = {
-        domain.axis: f"o{index}" for index, domain in enumerate(output_domains)
-    }
+    axis_coordinates = {domain.axis: f"o{index}" for index, domain in enumerate(output_domains)}
     reduction_coordinate = f"r{program.reduction_axes.index(reduction_domain.axis)}"
     input_value_ids = tuple(dict.fromkeys(load.value_id for load in program.loads))
     binding_indices = {value_id: index for index, value_id in enumerate(input_value_ids)}
@@ -314,15 +297,9 @@ def emit_reduction_body(
     assert program.post is not None
     post = _emit_expression(program.post, load_indices, axis_coordinates, program.loads)
 
-    coordinate_lines = _coordinate_lines(
-        program.store.shape, program.store.strides, "output_index"
-    )
-    output_coordinates = ", ".join(
-        axis_coordinates[domain.axis] for domain in output_domains
-    )
-    binding_type = ", ".join(
-        "cute.Tensor" for _ in range(len(input_value_ids) + 1)
-    )
+    coordinate_lines = _coordinate_lines(program.store.shape, program.store.strides, "output_index")
+    output_coordinates = ", ".join(axis_coordinates[domain.axis] for domain in output_domains)
+    binding_type = ", ".join("cute.Tensor" for _ in range(len(input_value_ids) + 1))
     accumulator_type = _cutlass_type(program.accumulator_dtype or "")
     reduction_operator = _ordered_reduction_operator(program.combine)
     # Output axes that only the post-reduction expression reads (the feature
@@ -332,9 +309,7 @@ def emit_reduction_body(
     if reduced_axes is not None:
         reduced_axes |= _expression_axes(program.init, program.loads) or set()
     row_domains = [
-        domain
-        for domain in output_domains
-        if reduced_axes is None or domain.axis in reduced_axes
+        domain for domain in output_domains if reduced_axes is None or domain.axis in reduced_axes
     ]
     post_domains = [domain for domain in output_domains if domain not in row_domains]
     warp_reduction = (
@@ -362,7 +337,7 @@ def emit_reduction_body(
             combine,
             reduction_operator,
         )
-    source = f'''import cutlass
+    source = f"""import cutlass
 import cutlass.cute as cute
 
 
@@ -399,7 +374,7 @@ def run(
             if thread == 0:
                 output[{output_coordinates}] = value
             cute.arch.sync_threads()
-'''
+"""
     output_count = 1
     for size in program.store.shape:
         output_count *= size
@@ -463,15 +438,11 @@ def single_cta_rounds(program: TensorProgram, threads: int) -> int:
     if program.family != "reduction":
         return -(-elements // (threads * MAP_ELEMENTS_PER_THREAD))
     output_domains = [
-        domain
-        for domain in program.iteration_domains
-        if domain.axis not in program.reduction_axes
+        domain for domain in program.iteration_domains if domain.axis not in program.reduction_axes
     ]
     reduced_axes = reduced_row_axes(program)
     row_domains = [
-        domain
-        for domain in output_domains
-        if reduced_axes is None or domain.axis in reduced_axes
+        domain for domain in output_domains if reduced_axes is None or domain.axis in reduced_axes
     ]
     if len(row_domains) == len(output_domains):
         return elements
@@ -489,7 +460,9 @@ def _strided_range(start: str, size: int, threads: int) -> str:
     return f"cutlass.range({start}, {size}, {threads}{unroll})"
 
 
-def _row_major_lines(domains: Sequence[Any], names: Mapping[str, str], value: str, indent: str) -> str:
+def _row_major_lines(
+    domains: Sequence[Any], names: Mapping[str, str], value: str, indent: str
+) -> str:
     # Each coordinate comes straight from the index; a remainder variable
     # reassigned once per axis sends the DSL preprocessor into unbounded
     # recursion at three axes.
@@ -532,8 +505,7 @@ def _emit_row_reduction_body(
         elif isinstance(node, Where):
             pending.extend((node.condition, node.true_value, node.false_value))
     hoisted_names = {
-        load_id: f"post_load_{index}"
-        for index, load_id in enumerate(dict.fromkeys(post_load_ids))
+        load_id: f"post_load_{index}" for index, load_id in enumerate(dict.fromkeys(post_load_ids))
     }
     load_lines = "".join(
         f"                {name} = "
@@ -560,8 +532,14 @@ def _emit_row_reduction_body(
         # step's stores, so the loads are in flight together; a store before
         # a later load would serialize them (the pointers may alias).
         post_loop = _staged_post_lines(
-            program, threads, post_steps, post_count, post_domains, axis_coordinates,
-            hoisted_names, load_indices,
+            program,
+            threads,
+            post_steps,
+            post_count,
+            post_domains,
+            axis_coordinates,
+            hoisted_names,
+            load_indices,
         )
     else:
         post_loop = (
@@ -582,7 +560,7 @@ def _emit_row_reduction_body(
         if reduction_operator == "maximum"
         else "accumulator = accumulator + scratch[block, warp_index]"
     )
-    source = f'''import cutlass
+    source = f"""import cutlass
 import cutlass.cute as cute
 
 
@@ -617,7 +595,7 @@ def run(
             for warp_index in cutlass.range(warps):
                 {merge_partial}
 {post_loop}            cute.arch.sync_threads()
-'''
+"""
     return GeneratedReductionBody(
         source=source,
         threads_per_cta=threads,
@@ -681,32 +659,22 @@ def _staged_post_lines(
     return "".join(load_lines) + "".join(store_lines)
 
 
-def emit_contraction_body(
-    program: TensorProgram, config: BodyConfig
-) -> GeneratedContractionBody:
+def emit_contraction_body(program: TensorProgram, config: BodyConfig) -> GeneratedContractionBody:
     _validate_contraction_body(program, config)
 
     threads = config.participants.participating_threads
     reduction_chunk = config.tiles.reduction_tile[0]
     output_domains = [
-        domain
-        for domain in program.iteration_domains
-        if domain.axis not in program.reduction_axes
+        domain for domain in program.iteration_domains if domain.axis not in program.reduction_axes
     ]
     reduction_domain = next(
-        domain
-        for domain in program.iteration_domains
-        if domain.axis in program.reduction_axes
+        domain for domain in program.iteration_domains if domain.axis in program.reduction_axes
     )
-    axis_coordinates = {
-        domain.axis: f"o{index}" for index, domain in enumerate(output_domains)
-    }
+    axis_coordinates = {domain.axis: f"o{index}" for index, domain in enumerate(output_domains)}
     reduction_coordinate = f"r{program.reduction_axes.index(reduction_domain.axis)}"
     load_indices = {load.id: index for index, load in enumerate(program.loads)}
 
-    accumulator = _emit_expression(
-        program.init, load_indices, axis_coordinates, program.loads
-    )
+    accumulator = _emit_expression(program.init, load_indices, axis_coordinates, program.loads)
     combine = _emit_expression(
         program.combine,
         load_indices,
@@ -714,22 +682,14 @@ def emit_contraction_body(
         program.loads,
     )
     assert program.post is not None
-    post = _emit_expression(
-        program.post, load_indices, axis_coordinates, program.loads
-    )
+    post = _emit_expression(program.post, load_indices, axis_coordinates, program.loads)
 
-    coordinate_lines = _coordinate_lines(
-        program.store.shape, program.store.strides
-    )
-    output_coordinates = ", ".join(
-        axis_coordinates[domain.axis] for domain in output_domains
-    )
-    binding_type = ", ".join(
-        "cute.Tensor" for _ in range(len(program.loads) + 1)
-    )
+    coordinate_lines = _coordinate_lines(program.store.shape, program.store.strides)
+    output_coordinates = ", ".join(axis_coordinates[domain.axis] for domain in output_domains)
+    binding_type = ", ".join("cute.Tensor" for _ in range(len(program.loads) + 1))
     accumulator_type = _cutlass_type(program.accumulator_dtype or "")
     output_cutlass_type = _cutlass_type(program.store.dtype)
-    source = f'''import cutlass
+    source = f"""import cutlass
 import cutlass.cute as cute
 
 
@@ -757,7 +717,7 @@ def run(
                         accumulator = {combine.code}
             stored_value = {output_cutlass_type}({post.code})
             output[{output_coordinates}] = stored_value
-'''
+"""
     element_count = 1
     for size in program.store.shape:
         element_count *= size
@@ -788,9 +748,7 @@ def _validate_map_body(program: TensorProgram, config: BodyConfig) -> None:
     threads = config.participants.participating_threads
     if threads <= 0:
         raise UnsupportedMapBody("map body requires participating threads")
-    if config.tiles.cta_shape != (threads,) + (1,) * (
-        len(program.iteration_domains) - 1
-    ):
+    if config.tiles.cta_shape != (threads,) + (1,) * (len(program.iteration_domains) - 1):
         raise UnsupportedMapBody("map body requires a flat one-element-per-thread tile")
     if config.tiles.work_partition != "one output element per thread":
         raise UnsupportedMapBody("map body requires one output element per thread")
@@ -815,9 +773,7 @@ def _validate_reduction_body(program: TensorProgram, config: BodyConfig) -> None
     if config.semantic.operation_family != program.family:
         raise UnsupportedReductionBody("body config and tensor program families differ")
     if len(program.reduction_axes) != 1:
-        raise UnsupportedReductionBody(
-            "reduction body generator supports one reduction axis"
-        )
+        raise UnsupportedReductionBody("reduction body generator supports one reduction axis")
     if program.init is None or program.post is None or program.accumulator_dtype is None:
         raise UnsupportedReductionBody("reduction body requires complete reduction state")
     if _ordered_reduction_operator(program.combine) not in {"add", "maximum"}:
@@ -850,9 +806,7 @@ def _validate_reduction_body(program: TensorProgram, config: BodyConfig) -> None
         raise UnsupportedReductionBody("reduction body lacks warp-partial scratch")
 
     output_domains = tuple(
-        domain
-        for domain in program.iteration_domains
-        if domain.axis not in program.reduction_axes
+        domain for domain in program.iteration_domains if domain.axis not in program.reduction_axes
     )
     if not output_domains or any(domain.size <= 0 for domain in output_domains):
         raise UnsupportedReductionBody("reduction body requires a nonempty output row")
@@ -871,50 +825,36 @@ def _validate_contraction_body(program: TensorProgram, config: BodyConfig) -> No
             f"contraction body generator supports contraction, not {program.family}"
         )
     if config.semantic.operation_family != program.family:
-        raise UnsupportedContractionBody(
-            "body config and tensor program families differ"
-        )
+        raise UnsupportedContractionBody("body config and tensor program families differ")
     if len(program.reduction_axes) != 1:
-        raise UnsupportedContractionBody(
-            "contraction body generator supports one reduction axis"
-        )
+        raise UnsupportedContractionBody("contraction body generator supports one reduction axis")
     if program.init is None or program.post is None or program.accumulator_dtype is None:
-        raise UnsupportedContractionBody(
-            "contraction body requires complete reduction state"
-        )
+        raise UnsupportedContractionBody("contraction body requires complete reduction state")
     if not _is_add_reduction(program.combine):
         raise UnsupportedContractionBody(
             "contraction body generator supports ordered multiply-accumulate"
         )
     if program.init.dtype != program.accumulator_dtype:
-        raise UnsupportedContractionBody(
-            "initializer and accumulator dtypes differ"
-        )
+        raise UnsupportedContractionBody("initializer and accumulator dtypes differ")
 
     threads = config.participants.participating_threads
     if threads <= 0:
         raise UnsupportedContractionBody("contraction body requires participating threads")
     output_domains = tuple(
-        domain
-        for domain in program.iteration_domains
-        if domain.axis not in program.reduction_axes
+        domain for domain in program.iteration_domains if domain.axis not in program.reduction_axes
     )
     if config.tiles.cta_shape != (threads,) + (1,) * (len(output_domains) - 1):
         raise UnsupportedContractionBody(
             "contraction body requires a flat one-output-element-per-thread tile"
         )
     if config.tiles.work_partition != "one output element per thread":
-        raise UnsupportedContractionBody(
-            "contraction body requires one output element per thread"
-        )
+        raise UnsupportedContractionBody("contraction body requires one output element per thread")
     if (
         not config.tiles.reduction_tile
         or config.tiles.reduction_tile[0] <= 0
         or len(config.tiles.reduction_tile) != 1
     ):
-        raise UnsupportedContractionBody(
-            "contraction body requires one positive reduction chunk"
-        )
+        raise UnsupportedContractionBody("contraction body requires one positive reduction chunk")
     if config.scratch.owner != "none" or config.scratch.size_bytes != 0:
         raise UnsupportedContractionBody("contraction body does not use scratch")
 
@@ -927,9 +867,7 @@ def _validate_contraction_body(program: TensorProgram, config: BodyConfig) -> No
             "contraction body requires a nonempty positive reduction extent"
         )
     if any(stride < 0 for stride in program.store.strides):
-        raise UnsupportedContractionBody(
-            "negative output strides are not supported"
-        )
+        raise UnsupportedContractionBody("negative output strides are not supported")
 
     _validate_body_layouts(program, config, output_domains)
 
@@ -958,10 +896,7 @@ def _validate_body_layouts(
         loads_by_value.setdefault(load.value_id, []).append(load)
     for load in program.loads:
         layout = config.layouts.inputs[load.value_id]
-        if (
-            layout.strides != tuple(load.strides)
-            or layout.dtype != load.dtype
-        ):
+        if layout.strides != tuple(load.strides) or layout.dtype != load.dtype:
             raise UnsupportedMapBody("body input layout does not match tensor program")
         primary_load = loads_by_value[load.value_id][0]
         if load is primary_load and layout.axes != primary_load.axes:
@@ -999,7 +934,7 @@ def _maximum_code(left: str, right: str) -> str:
     return f"cute.arch.fmax({left}, {right}, nan=True)"
 
 
-def _constant_code(value: int | float | bool) -> str:
+def _constant_code(value: float | bool) -> str:
     if isinstance(value, float) and value == float("-inf"):
         return 'float("-inf")'
     return repr(value)
@@ -1056,10 +991,8 @@ def _emit_expression(
         index = load_indices.get(expression.load_id)
         if index is None:
             raise UnsupportedMapBody(f"unknown load {expression.load_id}")
-        load = next(
-            candidate for candidate in loads if candidate.id == expression.load_id
-        )
-        hoisted = _HOISTED_LOADS.get().get(expression.load_id)
+        load = next(candidate for candidate in loads if candidate.id == expression.load_id)
+        hoisted = (_HOISTED_LOADS.get() or {}).get(expression.load_id)
         if hoisted is not None:
             return _TypedExpression(hoisted, load.dtype)
         return _load_access(load, index, loads, axis_coordinates)
@@ -1076,19 +1009,13 @@ def _emit_expression(
         coordinate = axis_coordinates.get(expression.axis)
         if coordinate is None:
             raise UnsupportedMapBody(f"unknown axis {expression.axis}")
-        return _cast_expression(
-            _TypedExpression(coordinate, "torch.int64"), expression.dtype
-        )
+        return _cast_expression(_TypedExpression(coordinate, "torch.int64"), expression.dtype)
     if isinstance(expression, Unary):
         operand = _cast_expression(
-            _emit_expression(
-                expression.operand, load_indices, axis_coordinates, loads
-            ),
+            _emit_expression(expression.operand, load_indices, axis_coordinates, loads),
             expression.dtype,
         )
-        return _TypedExpression(
-            _unary_code(expression.operator, operand), expression.dtype
-        )
+        return _TypedExpression(_unary_code(expression.operator, operand), expression.dtype)
     if isinstance(expression, Binary):
         left = _emit_expression(expression.lhs, load_indices, axis_coordinates, loads)
         right = _emit_expression(expression.rhs, load_indices, axis_coordinates, loads)
@@ -1108,9 +1035,7 @@ def _emit_expression(
         else:
             symbol = _BINARY_SYMBOLS.get(expression.operator)
             if symbol is None:
-                raise UnsupportedMapBody(
-                    f"unsupported binary operator {expression.operator}"
-                )
+                raise UnsupportedMapBody(f"unsupported binary operator {expression.operator}")
             if expression.dtype in _HALF_DTYPES and expression.operator in _ARITHMETIC:
                 # PyTorch computes half-precision arithmetic in float32 and
                 # rounds each result. Doing the same keeps every source
@@ -1119,28 +1044,20 @@ def _emit_expression(
                 left = _cast_expression(left, "torch.float32")
                 right = _cast_expression(right, "torch.float32")
                 return _cast_expression(
-                    _TypedExpression(
-                        f"({left.code} {symbol} {right.code})", "torch.float32"
-                    ),
+                    _TypedExpression(f"({left.code} {symbol} {right.code})", "torch.float32"),
                     expression.dtype,
                 )
             code = f"({left.code} {symbol} {right.code})"
         return _TypedExpression(code, expression.dtype)
     if isinstance(expression, Where):
-        condition = _emit_expression(
-            expression.condition, load_indices, axis_coordinates, loads
-        )
+        condition = _emit_expression(expression.condition, load_indices, axis_coordinates, loads)
         condition = _cast_expression(condition, "torch.bool")
         true_value = _cast_expression(
-            _emit_expression(
-                expression.true_value, load_indices, axis_coordinates, loads
-            ),
+            _emit_expression(expression.true_value, load_indices, axis_coordinates, loads),
             expression.dtype,
         )
         false_value = _cast_expression(
-            _emit_expression(
-                expression.false_value, load_indices, axis_coordinates, loads
-            ),
+            _emit_expression(expression.false_value, load_indices, axis_coordinates, loads),
             expression.dtype,
         )
         # Parenthesized as a whole: a select nested in a larger expression
@@ -1151,9 +1068,7 @@ def _emit_expression(
         )
     if isinstance(expression, Cast):
         return _cast_expression(
-            _emit_expression(
-                expression.operand, load_indices, axis_coordinates, loads
-            ),
+            _emit_expression(expression.operand, load_indices, axis_coordinates, loads),
             expression.dtype,
         )
     raise UnsupportedMapBody(f"unsupported scalar expression {expression!r}")
@@ -1195,9 +1110,7 @@ def _load_access(
     return _TypedExpression(access, load.dtype)
 
 
-def _axis_code(
-    axis: Any, axis_coordinates: Mapping[str, str], loads: tuple
-) -> str:
+def _axis_code(axis: Any, axis_coordinates: Mapping[str, str], loads: tuple) -> str:
     if isinstance(axis, str):
         return axis_coordinates[axis]
     if isinstance(axis, int):
@@ -1205,9 +1118,7 @@ def _axis_code(
     if isinstance(axis, DataIndex):
         for index, candidate in enumerate(loads):
             if candidate.id == axis.load_id:
-                return _load_access(
-                    candidate, index, loads, axis_coordinates
-                ).code
+                return _load_access(candidate, index, loads, axis_coordinates).code
         raise UnsupportedMapBody(f"unknown data index {axis.load_id}")
     if not isinstance(axis, AxisAffine):
         raise UnsupportedMapBody(f"unsupported indexed axis {axis!r}")
@@ -1319,15 +1230,11 @@ def _is_float(dtype: str) -> bool:
 
 
 def _float_rank(dtype: str) -> int:
-    return ["torch.float16", "torch.bfloat16", "torch.float32", "torch.float64"].index(
-        dtype
-    )
+    return ["torch.float16", "torch.bfloat16", "torch.float32", "torch.float64"].index(dtype)
 
 
 def _integer_rank(dtype: str) -> int:
-    return ["torch.bool", "torch.int8", "torch.int16", "torch.int32", "torch.int64"].index(
-        dtype
-    )
+    return ["torch.bool", "torch.int8", "torch.int16", "torch.int32", "torch.int64"].index(dtype)
 
 
 def _larger_float(left: str, right: str) -> str:
@@ -1375,11 +1282,7 @@ class GenericBodyProvider:
         if family == "view":
             return CandidateSet(
                 (),
-                (
-                    ProviderRejection(
-                        self.provider_name, "aliasing view needs no device body"
-                    ),
-                ),
+                (ProviderRejection(self.provider_name, "aliasing view needs no device body"),),
             )
         if isinstance(region.semantics, GemmEpilogue):
             # The fused region only pays off in a tuned GEMM body; without one
@@ -1402,11 +1305,7 @@ class GenericBodyProvider:
         }:
             return CandidateSet(
                 (),
-                (
-                    ProviderRejection(
-                        self.provider_name, f"unsupported program family {family}"
-                    ),
-                ),
+                (ProviderRejection(self.provider_name, f"unsupported program family {family}"),),
             )
 
         return CandidateSet((generic_config(region, program),), ())
@@ -1467,11 +1366,7 @@ def generic_config(region: Region, program: Any) -> BodyConfig:
     is_fused_chain = isinstance(region.semantics, ScalarChain)
     threads = 128
     warp_count = threads // 32
-    scratch_bytes = (
-        warp_count * DTYPE_BYTES[program.accumulator_dtype]
-        if is_reduction
-        else 0
-    )
+    scratch_bytes = warp_count * DTYPE_BYTES[program.accumulator_dtype] if is_reduction else 0
     barriers = ("cta_reduction",) if is_reduction else ()
     cta_shape = (128,) + (1,) * max(len(output_axes) - 1, 0)
     completion = CompletionContract(
@@ -1511,9 +1406,7 @@ def generic_config(region: Region, program: Any) -> BodyConfig:
             revision="task-05",
             resources={"threads": threads, "shared_bytes": scratch_bytes},
             measurements=(
-                {"fusion_saved_bytes": region.semantics.saved_bytes}
-                if is_fused_chain
-                else {}
+                {"fusion_saved_bytes": region.semantics.saved_bytes} if is_fused_chain else {}
             ),
         )
     )
@@ -1532,14 +1425,10 @@ def generic_config(region: Region, program: Any) -> BodyConfig:
             cta_shape=cta_shape,
             cluster_shape=(1,) * len(cta_shape),
             work_partition=(
-                "one output row per CTA"
-                if is_reduction
-                else "one output element per thread"
+                "one output row per CTA" if is_reduction else "one output element per thread"
             ),
             mma_family=None,
-            reduction_tile=(threads,) if is_reduction else (32,)
-            if is_contraction
-            else (),
+            reduction_tile=(threads,) if is_reduction else (32,) if is_contraction else (),
         ),
         participants=ParticipantContract(
             participating_threads=threads,
@@ -1564,9 +1453,7 @@ def generic_config(region: Region, program: Any) -> BodyConfig:
 
 
 def _layouts(program: Any, alignment_bytes: int | None = None) -> LayoutContract:
-    domain_sizes = {
-        domain.axis: domain.size for domain in program.iteration_domains
-    }
+    domain_sizes = {domain.axis: domain.size for domain in program.iteration_domains}
     inputs: dict[str, TensorLayout] = {}
     for load in program.loads:
         if load.value_id in inputs:
@@ -1579,10 +1466,7 @@ def _layouts(program: Any, alignment_bytes: int | None = None) -> LayoutContract
             shape=(
                 tuple(load.source_shape)
                 if load.source_shape is not None
-                else tuple(
-                    1 if isinstance(axis, int) else domain_sizes[axis]
-                    for axis in load.axes
-                )
+                else tuple(1 if isinstance(axis, int) else domain_sizes[axis] for axis in load.axes)
             ),
         )
     store = program.store

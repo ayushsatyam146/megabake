@@ -4,11 +4,14 @@ import argparse
 import importlib
 import json
 import re
+from collections.abc import Sequence
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import torch
 
+from .doctor import format_checks, run_checks
 from .frontend import make_backend
 from .fx_handler.export import capture_exported_program
 from .fx_handler.transformers import capture_transformer
@@ -72,19 +75,19 @@ def _run_transformers(args: argparse.Namespace) -> int:
     compute_graph_path = None
     lowering_graph_path = None
     region_graph_path = None
-    if getattr(args, "dump_compute_graph", False) or getattr(
-        args, "dump_lowering_graph", False
-    ) or getattr(args, "dump_region_graph", False):
+    if (
+        getattr(args, "dump_compute_graph", False)
+        or getattr(args, "dump_lowering_graph", False)
+        or getattr(args, "dump_region_graph", False)
+    ):
         compute_graph = import_fx(capture.graph, capture.context)
         model_name = args.model_name
         safe_model_name = re.sub(r"[^A-Za-z0-9_.-]+", "__", model_name).strip("._")
-        output_directory = Path(args.dump_dir or "fx_traces") / (
-            safe_model_name or "model"
-        )
+        output_directory = Path(args.dump_dir or "fx_traces") / (safe_model_name or "model")
         if getattr(args, "dump_compute_graph", False):
             compute_graph_path = dump_compute_graph(
                 compute_graph, output_directory / "compute_graph.txt"
-        )
+            )
         if getattr(args, "dump_lowering_graph", False):
             canonical_graph = canonicalize_semantics(compute_graph)
             lowering_graph_path = dump_lowering_graph(
@@ -111,7 +114,9 @@ def _run_transformers(args: argparse.Namespace) -> int:
 
 
 def _json_value(value: str) -> Any:
-    return json.loads(value)
+    """Parse a JSON argument; a list becomes a tensor, since torch.export traces tensors."""
+    parsed = json.loads(value)
+    return torch.tensor(parsed) if isinstance(parsed, list) else parsed
 
 
 def _run_export(args: argparse.Namespace) -> int:
@@ -152,12 +157,16 @@ def _run_megakernel(args: argparse.Namespace) -> int:
 
     output_dir = Path(args.out)
     output_dir.mkdir(parents=True, exist_ok=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        revision=args.revision,
-        attn_implementation="eager",
-        dtype=getattr(torch, args.dtype),
-    ).to("cuda").eval()
+    model = (
+        AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            revision=args.revision,
+            attn_implementation="eager",
+            dtype=getattr(torch, args.dtype),
+        )
+        .to("cuda")
+        .eval()
+    )
     model.config.use_cache = False
     input_ids = torch.tensor([args.input_ids], device="cuda")
     attention_mask = torch.ones_like(input_ids)
@@ -175,9 +184,7 @@ def _run_megakernel(args: argparse.Namespace) -> int:
         actual = compiled_model(input_ids, attention_mask=attention_mask).logits
         compile_seconds = time.perf_counter() - started
         expected = model(input_ids, attention_mask=attention_mask).logits
-    relative_error = (
-        (actual.float() - expected.float()).norm() / expected.float().norm()
-    ).item()
+    relative_error = ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
 
     compiled = backend.megabake_last_compiled
     kernel_object = None
@@ -218,18 +225,27 @@ def _run_megakernel(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_doctor(args: argparse.Namespace) -> int:
+    checks = run_checks(require_cuda=args.cuda)
+    print(format_checks(checks))
+    return 1 if any(check.status == "fail" for check in checks) else 0
+
+
+def _package_version() -> str:
+    try:
+        return version("megabake")
+    except PackageNotFoundError:
+        return "unknown"
+
+
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument(
-        "--mode", choices=("prefill", "decode"), default=argparse.SUPPRESS
-    )
-    common.add_argument(
-        "--fallback", choices=("error", "inductor"), default=argparse.SUPPRESS
-    )
+    common.add_argument("--mode", choices=("prefill", "decode"), default=argparse.SUPPRESS)
+    common.add_argument("--fallback", choices=("error", "inductor"), default=argparse.SUPPRESS)
     common.add_argument("--no-cache", action="store_true", default=argparse.SUPPRESS)
     common.add_argument("--dump-dir", default=argparse.SUPPRESS)
     parser = argparse.ArgumentParser(prog="megabake", parents=[common])
-    parser.add_argument("--version", action="version", version="megabake 0.1.0")
+    parser.add_argument("--version", action="version", version=f"megabake {_package_version()}")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     demo = subparsers.add_parser("demo", parents=[common])
@@ -238,26 +254,19 @@ def build_parser() -> argparse.ArgumentParser:
     demo.set_defaults(handler=_run_demo)
 
     transformers_parser = subparsers.add_parser("transformers", parents=[common])
-    transformers_parser.add_argument(
-        "--model-name", default="HuggingFaceTB/SmolLM-135M"
-    )
+    transformers_parser.add_argument("--model-name", default="HuggingFaceTB/SmolLM-135M")
     transformers_parser.add_argument("--revision")
     transformers_parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu"
     )
     transformers_parser.add_argument(
-        "--input-ids", type=lambda value: [int(item) for item in value.split(",")],
+        "--input-ids",
+        type=lambda value: [int(item) for item in value.split(",")],
         default="1,2,3,4",
     )
-    transformers_parser.add_argument(
-        "--dump-compute-graph", action="store_true", default=False
-    )
-    transformers_parser.add_argument(
-        "--dump-lowering-graph", action="store_true", default=False
-    )
-    transformers_parser.add_argument(
-        "--dump-region-graph", action="store_true", default=False
-    )
+    transformers_parser.add_argument("--dump-compute-graph", action="store_true", default=False)
+    transformers_parser.add_argument("--dump-lowering-graph", action="store_true", default=False)
+    transformers_parser.add_argument("--dump-region-graph", action="store_true", default=False)
     transformers_parser.set_defaults(handler=_run_transformers)
 
     megakernel_parser = subparsers.add_parser(
@@ -266,7 +275,8 @@ def build_parser() -> argparse.ArgumentParser:
     megakernel_parser.add_argument("--model-name", required=True)
     megakernel_parser.add_argument("--revision")
     megakernel_parser.add_argument(
-        "--input-ids", type=lambda value: [int(item) for item in value.split(",")],
+        "--input-ids",
+        type=lambda value: [int(item) for item in value.split(",")],
         default="1,504,3458,314",
     )
     megakernel_parser.add_argument(
@@ -279,10 +289,16 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--callable", required=True)
     export_parser.add_argument("--model-name")
     export_parser.add_argument("--arg", action="append", default=[], metavar="JSON")
-    export_parser.add_argument(
-        "--kwarg", action="append", default=[], metavar="NAME=JSON"
-    )
+    export_parser.add_argument("--kwarg", action="append", default=[], metavar="NAME=JSON")
     export_parser.set_defaults(handler=_run_export)
+
+    doctor_parser = subparsers.add_parser(
+        "doctor", help="check Python, PyTorch, GPU and CUDA toolkit setup"
+    )
+    doctor_parser.add_argument(
+        "--cuda", action="store_true", help="treat missing CUDA pieces as failures, not warnings"
+    )
+    doctor_parser.set_defaults(handler=_run_doctor)
     return parser
 
 

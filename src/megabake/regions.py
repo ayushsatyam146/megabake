@@ -39,15 +39,15 @@ def form_regions(graph: ComputeGraph) -> ComputeGraph:
 
 def dump_region_graph(graph: ComputeGraph, path: str | Path) -> Path:
     operation_regions = {
-        operation_id: region
-        for region in graph.regions
-        for operation_id in region.source_op_ids
+        operation_id: region for region in graph.regions for operation_id in region.source_op_ids
     }
     lines = [
         "# RegionGraph",
-        f"values={len(graph.values)} operations={len(graph.ops)} "
-        f"regions={len(graph.regions)} inputs={len(graph.inputs)} "
-        f"outputs={len(graph.outputs)}",
+        (
+            f"values={len(graph.values)} operations={len(graph.ops)} "
+            f"regions={len(graph.regions)} inputs={len(graph.inputs)} "
+            f"outputs={len(graph.outputs)}"
+        ),
         "",
         "## Regions",
     ]
@@ -133,14 +133,10 @@ def _verify_regions(graph: ComputeGraph) -> None:
         raise ValueError("Regions do not cover every source operation exactly once")
 
     operation_regions = {
-        operation_id: region
-        for region in graph.regions
-        for operation_id in region.source_op_ids
+        operation_id: region for region in graph.regions for operation_id in region.source_op_ids
     }
     candidate_ids = [
-        candidate.id
-        for region in graph.regions
-        for candidate in region.fusion_candidates
+        candidate.id for region in graph.regions for candidate in region.fusion_candidates
     ]
     if len(set(candidate_ids)) != len(candidate_ids):
         raise ValueError("Fusion candidate IDs are not unique")
@@ -151,8 +147,7 @@ def _verify_regions(graph: ComputeGraph) -> None:
             if not set(candidate.source_op_ids).issubset(graph.ops):
                 raise ValueError(f"Candidate {candidate.id} references an unknown operation")
             if any(
-                operation_id not in region.source_op_ids
-                for operation_id in candidate.source_op_ids
+                operation_id not in region.source_op_ids for operation_id in candidate.source_op_ids
             ):
                 if candidate.source_op_ids[-1] not in region.source_op_ids:
                     raise ValueError(f"Candidate {candidate.id} is not attached to its tail region")
@@ -169,7 +164,10 @@ def _verify_regions(graph: ComputeGraph) -> None:
                 for value_id in candidate.external_inputs
             ):
                 raise ValueError(f"Candidate {candidate.id} marks an internal value external")
-            if candidate.tensor_program is not None and candidate.tensor_program.store.value_id not in candidate.live_outputs:
+            if (
+                candidate.tensor_program is not None
+                and candidate.tensor_program.store.value_id not in candidate.live_outputs
+            ):
                 raise ValueError(f"Candidate {candidate.id} does not output its program result")
     for region in graph.regions:
         operations = tuple(graph.ops[operation_id] for operation_id in region.source_op_ids)

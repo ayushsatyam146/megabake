@@ -11,9 +11,9 @@ query and new key (RoPE) as prologues.
 
 from __future__ import annotations
 
+import operator
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
-import operator
 from typing import Any, Literal
 
 import torch
@@ -77,8 +77,7 @@ def kv_attention(
     end = start + source.shape[1]
     if start < 0 or end > key_cache.shape[1]:
         raise RuntimeError(
-            f"KV cache length {start} plus {source.shape[1]} exceeds capacity "
-            f"{key_cache.shape[1]}"
+            f"KV cache length {start} plus {source.shape[1]} exceeds capacity {key_cache.shape[1]}"
         )
     key_cache[:, start:end].copy_(key)
     value_cache[:, start:end].copy_(value)
@@ -395,33 +394,55 @@ def kv_attention_program(
 
     batch_head = AxisAffine((AxisTerm("bh", divisor=query_heads),))
     query_head = AxisAffine((AxisTerm("bh", modulus=query_heads),))
-    kv_head = AxisAffine(
-        (AxisTerm("bh", divisor=query_heads, modulus=group_size),)
-    )
+    kv_head = AxisAffine((AxisTerm("bh", divisor=query_heads, modulus=group_size),))
     loads = (
         IndexedLoad(
-            "attention:q", source.id, (batch_head, "s", query_head, "d"),
-            source.strides, source.dtype, source.shape,
+            "attention:q",
+            source.id,
+            (batch_head, "s", query_head, "d"),
+            source.strides,
+            source.dtype,
+            source.shape,
         ),
         IndexedLoad(
-            "attention:new_k", new_key.id, (batch_head, 0, kv_head, "d"),
-            new_key.strides, new_key.dtype, new_key.shape,
+            "attention:new_k",
+            new_key.id,
+            (batch_head, 0, kv_head, "d"),
+            new_key.strides,
+            new_key.dtype,
+            new_key.shape,
         ),
         IndexedLoad(
-            "attention:new_v", new_value.id, (batch_head, 0, kv_head, "d"),
-            new_value.strides, new_value.dtype, new_value.shape,
+            "attention:new_v",
+            new_value.id,
+            (batch_head, 0, kv_head, "d"),
+            new_value.strides,
+            new_value.dtype,
+            new_value.shape,
         ),
         IndexedLoad(
-            "attention:k", key_cache.id, (batch_head, "k", kv_head, "d"),
-            key_cache.strides, key_cache.dtype, key_cache.shape,
+            "attention:k",
+            key_cache.id,
+            (batch_head, "k", kv_head, "d"),
+            key_cache.strides,
+            key_cache.dtype,
+            key_cache.shape,
         ),
         IndexedLoad(
-            "attention:v", value_cache.id, (batch_head, "k", kv_head, "d"),
-            value_cache.strides, value_cache.dtype, value_cache.shape,
+            "attention:v",
+            value_cache.id,
+            (batch_head, "k", kv_head, "d"),
+            value_cache.strides,
+            value_cache.dtype,
+            value_cache.shape,
         ),
         IndexedLoad(
-            "attention:valid_length", valid_length.id, (0,),
-            valid_length.strides, valid_length.dtype, valid_length.shape,
+            "attention:valid_length",
+            valid_length.id,
+            (0,),
+            valid_length.strides,
+            valid_length.dtype,
+            valid_length.shape,
         ),
     )
     zero = Constant(0.0, "torch.float32")
@@ -437,9 +458,7 @@ def kv_attention_program(
         capacity=capacity,
         query_length=query_length,
         key_layout=KVCacheLayout(key_cache.shape, key_cache.strides, key_cache.dtype),
-        value_layout=KVCacheLayout(
-            value_cache.shape, value_cache.strides, value_cache.dtype
-        ),
+        value_layout=KVCacheLayout(value_cache.shape, value_cache.strides, value_cache.dtype),
         storage_identity=(key_cache.id, value_cache.id),
     )
     return TensorProgram(
@@ -458,9 +477,7 @@ def kv_attention_program(
         combine=zero,
         post=zero,
         accumulator_dtype="torch.float32",
-        store=TensorStore(
-            output.id, output.shape, output.dtype, output.strides, True
-        ),
+        store=TensorStore(output.id, output.shape, output.dtype, output.strides, True),
         predicates=(
             AxisPredicate("bh", batch * query_heads),
             AxisPredicate("s", query_length),
@@ -505,9 +522,7 @@ def attention_tensor_program(
     group_size = query_heads // kv_heads
     batch_head = AxisAffine((AxisTerm("bh", divisor=query_heads),))
     query_head = AxisAffine((AxisTerm("bh", modulus=query_heads),))
-    kv_head = AxisAffine(
-        (AxisTerm("bh", divisor=query_heads, modulus=group_size),)
-    )
+    kv_head = AxisAffine((AxisTerm("bh", divisor=query_heads, modulus=group_size),))
 
     loads = (
         IndexedLoad(
@@ -1215,9 +1230,7 @@ def _pattern_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate | 
         or len(score_program.loads) != 2
     ):
         return None
-    softmax_input = (
-        score_add.results[0] if score_add is not None else scale_operation.results[0]
-    )
+    softmax_input = score_add.results[0] if score_add is not None else scale_operation.results[0]
     softmax_input_cast = producer_of(score_value, graph)
     if (
         softmax_input_cast is not None
@@ -1255,9 +1268,7 @@ def _pattern_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate | 
     group_size = query_heads // kv_heads
     batch_head = AxisAffine((AxisTerm("bh", divisor=query_heads),))
     query_head = AxisAffine((AxisTerm("bh", modulus=query_heads),))
-    kv_head = AxisAffine(
-        (AxisTerm("bh", divisor=query_heads, modulus=group_size),)
-    )
+    kv_head = AxisAffine((AxisTerm("bh", divisor=query_heads, modulus=group_size),))
     q_load = IndexedLoad(
         "attention:q",
         q_root,
@@ -1289,9 +1300,7 @@ def _pattern_candidate(value_bmm: Op, graph: ComputeGraph) -> RegionCandidate | 
     probability_path = _producer_path(value_program.loads[0].value_id, division, graph)
     if probability_path is None:
         return None
-    boundary_output, output_path = _boundary_output_path(
-        value_bmm.results[0], graph
-    )
+    boundary_output, output_path = _boundary_output_path(value_bmm.results[0], graph)
     operations = ordered_operations(
         (
             *q_path,
@@ -1383,9 +1392,7 @@ def _attention_head_axes(value: Any) -> tuple[int, ...]:
         return ()
     head_stride = value.shape[3] * value.strides[3]
     return tuple(
-        axis
-        for axis in (2, 1)
-        if value.strides[axis] == head_stride or value.shape[axis] == 1
+        axis for axis in (2, 1) if value.strides[axis] == head_stride or value.shape[axis] == 1
     )
 
 
@@ -1483,9 +1490,7 @@ def _producer_path(value_id: str, stop: Op, graph: ComputeGraph) -> tuple[Op, ..
     return None
 
 
-def _boundary_output_path(
-    value_id: str, graph: ComputeGraph
-) -> tuple[str, tuple[Op, ...]]:
+def _boundary_output_path(value_id: str, graph: ComputeGraph) -> tuple[str, tuple[Op, ...]]:
     operations: list[Op] = []
     current = value_id
     while current not in graph.outputs:
@@ -1506,15 +1511,10 @@ def _boundary_output_path(
     return current, tuple(operations)
 
 
-def _value_root_path(
-    value_id: str, graph: ComputeGraph
-) -> tuple[str, tuple[Op, ...]]:
+def _value_root_path(value_id: str, graph: ComputeGraph) -> tuple[str, tuple[Op, ...]]:
     operations: list[Op] = []
     current = value_id
-    while (
-        graph.values[current].shape is None
-        or len(graph.values[current].shape) != 4
-    ):
+    while graph.values[current].shape is None or len(graph.values[current].shape) != 4:
         operation = producer_of(current, graph)
         program = operation.tensor_program if operation is not None else None
         if (
@@ -1553,11 +1553,7 @@ def _softmax_operations(
     if not matches_target(division, "aten.div.Tensor") or len(division.operands) != 2:
         return None
     exponential = producer_of(division.operands[0], graph)
-    subtraction = (
-        producer_of(exponential.operands[0], graph)
-        if exponential is not None
-        else None
-    )
+    subtraction = producer_of(exponential.operands[0], graph) if exponential is not None else None
     if (
         exponential is None
         or subtraction is None
@@ -1574,15 +1570,18 @@ def _softmax_operations(
         and exponential.operands == (subtraction.results[0],)
         and producer_of(division.operands[1], graph) is not None
         and matches_target(producer_of(division.operands[1], graph), "aten.sum.dim_IntList")
-        and producer_of(producer_of(division.operands[1], graph).operands[0], graph)
-        is exponential
+        and producer_of(producer_of(division.operands[1], graph).operands[0], graph) is exponential
     ):
-        return "stable_softmax", subtraction.operands[0], (
-            maximum,
-            subtraction,
-            exponential,
-            producer_of(division.operands[1], graph),
-            division,
+        return (
+            "stable_softmax",
+            subtraction.operands[0],
+            (
+                maximum,
+                subtraction,
+                exponential,
+                producer_of(division.operands[1], graph),
+                division,
+            ),
         )
 
     maximum_projection = producer_of(subtraction.operands[1], graph)
@@ -1606,13 +1605,17 @@ def _softmax_operations(
         or exponential.operands != (subtraction.results[0],)
     ):
         return None
-    return "online_softmax", subtraction.operands[0], (
-        statistics,
-        maximum_projection,
-        sum_projection,
-        subtraction,
-        exponential,
-        division,
+    return (
+        "online_softmax",
+        subtraction.operands[0],
+        (
+            statistics,
+            maximum_projection,
+            sum_projection,
+            subtraction,
+            exponential,
+            division,
+        ),
     )
 
 
@@ -1752,8 +1755,7 @@ def _comparison_offset(condition: Op, graph: ComputeGraph) -> int | None:
         return None
     offset = producer_of(program.loads[1].value_id, graph)
     if offset is None or not (
-        matches_target(offset, "aten.add.Tensor")
-        or matches_target(offset, "aten.sub.Tensor")
+        matches_target(offset, "aten.add.Tensor") or matches_target(offset, "aten.sub.Tensor")
     ):
         return None
     value = scalar_operand(offset, 1)
@@ -1765,11 +1767,7 @@ def _comparison_offset(condition: Op, graph: ComputeGraph) -> int | None:
 def _cache_effects(key_root: str, value_root: str, graph: ComputeGraph) -> CacheEffects:
     key_state, key_append = _cache_access(key_root, graph)
     value_state, value_append = _cache_access(value_root, graph)
-    updates = tuple(
-        value_id
-        for value_id in (key_root, value_root)
-        if value_id in graph.outputs
-    )
+    updates = tuple(value_id for value_id in (key_root, value_root) if value_id in graph.outputs)
     if updates:
         policy = "functional_append"
     elif _in_place_cache_update((key_state, value_state, key_root, value_root), graph):
@@ -1779,11 +1777,7 @@ def _cache_effects(key_root: str, value_root: str, graph: ComputeGraph) -> Cache
     return CacheEffects(
         policy,
         reads=(key_state, value_state),
-        appends=tuple(
-            value_id
-            for value_id in (key_append, value_append)
-            if value_id is not None
-        ),
+        appends=tuple(value_id for value_id in (key_append, value_append) if value_id is not None),
         updates=updates,
     )
 
@@ -1840,4 +1834,3 @@ def _in_place_cache_update(cache_values: tuple[str, ...], graph: ComputeGraph) -
         and operation.operands[0] in cache_values
         for operation in graph.ops.values()
     )
-

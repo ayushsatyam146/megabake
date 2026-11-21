@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import statistics
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 import torch
 
@@ -31,9 +31,7 @@ def event_samples(function: Callable[[], object], count: int = 32) -> dict[str, 
 
 
 def kernel_trace(function: Callable[[], object], path: Path) -> dict[str, object]:
-    with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CUDA]
-    ) as profiler:
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as profiler:
         function()
         torch.cuda.synchronize()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -58,9 +56,7 @@ def kernel_trace(function: Callable[[], object], path: Path) -> dict[str, object
         "launch_count": len(kernels),
         "launch_event_count": len(launch_events),
         "kernel_duration_us": sum(float(event["dur"]) for event in kernels),
-        "kernel_span_us": (
-            max(kernel_ends) - min(kernel_starts) if kernel_starts else 0.0
-        ),
+        "kernel_span_us": (max(kernel_ends) - min(kernel_starts) if kernel_starts else 0.0),
         "first_launch_to_last_kernel_us": last_kernel_end - first_launch,
         "trace_path": str(path),
     }

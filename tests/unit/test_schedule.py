@@ -37,9 +37,7 @@ def _target() -> TargetFacts:
 def _graph(model, *inputs):
     exported = torch.export.export(model, inputs)
     prepared = prepare_fx_graph(exported.graph_module, inputs)
-    return form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    return form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
 
 
 def _scheduled(model, *inputs):
@@ -106,9 +104,7 @@ def test_dependencies_include_all_reduction_input_tiles():
     source = torch.randn(128, 128, dtype=torch.bfloat16)
     first_weight = torch.randn(256, 128, dtype=torch.bfloat16)
     second_weight = torch.randn(128, 256, dtype=torch.bfloat16)
-    _, dependencies, schedule = _scheduled(
-        Model(), source, first_weight, second_weight
-    )
+    _, dependencies, schedule = _scheduled(Model(), source, first_weight, second_weight)
     dependency = next(
         dependency
         for dependency in dependencies.dependencies
@@ -140,21 +136,14 @@ def test_event_schedule_interleaves_fork_join_without_a_phase_barrier():
     left = torch.randn(1, 3)
     right = torch.randn(1, 3)
     selection, dependencies, _ = _scheduled(Model(), left, right)
-    schedule = make_event_schedule(
-        selection, dependencies, worker_count=2
-    )
+    schedule = make_event_schedule(selection, dependencies, worker_count=2)
     join = next(
-        task
-        for task in schedule.tasks
-        if task.region_id == selection.selections[-1].region_id
+        task for task in schedule.tasks if task.region_id == selection.selections[-1].region_id
     )
 
     assert [task.order for task in schedule.tasks] == [0, 1, 2]
     assert all(
-        [
-            schedule.task_for(task_id).order
-            for task_id in worker.task_ids
-        ]
+        [schedule.task_for(task_id).order for task_id in worker.task_ids]
         == sorted(schedule.task_for(task_id).order for task_id in worker.task_ids)
         for worker in schedule.workers
     )
@@ -191,9 +180,7 @@ def test_event_schedule_groups_exact_reduction_prerequisites():
     source = torch.randn(128, 128, dtype=torch.bfloat16)
     first_weight = torch.randn(256, 128, dtype=torch.bfloat16)
     second_weight = torch.randn(128, 256, dtype=torch.bfloat16)
-    selection, dependencies, _ = _scheduled(
-        Model(), source, first_weight, second_weight
-    )
+    selection, dependencies, _ = _scheduled(Model(), source, first_weight, second_weight)
     schedule = make_event_schedule(selection, dependencies)
 
     assert len(schedule.events) == 2
@@ -220,9 +207,7 @@ def test_event_schedule_keeps_conservative_state_effects_explicit():
     source = torch.randn(128, 128, dtype=torch.bfloat16)
     first_weight = torch.randn(256, 128, dtype=torch.bfloat16)
     second_weight = torch.randn(128, 256, dtype=torch.bfloat16)
-    selection, dependencies, _ = _scheduled(
-        Model(), source, first_weight, second_weight
-    )
+    selection, dependencies, _ = _scheduled(Model(), source, first_weight, second_weight)
     producer = dependencies.dependencies[0].producer_region_id
     consumer = dependencies.dependencies[0].consumer_region_id
     state_effect = RegionDependency(

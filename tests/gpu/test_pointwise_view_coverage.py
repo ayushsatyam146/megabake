@@ -5,7 +5,6 @@ import torch
 
 from megabake import make_backend
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),
     reason="requires an SM90 CUDA device",
@@ -28,7 +27,9 @@ class PointwiseAndViews(torch.nn.Module):
             + torch.reciprocal(positive)
         )
         rounded = torch.floor(source) + torch.ceil(source) + torch.trunc(source)
-        clamped = source.clamp(-0.5, 0.5) + torch.maximum(source, other) + torch.minimum(source, other)
+        clamped = (
+            source.clamp(-0.5, 0.5) + torch.maximum(source, other) + torch.minimum(source, other)
+        )
         logical = torch.logical_and(flags, source > 0) | torch.logical_xor(flags, other > 0)
         mixed = torch.where(logical, transcendental, rounded) + clamped
         half = mixed.to(torch.bfloat16)
@@ -98,7 +99,9 @@ def test_depthwise_conv1d_compiles_and_matches_eager(tmp_path):
     try:
         model = CausalConv1d().eval()
         source = torch.randn(2, 8, 6, device="cuda")
-        backend = make_backend(compile_kernel=True, cache=False, dump_dir=tmp_path, scheduler="phase")
+        backend = make_backend(
+            compile_kernel=True, cache=False, dump_dir=tmp_path, scheduler="phase"
+        )
         with torch.no_grad():
             actual = torch.compile(model, backend=backend, fullgraph=True)(source)
             expected = model(source)
@@ -121,7 +124,9 @@ def test_in_place_state_writes_persist_across_calls(tmp_path):
     source = torch.randn(4, 64, device="cuda")
     state = torch.randn(4, 64, device="cuda")
     expected_state = state.clone()
-    backend = make_backend(mode="decode", compile_kernel=True, cache=False, dump_dir=tmp_path, scheduler="phase")
+    backend = make_backend(
+        mode="decode", compile_kernel=True, cache=False, dump_dir=tmp_path, scheduler="phase"
+    )
     optimized = torch.compile(model, backend=backend, fullgraph=True)
     with torch.no_grad():
         for _ in range(3):

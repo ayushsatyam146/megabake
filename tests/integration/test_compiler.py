@@ -6,7 +6,6 @@ import torch.nn.functional as F
 
 from megabake import make_backend
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),
     reason="task 15 requires an SM90 CUDA device",
@@ -34,20 +33,14 @@ def test_task_15_compiles_binds_and_reexecutes_through_torch_compile(tmp_path):
 
     with torch.no_grad():
         first_output = optimized(first)
-        torch.testing.assert_close(
-            first_output, model(first), rtol=0.03, atol=8
-        )
+        torch.testing.assert_close(first_output, model(first), rtol=0.03, atol=8)
 
         second_output = optimized(second)
-        torch.testing.assert_close(
-            second_output, model(second), rtol=0.03, atol=8
-        )
+        torch.testing.assert_close(second_output, model(second), rtol=0.03, atol=8)
 
         model.weight.add_(1)
         changed_parameter_output = optimized(second)
-        torch.testing.assert_close(
-            changed_parameter_output, model(second), rtol=0.03, atol=8
-        )
+        torch.testing.assert_close(changed_parameter_output, model(second), rtol=0.03, atol=8)
 
     context = backend.megabake_contexts[-1]
     compiled = backend.megabake_last_compiled

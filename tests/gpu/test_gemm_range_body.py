@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import cutlass
 import cuda.bindings.driver as cuda
+import cutlass
 import pytest
 import torch
 
@@ -16,10 +16,9 @@ from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),
-    reason="Hopper WGMMA range body requires SM90"
+    reason="Hopper WGMMA range body requires SM90",
 )
 
 
@@ -31,14 +30,11 @@ class Model(torch.nn.Module):
 def _region(source, weight):
     exported = torch.export.export(Model(), (source, weight))
     prepared = prepare_fx_graph(exported.graph_module, (source, weight))
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     return next(
         region
         for region in graph.regions
-        if region.tensor_programs
-        and region.tensor_programs[0].family == "contraction"
+        if region.tensor_programs and region.tensor_programs[0].family == "contraction"
     )
 
 
@@ -67,9 +63,7 @@ def test_g0_range_body_rebinds_changed_tensors_and_tile_count():
     max_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(1)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     output = torch.empty(4, 1536, device="cuda", dtype=torch.bfloat16)
-    compiled = compile_g0_range_gemm(
-        body, source, weight, output, max_clusters, stream
-    )
+    compiled = compile_g0_range_gemm(body, source, weight, output, max_clusters, stream)
     resources = g0_range_resources(
         compiled,
         config.participants.participating_threads,
@@ -82,18 +76,14 @@ def test_g0_range_body_rebinds_changed_tensors_and_tile_count():
     compiled(source, weight, output, stream)
     torch.cuda.synchronize()
     reference = (source.float() @ weight.float().T).bfloat16()
-    first_error = (
-        (output.float() - reference.float()).norm() / reference.float().norm()
-    ).item()
+    first_error = ((output.float() - reference.float()).norm() / reference.float().norm()).item()
 
     source = torch.randn(256, 576, device="cuda", dtype=torch.bfloat16)
     output = torch.empty(256, 1536, device="cuda", dtype=torch.bfloat16)
     compiled(source, weight, output, stream)
     torch.cuda.synchronize()
     reference = (source.float() @ weight.float().T).bfloat16()
-    second_error = (
-        (output.float() - reference.float()).norm() / reference.float().norm()
-    ).item()
+    second_error = ((output.float() - reference.float()).norm() / reference.float().norm()).item()
 
     assert first_error < 0.005
     assert second_error < 0.005

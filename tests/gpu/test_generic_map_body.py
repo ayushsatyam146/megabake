@@ -4,11 +4,10 @@ import importlib.util
 import sys
 
 import cuda.bindings.driver as cuda
-import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
 import pytest
 import torch
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 from megabake.bodies.catalog import get_candidates
 from megabake.bodies.cuda.generic import emit_map_body
@@ -16,7 +15,6 @@ from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
-
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="map-body launcher requires CUDA"
@@ -41,9 +39,7 @@ def _target():
 def _program(model, *inputs):
     exported = torch.export.export(model, inputs)
     prepared = prepare_fx_graph(exported.graph_module, inputs)
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     region = graph.regions[0]
     target, policy = _target()
     config = get_candidates(region, target, policy).configurations[0]
@@ -66,7 +62,7 @@ def _load_body(program, config, name, tmp_path):
 
 
 def _load_launcher(body_name, tensor_count, threads, tmp_path):
-    source = f'''from {body_name} import run
+    source = f"""from {body_name} import run
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 
@@ -87,7 +83,7 @@ def launch(
         block=[{threads}, 1, 1],
         stream=stream,
     )
-'''
+"""
     module_name = f"megabake_{body_name}_launcher"
     path = tmp_path / f"{module_name}.py"
     path.write_text(source, encoding="utf-8")
@@ -97,11 +93,7 @@ def launch(
 def _view(tensor):
     result = from_dlpack(tensor, assumed_align=16)
     leading_dimension = next(
-        (
-            index
-            for index, stride in enumerate(tensor.stride())
-            if stride == 1
-        ),
+        (index for index, stride in enumerate(tensor.stride()) if stride == 1),
         None,
     )
     if leading_dimension is None:
@@ -139,8 +131,8 @@ def test_map_body_launcher_handles_two_expressions_partial_tiles_and_strides(
 
     add_program, add_config = _program(Add(), left, right)
     cast_program, cast_config = _program(Cast(), value)
-    add_module, add_body = _load_body(add_program, add_config, "add", tmp_path)
-    cast_module, cast_body = _load_body(cast_program, cast_config, "cast", tmp_path)
+    _add_module, add_body = _load_body(add_program, add_config, "add", tmp_path)
+    _cast_module, cast_body = _load_body(cast_program, cast_config, "cast", tmp_path)
 
     assert add_body.threads_per_cta == cast_body.threads_per_cta == 128
     assert "tensor_bindings[1][0, o1_0]" in add_body.source
@@ -149,22 +141,14 @@ def test_map_body_launcher_handles_two_expressions_partial_tiles_and_strides(
     assert "linear_3 < output_count" in add_body.source
     assert ".to(cutlass.BFloat16)" in cast_body.source
 
-    add_launcher = _load_launcher(
-        "megabake_add_body", len(add_program.loads) + 1, 128, tmp_path
-    )
-    cast_launcher = _load_launcher(
-        "megabake_cast_body", len(cast_program.loads) + 1, 128, tmp_path
-    )
+    add_launcher = _load_launcher("megabake_add_body", len(add_program.loads) + 1, 128, tmp_path)
+    cast_launcher = _load_launcher("megabake_cast_body", len(cast_program.loads) + 1, 128, tmp_path)
 
     gpu_left = left.cuda()
     gpu_right = right.cuda()
     gpu_value = value.cuda()
-    add_output = torch.full(
-        (rows, columns), float("nan"), device="cuda", dtype=torch.float32
-    )
-    cast_output = torch.full(
-        (rows, columns), float("nan"), device="cuda", dtype=torch.bfloat16
-    )
+    add_output = torch.full((rows, columns), float("nan"), device="cuda", dtype=torch.float32)
+    cast_output = torch.full((rows, columns), float("nan"), device="cuda", dtype=torch.bfloat16)
     _run_body(add_launcher, (gpu_left, gpu_right, add_output), add_body.tile_elements)
     _run_body(cast_launcher, (gpu_value, cast_output), cast_body.tile_elements)
 

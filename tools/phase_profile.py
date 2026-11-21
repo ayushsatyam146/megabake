@@ -8,6 +8,7 @@ therefore approximate, while interval totals are exact.
 
     .venv/bin/python tools/phase_profile.py --model HuggingFaceTB/SmolLM-1.7B --mode prefill
     .venv/bin/python tools/phase_profile.py --mode decode --skip-accuracy-gate
+    .venv/bin/python tools/phase_profile.py --tune-model --model HuggingFaceTB/SmolLM-1.7B --out tuning.json
 
 With --cta every CTA also stamps when its work in each phase is done and when
 it leaves the phase's barrier, which splits each barrier interval into the
@@ -19,33 +20,59 @@ from __future__ import annotations
 
 import argparse
 import collections
+import functools
 import json
 import os
 import re
 import sys
 from pathlib import Path
+from statistics import median
 
 os.environ["MEGABAKE_PHASE_TIMER"] = "cta" if "--cta" in sys.argv else "1"
 
-import torch  # noqa: E402
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-import megabake.compiler as compiler  # noqa: E402
-from megabake import make_backend  # noqa: E402
-from megabake.runtime import (  # noqa: E402
+from benchmarks.full_model import PROMPT, _load, decode_module
+from megabake import (
+    compiler,
+    make_backend,
+)
+from megabake.bodies.catalog import is_table_gemm, table_gemm, tuner_for_device
+from megabake.bodies.cuda.sm90.gemm import split_k
+from megabake.runtime import (
     CTA_TIMER_STRIDE,
     GRID_TIMER_SLOTS,
     PHASE_TIMER_SLOTS,
 )
-from benchmarks.full_model import PROMPT, _load, decode_module  # noqa: E402
-from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION  # noqa: E402
+from tests.fixtures import SMOLLM_MODEL_NAME, SMOLLM_REVISION
+
+
+def _unwrap_relative(value: int, reference: int) -> int:
+    """32-bit nanosecond stamp, unwrapped relative to a reference."""
+    return ((value - reference + (1 << 31)) & 0xFFFFFFFF) - (1 << 31)
+
+
+class _DecodeStepRunner:
+    """Invokes compiled decode step while advancing device position IDs."""
+
+    def __init__(self, model, token: torch.Tensor, state: list[torch.Tensor], position: int = 0):
+        self.model = model
+        self.token = token
+        self.state = state
+        self.position = position
+
+    def __call__(self):
+        position_ids = torch.tensor([[self.position]], device="cuda")
+        self.position += 1
+        return self.model(self.token, position_ids, *self.state)
 
 
 def _category(phase) -> str:
     name = re.sub(r"_\d+x\d+$", "", phase.body.name)
-    if phase.body.tiles.mma_family == "wgmma":
+    if phase.body.tiles.mma_family is not None:
         return f"{name} (tensor-core GEMM)"
     kind = phase.region_id.rsplit(":", 1)[-1]
     if kind.startswith(("mm", "bmm", "addmm")) or kind in name:
@@ -84,13 +111,15 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
     release latency runs from the last CTA's arrival to the first CTA's exit.
     """
     phases = compiled.plan.phases
+    programs = {
+        selection.region_id: selection.program for selection in compiled.plan.selection.selections
+    }
     barriers = [row[1] != 0 for row in compiled.generated.launch.phase_table]
     samples = []
     for _ in range(calls):
         run()
         torch.cuda.synchronize()
         samples.append(_cta_stamps(callable_, compiled))
-    median = lambda values: sorted(values)[len(values) // 2]  # noqa: E731
     keys = ("span", "critical", "mean_busy", "straggler_wait", "release", "busy_ctas")
     intervals = []
     previous, members = None, []
@@ -103,10 +132,10 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
         for stamps in samples:
             # 32-bit nanosecond stamps, unwrapped relative to CTA 0's start.
             reference = stamps[0][0 if previous is None else 2 + 2 * previous]
-            relative = lambda value: ((value - reference + (1 << 31)) & 0xFFFFFFFF) - (1 << 31)  # noqa: E731
-            starts = [relative(row[0 if previous is None else 2 + 2 * previous]) for row in stamps]
-            dones = [relative(row[1 + 2 * index]) for row in stamps]
-            exits = [relative(row[2 + 2 * index]) for row in stamps]
+            prev_idx = 0 if previous is None else 2 + 2 * previous
+            starts = [_unwrap_relative(row[prev_idx], reference) for row in stamps]
+            dones = [_unwrap_relative(row[1 + 2 * index], reference) for row in stamps]
+            exits = [_unwrap_relative(row[2 + 2 * index], reference) for row in stamps]
             busy = [done - start for done, start in zip(dones, starts, strict=True)]
             critical = max(busy)
             busy_lists.append(busy)
@@ -127,29 +156,44 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
     phase_rows = []
     for index, phase in enumerate(phases):
         times, fastest, typical = [], [], []
+        prev_idx = 0 if index == 0 else 2 * index
         for stamps in samples:
             reference = stamps[0][0]
-            relative = lambda value: ((value - reference + (1 << 31)) & 0xFFFFFFFF) - (1 << 31)  # noqa: E731
             per_cta = sorted(
-                relative(row[1 + 2 * index]) - relative(row[0 if index == 0 else 2 * index])
+                _unwrap_relative(row[1 + 2 * index], reference)
+                - _unwrap_relative(row[prev_idx], reference)
                 for row in stamps
             )
             times.append(per_cta[-1])
             fastest.append(per_cta[0])
             typical.append(per_cta[len(per_cta) // 2])
-        phase_rows.append(
-            {
-                "index": index,
-                "us": median(times) / 1e3,
-                # A CTA without tiles in the phase still walks it: these are
-                # the fastest and the median CTA's time for the phase.
-                "fastest_cta_us": median(fastest) / 1e3,
-                "median_cta_us": median(typical) / 1e3,
-                "phase": f"{_category(phase)} tiles={len(phase.work_items)}",
-                "recompute": phase.recompute,
-                "barrier": barriers[index],
-            }
-        )
+        row = {
+            "index": index,
+            "us": median(times) / 1e3,
+            # A CTA without tiles in the phase still walks it: these are
+            # the fastest and the median CTA's time for the phase.
+            "fastest_cta_us": median(fastest) / 1e3,
+            "median_cta_us": median(typical) / 1e3,
+            "phase": f"{_category(phase)} tiles={len(phase.work_items)}",
+            "recompute": phase.recompute,
+            "barrier": barriers[index],
+        }
+        program = programs.get(phase.region_id)
+        if is_table_gemm(phase.body.provider) and program is not None:
+            gemm_impl = table_gemm(phase.body.provider)
+            reduction = next(
+                domain.size
+                for domain in program.iteration_domains
+                if domain.axis in program.reduction_axes
+            )
+            row.update(
+                gemm_shape=[*program.store.shape, reduction],
+                feature_tile=phase.body.tiles.cta_shape[1],
+                split_k=split_k(phase.body)
+                if gemm_impl is None
+                else gemm_impl.gemm.split_k(phase.body),
+            )
+        phase_rows.append(row)
     totals = {
         key: sum(row[key] for row, _ in intervals) / 1e3
         for key in ("span", "critical", "mean_busy", "straggler_wait", "release")
@@ -178,7 +222,10 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
         "phases": phase_rows,
         "all_intervals": [
             {
-                **{key: row[key] / 1e3 for key in ("span", "critical", "mean_busy", "straggler_wait", "release")},
+                **{
+                    key: row[key] / 1e3
+                    for key in ("span", "critical", "mean_busy", "straggler_wait", "release")
+                },
                 "busy_ctas": row["busy_ctas"],
                 "busy_per_cta_us": [round(value / 1e3, 3) for value in row["busy_per_cta"]],
                 "phase_indices": [phase.index for phase in group],
@@ -192,9 +239,7 @@ def cta_profile(callable_, compiled, run, calls: int) -> dict:
                 "critical_us": row["critical"] / 1e3,
                 "straggler_wait_us": row["straggler_wait"] / 1e3,
                 "busy_ctas": row["busy_ctas"],
-                "phases": [
-                    f"{_category(phase)} tiles={len(phase.work_items)}" for phase in group
-                ],
+                "phases": [f"{_category(phase)} tiles={len(phase.work_items)}" for phase in group],
             }
             for row, group in sorted(intervals, key=lambda item: -item[0]["straggler_wait"])[:12]
         ],
@@ -209,7 +254,6 @@ def profile(callable_, compiled, run, calls: int) -> dict:
         run()
         torch.cuda.synchronize()
         samples.append(_stamps(callable_, compiled))
-    median = lambda values: sorted(values)[len(values) // 2]  # noqa: E731
     intervals, members, previous = [], [], len(phases)
     for index, phase in enumerate(phases):
         members.append(phase)
@@ -226,7 +270,7 @@ def profile(callable_, compiled, run, calls: int) -> dict:
             counts[_category(phase)] += 1
     total = sum(duration for duration, _ in intervals)
     gemm_tiles = collections.Counter(
-        len(phase.work_items) for phase in phases if phase.body.tiles.mma_family == "wgmma"
+        len(phase.work_items) for phase in phases if phase.body.tiles.mma_family is not None
     )
     return {
         "workers": compiled.plan.launch.grid_size,
@@ -245,9 +289,7 @@ def profile(callable_, compiled, run, calls: int) -> dict:
         "slowest_intervals": [
             {
                 "us": duration / 1e3,
-                "phases": [
-                    f"{_category(phase)} tiles={len(phase.work_items)}" for phase in group
-                ],
+                "phases": [f"{_category(phase)} tiles={len(phase.work_items)}" for phase in group],
             }
             for duration, group in sorted(intervals, key=lambda item: -item[0])[:12]
         ],
@@ -360,12 +402,19 @@ def main() -> None:
     parser.add_argument("--model", default=SMOLLM_MODEL_NAME)
     parser.add_argument("--revision")
     parser.add_argument("--mode", choices=("prefill", "decode"), default="prefill")
+    parser.add_argument("--prompt-tokens", type=int, default=len(PROMPT))
     parser.add_argument("--attention", choices=("eager", "megabake"), default="eager")
     parser.add_argument("--capacity", type=int, default=128)
     parser.add_argument(
         "--context", type=int, default=0, help="decode: tokens already cached before the first call"
     )
     parser.add_argument("--calls", type=int, default=9)
+    parser.add_argument("--tune-model", action="store_true", help="sweep GEMM choices for decode")
+    parser.add_argument("--profile-timeout", type=int, default=480)
+    parser.add_argument("--tiles", nargs="+", choices=("auto", "64", "128"), default=("64", "128"))
+    parser.add_argument(
+        "--split-limits", nargs="+", choices=("1", "2", "4", "8"), default=("1", "2", "4", "8")
+    )
     parser.add_argument("--out", type=Path)
     parser.add_argument(
         "--cta", action="store_true", help="also split intervals into work and wait per CTA"
@@ -380,6 +429,11 @@ def main() -> None:
         help="profile a plan even if it fails the accuracy check (diagnostic only)",
     )
     args = parser.parse_args()
+    if args.tune_model:
+        tuner_for_device().tune_model(args, Path(__file__).resolve())
+        return
+    if args.prompt_tokens < 1:
+        parser.error("--prompt-tokens must be positive")
     if args.skip_accuracy_gate:
         compiler._TABLE_PLAN_RELATIVE_L2_LIMIT = float("inf")
         compiler._PLAN_RELATIVE_L2_LIMIT = float("inf")
@@ -388,10 +442,11 @@ def main() -> None:
     backend = make_backend(mode=args.mode, compile_kernel=True, cache=False, scheduler="phase")
     with torch.no_grad():
         if args.mode == "prefill":
-            ids = torch.tensor([PROMPT], device="cuda")
+            prompt = (PROMPT * -(-args.prompt_tokens // len(PROMPT)))[: args.prompt_tokens]
+            ids = torch.tensor([prompt], device="cuda")
             mask = torch.ones_like(ids)
             compiled_model = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
-            run = lambda: compiled_model(ids, attention_mask=mask)  # noqa: E731
+            run = functools.partial(compiled_model, ids, attention_mask=mask)
         else:
             stateful, shapes = decode_module(model, args.capacity)
             state = [torch.zeros(s, device="cuda", dtype=d) for layer in shapes for s, d in layer]
@@ -402,15 +457,11 @@ def main() -> None:
             for tensor in state:
                 if tensor.dtype == torch.int32 and tensor.numel() == 1:
                     tensor.fill_(args.context)
-            position = [args.context]
 
             if args.context + 2 * args.calls + 4 > args.capacity:
                 raise SystemExit("--capacity must exceed --context + 2 * --calls + 4")
 
-            def run():
-                position_ids = torch.tensor([[position[0]]], device="cuda")
-                position[0] += 1
-                return compiled_model(token, position_ids, *state)
+            run = _DecodeStepRunner(compiled_model, token, state, position=args.context)
 
         run()
         callable_ = backend.megabake_last_callable
@@ -423,7 +474,12 @@ def main() -> None:
             raise SystemExit("plan has more phases than timer slots")
         for _ in range(3):
             run()
-        report = {"model": args.model, "mode": args.mode, **profile(callable_, compiled, run, args.calls)}
+        report = {
+            "model": args.model,
+            "mode": args.mode,
+            "prompt_tokens": args.prompt_tokens if args.mode == "prefill" else None,
+            **profile(callable_, compiled, run, args.calls),
+        }
         resources = getattr(compiled, "resources", None)
         if resources is not None:
             report["resources"] = {

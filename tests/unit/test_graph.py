@@ -6,7 +6,13 @@ import torch
 
 from megabake import import_fx, make_backend, prepare_fx_graph
 from megabake.fx_handler.export import capture_exported_program
-from megabake.graph import ComputeGraph, Op, StorageRelation, Value, verify_compute_graph
+from megabake.graph import (
+    ComputeGraph,
+    Op,
+    StorageRelation,
+    Value,
+    verify_compute_graph,
+)
 
 
 def _context(graph, value):
@@ -70,9 +76,7 @@ def test_import_fx_preserves_tuples_reuse_views_and_inventory():
         if node.op not in {"placeholder", "output"}
     }
     imported_operation_ids = {
-        source_id
-        for op in graph.ops.values()
-        for source_id in op.source_fx_ids
+        source_id for op in graph.ops.values() for source_id in op.source_fx_ids
     }
     assert imported_operation_ids == source_operation_ids
     assert all(op.tensor_program is None for op in graph.ops.values())
@@ -119,9 +123,7 @@ def test_import_fx_retains_unknown_target_and_source_node():
 
     value = torch.randn(2, 3)
     graph_module = torch.fx.symbolic_trace(Model())
-    unknown_node = next(
-        node for node in graph_module.graph.nodes if node.op == "call_function"
-    )
+    unknown_node = next(node for node in graph_module.graph.nodes if node.op == "call_function")
     unknown_node.meta["stack_trace"] = "test_graph.py:unknown_operator"
     graph = import_fx(graph_module, _context(graph_module, value))
     input_value = graph.values[graph.inputs[0]]

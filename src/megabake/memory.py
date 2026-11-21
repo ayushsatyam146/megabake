@@ -145,9 +145,7 @@ class LaunchRequirements:
     required_active_blocks: int
 
 
-def assign_storage(
-    plan: PhaseSchedule, *, reuse_workspace: bool = True
-) -> KernelPlan:
+def assign_storage(plan: PhaseSchedule, *, reuse_workspace: bool = True) -> KernelPlan:
     """Assign storage to every value; ``reuse_workspace=False`` keeps each
     intermediate in its own slice so diagnostics can read it after the call."""
     if not isinstance(plan, PhaseSchedule):
@@ -260,7 +258,7 @@ def assign_storage(
     bindings.extend(_boundary_bindings(selection, tile_maps))
     bindings = _deduplicate_bindings(bindings)
     worker_scratch = _worker_scratch(plan)
-    offsets, workspace_bytes = (
+    offsets, _workspace_bytes = (
         _allocate_workspace(workspace_requests)
         if reuse_workspace
         else _allocate_distinct_workspace(workspace_requests)
@@ -381,7 +379,9 @@ def verify_plan(plan: KernelPlan) -> None:
         for region_id in lifetime.reader_region_ids:
             reader = phase_by_region.get(region_id)
             if reader is None or not lifetime.start_phase <= reader.index < lifetime.end_phase:
-                raise InvalidStorage(f"workspace slice {assignment.storage_id} has an invalid reader")
+                raise InvalidStorage(
+                    f"workspace slice {assignment.storage_id} has an invalid reader"
+                )
 
     for index, left in enumerate(plan.storage.workspace):
         for right in plan.storage.workspace[index + 1 :]:
@@ -394,7 +394,9 @@ def verify_plan(plan: KernelPlan) -> None:
                 and right.offset_bytes < left.offset_bytes + left.size_bytes
             )
             if lifetime_overlap and byte_overlap:
-                raise InvalidStorage(f"workspace slice {left.storage_id} overlaps {right.storage_id}")
+                raise InvalidStorage(
+                    f"workspace slice {left.storage_id} overlaps {right.storage_id}"
+                )
 
     _verify_worker_scratch(plan)
     _verify_launch(plan)
@@ -430,7 +432,9 @@ def _build_consumers(selection: BodySelectionPlan) -> dict[str, tuple[str, ...]]
     return {value_id: tuple(region_ids) for value_id, region_ids in consumers.items()}
 
 
-def _storage_value_ids(value_id: str, graph: ComputeGraph, seen: set[str] | None = None) -> tuple[str, ...]:
+def _storage_value_ids(
+    value_id: str, graph: ComputeGraph, seen: set[str] | None = None
+) -> tuple[str, ...]:
     seen = seen or set()
     if value_id in seen:
         return ()
@@ -466,13 +470,9 @@ def _output_storage_roots(graph: ComputeGraph) -> frozenset[str]:
 
 
 def _direct_boundary_ids(graph: ComputeGraph) -> frozenset[str]:
-    parameter_names = set(
-        getattr(graph.runtime_context, "parameter_names", None) or ()
-    )
+    parameter_names = set(getattr(graph.runtime_context, "parameter_names", None) or ())
     return frozenset(
-        value_id
-        for value_id in (*graph.inputs, *graph.outputs)
-        if value_id in graph.values
+        value_id for value_id in (*graph.inputs, *graph.outputs) if value_id in graph.values
     ) | frozenset(
         value_id
         for value_id, value in graph.values.items()
@@ -491,7 +491,8 @@ def _aliases_boundary(
     if value is None:
         return False
     return any(
-        _aliases_boundary(alias, graph, boundary_ids, seen) for alias in value.storage_relation.aliases
+        _aliases_boundary(alias, graph, boundary_ids, seen)
+        for alias in value.storage_relation.aliases
     )
 
 
@@ -639,17 +640,13 @@ def _boundary_bindings(
 
     for value_id, value in graph.values.items():
         if value.binding_name in parameter_names:
-            bindings.append(
-                _make_boundary_binding(value_id, selection, tile_maps, "parameter")
-            )
+            bindings.append(_make_boundary_binding(value_id, selection, tile_maps, "parameter"))
 
     for value_id in graph.outputs:
         bindings.append(_make_boundary_binding(value_id, selection, tile_maps, "output"))
 
     selected_outputs = {
-        value_id
-        for selected in selection.selections
-        for value_id in selected.outputs
+        value_id for selected in selection.selections for value_id in selected.outputs
     }
     for selected in selection.selections:
         for value_id in selected.inputs:
@@ -671,9 +668,7 @@ def _boundary_bindings(
     for selected in selection.selections:
         for value_id in selected.outputs:
             if value_id not in bound and _aliases_boundary(value_id, graph, direct_boundary_ids):
-                bindings.append(
-                    _make_boundary_binding(value_id, selection, tile_maps, "alias")
-                )
+                bindings.append(_make_boundary_binding(value_id, selection, tile_maps, "alias"))
                 bound.add(value_id)
     return bindings
 
@@ -682,8 +677,7 @@ def _state_value_ids(graph: ComputeGraph) -> frozenset[str]:
     state_ids: set[str] = set()
     for operation in graph.ops.values():
         if not (
-            operation.effects.get("mutates_inputs")
-            or operation.effects.get("may_mutate_inputs")
+            operation.effects.get("mutates_inputs") or operation.effects.get("may_mutate_inputs")
         ):
             continue
         written = operation.effects.get("mutated_operands", operation.operands)
@@ -703,14 +697,10 @@ def _state_assignments(
             key = access.storage_identity
             existing = assignments.get(key)
             read_regions = tuple(
-                dict.fromkeys(
-                    (*(existing.read_regions if existing else ()), selected.region_id)
-                )
+                dict.fromkeys((*(existing.read_regions if existing else ()), selected.region_id))
             )
             write_regions = tuple(
-                dict.fromkeys(
-                    (*(existing.write_regions if existing else ()), selected.region_id)
-                )
+                dict.fromkeys((*(existing.write_regions if existing else ()), selected.region_id))
             )
             assignments[key] = StateStorageAssignment(
                 key_cache_value_id=access.key_cache_value_id,
@@ -761,11 +751,7 @@ def _verify_state_storage(plan: KernelPlan) -> None:
             state.valid_length_value_id,
         ):
             binding = next(
-                (
-                    binding
-                    for binding in plan.storage.bindings
-                    if binding.value_id == value_id
-                ),
+                (binding for binding in plan.storage.bindings if binding.value_id == value_id),
                 None,
             )
             if binding is None or binding.kind != "state":
@@ -825,7 +811,9 @@ def _value_shaped(layout: CuTeLayout, value: Any) -> CuTeLayout:
     output, while other regions index the value in its graph shape."""
     if value.shape is None or value.strides is None or tuple(value.shape) == layout.shape:
         return layout
-    shaped = CuTeLayout(layout.dtype, tuple(value.shape), tuple(value.strides), layout.alignment_bytes)
+    shaped = CuTeLayout(
+        layout.dtype, tuple(value.shape), tuple(value.strides), layout.alignment_bytes
+    )
     return shaped if layout.same_dense_memory(shaped) else layout
 
 
@@ -891,14 +879,16 @@ def _scratch_phase(phase: ScheduledPhase) -> WorkerScratchPhase:
 def _launch_requirements(
     schedule: PhaseSchedule, target: TargetFacts, storage: StoragePlan
 ) -> LaunchRequirements:
-    threads = max((phase.participants.participating_threads for phase in schedule.phases), default=1)
-    registers = max((phase.participants.registers_per_thread for phase in schedule.phases), default=1)
+    threads = max(
+        (phase.participants.participating_threads for phase in schedule.phases), default=1
+    )
+    registers = max(
+        (phase.participants.registers_per_thread for phase in schedule.phases), default=1
+    )
     active_blocks = min(
         (
             block_limit
-            for block_limit in (
-                phase.resources.maximum_active_blocks for phase in schedule.phases
-            )
+            for block_limit in (phase.resources.maximum_active_blocks for phase in schedule.phases)
             if block_limit is not None
         ),
         default=None,
@@ -933,9 +923,13 @@ def _verify_worker_scratch(plan: KernelPlan) -> None:
             if worker.alignment_bytes % phase_layout.alignment_bytes:
                 raise InvalidStorage(f"worker {worker.worker_id} scratch alignment is incompatible")
             if tuple(phase_layout.barrier_offsets) != phase.body.pipeline.barriers:
-                raise InvalidStorage(f"{phase.region_id} scratch barrier assignment is incompatible")
+                raise InvalidStorage(
+                    f"{phase.region_id} scratch barrier assignment is incompatible"
+                )
             if tuple(phase_layout.descriptor_offsets) != tuple(phase.body.pipeline.descriptors):
-                raise InvalidStorage(f"{phase.region_id} scratch descriptor assignment is incompatible")
+                raise InvalidStorage(
+                    f"{phase.region_id} scratch descriptor assignment is incompatible"
+                )
             lifetime = phase_layout.lifetime
             if (
                 lifetime.start_phase != phase.index
@@ -945,7 +939,9 @@ def _verify_worker_scratch(plan: KernelPlan) -> None:
             ):
                 raise InvalidStorage(f"{phase.region_id} scratch lifetime is invalid")
         if target is not None and worker.size_bytes > target.max_shared_memory_per_cta:
-            raise InvalidStorage(f"worker {worker.worker_id} scratch exceeds shared-memory capacity")
+            raise InvalidStorage(
+                f"worker {worker.worker_id} scratch exceeds shared-memory capacity"
+            )
 
 
 def _verify_launch(plan: KernelPlan) -> None:
@@ -964,7 +960,10 @@ def _verify_launch(plan: KernelPlan) -> None:
     if launch.dynamic_shared_memory_bytes != plan.storage.worker_scratch_bytes:
         raise InvalidStorage("launch shared-memory size does not match worker scratch")
     capacity = launch.max_active_blocks_per_sm
-    if capacity is not None and launch.required_active_blocks > capacity * target.multiprocessor_count:
+    if (
+        capacity is not None
+        and launch.required_active_blocks > capacity * target.multiprocessor_count
+    ):
         raise InvalidStorage("launch cannot sustain the required resident workers")
 
 
@@ -977,17 +976,12 @@ def _verify_collective_participation(plan: KernelPlan) -> None:
         ):
             raise InvalidStorage(f"{phase.region_id} has invalid worker participation")
         participating_ids = tuple(
-            worker.worker_id
-            for worker in phase.workers
-            if worker.participates_in_barrier
+            worker.worker_id for worker in phase.workers if worker.participates_in_barrier
         )
         if phase.barrier is None:
             if participating_ids not in ((), all_workers):
                 raise InvalidStorage(f"{phase.region_id} has invalid terminal barrier membership")
-        elif (
-            phase.barrier.participating_workers != all_workers
-            or participating_ids != all_workers
-        ):
+        elif phase.barrier.participating_workers != all_workers or participating_ids != all_workers:
             raise InvalidStorage(f"{phase.region_id} barrier does not include every worker")
         if (
             phase.participants.waiting_threads < 0
@@ -996,13 +990,9 @@ def _verify_collective_participation(plan: KernelPlan) -> None:
             raise InvalidStorage(f"{phase.region_id} has invalid thread participation")
 
 
-def _phase_values(
-    phase: ScheduledPhase, selection: BodySelectionPlan
-) -> tuple[str, ...]:
+def _phase_values(phase: ScheduledPhase, selection: BodySelectionPlan) -> tuple[str, ...]:
     selected = next(
-        selected
-        for selected in selection.selections
-        if selected.region_id == phase.region_id
+        selected for selected in selection.selections if selected.region_id == phase.region_id
     )
     return tuple(dict.fromkeys((*selected.inputs, *selected.outputs)))
 

@@ -1,7 +1,7 @@
 import pytest
 import torch
-from torch.fx import GraphModule
 from torch._inductor import compile_fx as inductor_compile_fx
+from torch.fx import GraphModule
 
 from megabake import CompilerError, make_backend, prepare_fx_graph
 
@@ -67,9 +67,7 @@ def test_prepare_fx_graph_remains_fx_and_skips_inductor_compilation(monkeypatch)
     def forbidden(*args, **kwargs):
         raise AssertionError("Inductor compilation must not be invoked")
 
-    monkeypatch.setattr(
-        inductor_compile_fx, "compile_fx_forward", forbidden
-    )
+    monkeypatch.setattr(inductor_compile_fx, "compile_fx_forward", forbidden)
 
     class Model(torch.nn.Module):
         def forward(self, value):
@@ -136,9 +134,7 @@ def test_torch_compile_returns_fx_reference_and_follows_parameters():
 def test_task22_strict_rejection_happens_before_execution():
     value = torch.randn(3, 4)
     exported = torch.export.export(OpaqueModel(), (value,))
-    backend = make_backend(
-        fallback="error", compile_kernel=True, cache=False
-    )
+    backend = make_backend(fallback="error", compile_kernel=True, cache=False)
     calls_before = _opaque_calls[0]
     with pytest.raises(CompilerError, match="missing lowering rule") as rejection:
         backend(exported.graph_module, (value,))
@@ -149,9 +145,7 @@ def test_task22_strict_rejection_happens_before_execution():
 
 def test_task22_inductor_fallback_handles_changed_inputs():
     value = torch.randn(3, 4)
-    backend = make_backend(
-        fallback="inductor", compile_kernel=True, cache=False
-    )
+    backend = make_backend(fallback="inductor", compile_kernel=True, cache=False)
     forward = torch.compile(OpaqueModel(), backend=backend, fullgraph=True)
     calls_before = _opaque_calls[0]
     with torch.no_grad():

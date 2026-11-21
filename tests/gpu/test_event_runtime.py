@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
-from cuda.bindings import driver as cuda
 import pytest
 import torch
+from cuda.bindings import driver as cuda
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 from megabake import (
     derive_dependencies,
@@ -20,10 +20,7 @@ from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
 from megabake.runtime import publish_event, wait_for_event
 
-
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA is required"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 
 @cute.kernel
@@ -85,19 +82,13 @@ def _schedule():
     value = torch.randn(1, 3)
     exported = torch.export.export(Model(), (value,))
     prepared = prepare_fx_graph(exported.graph_module, (value,))
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     selection = select_bodies(graph, _target())
-    return make_event_schedule(
-        selection, derive_dependencies(selection), worker_count=2
-    )
+    return make_event_schedule(selection, derive_dependencies(selection), worker_count=2)
 
 
 def _flat(tensor):
-    return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(
-        leading_dim=tensor.ndim - 1
-    )
+    return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(leading_dim=tensor.ndim - 1)
 
 
 def test_event_runtime_publishes_and_waits_across_ctas():

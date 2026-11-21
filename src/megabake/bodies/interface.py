@@ -51,6 +51,7 @@ class SelectionPolicy:
     # The launch's ``device.DeviceTree``: the rates and capacities providers
     # and the planner decide with. None plans as before the tree existed.
     device: Any = None
+    event_schedule: bool = False
 
 
 @dataclass(frozen=True)
@@ -159,6 +160,9 @@ class BodyConfig:
     completion: CompletionContract
     evidence: ResourceEvidence
     entrypoint: DeviceEntry = DeviceEntry()
+    # Providers may prioritize a compatible implementation over the default
+    # cost ordering. Zero retains the generic planner's normal ordering.
+    selection_priority: int = 0
 
 
 @dataclass(frozen=True)
@@ -253,9 +257,7 @@ def validate_body_config(
     policy: SelectionPolicy | None = None,
 ) -> None:
     if policy is not None and policy.mode not in {"prefill", "decode"}:
-        raise InvalidBodyConfig(
-            f"selection mode {policy.mode!r} must be 'prefill' or 'decode'"
-        )
+        raise InvalidBodyConfig(f"selection mode {policy.mode!r} must be 'prefill' or 'decode'")
     if config.entrypoint.name != "run" or config.entrypoint.arguments != (
         "work_iterator",
         "tensor_bindings",
@@ -282,12 +284,8 @@ def validate_body_config(
                     f"{label} layout {value_id} has mismatched axes and strides"
                 )
             if layout.shape is not None and len(layout.shape) != len(layout.axes):
-                raise InvalidBodyConfig(
-                    f"{label} layout {value_id} has mismatched shape and axes"
-                )
-            if layout.alignment_bytes <= 0 or layout.alignment_bytes & (
-                layout.alignment_bytes - 1
-            ):
+                raise InvalidBodyConfig(f"{label} layout {value_id} has mismatched shape and axes")
+            if layout.alignment_bytes <= 0 or layout.alignment_bytes & (layout.alignment_bytes - 1):
                 raise InvalidBodyConfig(f"{label} layout {value_id} has invalid alignment")
 
     for dimensions in (config.tiles.cta_shape, config.tiles.cluster_shape):
@@ -320,7 +318,10 @@ def validate_body_config(
             raise InvalidBodyConfig("body requires more registers than the target allows")
         if config.scratch.size_bytes > target.max_shared_memory_per_cta:
             raise InvalidBodyConfig("body requires more shared memory than the target allows")
-        if len(participants.warp_roles) != participants.participating_threads // target.threads_per_warp:
+        if (
+            len(participants.warp_roles)
+            != participants.participating_threads // target.threads_per_warp
+        ):
             raise InvalidBodyConfig("body warp roles do not match participating threads")
 
     if policy is not None and config.semantic.numerical_policy != policy.numerical_policy:

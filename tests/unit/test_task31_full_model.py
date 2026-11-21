@@ -70,9 +70,7 @@ def test_task31_builds_and_emits_complete_smollm_architecture_plan(tmp_path):
     )
     assert capture.context.requirements["preserve_output_wrappers"]
 
-    graph = form_regions(
-        canonicalize_semantics(import_fx(capture.graph, capture.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(capture.graph, capture.context)))
     assert all(operation.tensor_program is not None for operation in graph.ops.values())
     # Both layers are captured; per-layer duplicates (the causal mask, RoPE
     # tables) merge into one copy each.
@@ -80,9 +78,7 @@ def test_task31_builds_and_emits_complete_smollm_architecture_plan(tmp_path):
     assert _gather_index_is_static(graph, "value:unsqueeze_3")
     assert not _gather_index_is_static(graph, graph.inputs[0])
 
-    selection = select_bodies(
-        graph, _target(), SelectionPolicy(mode="prefill", allow_tuned=False)
-    )
+    selection = select_bodies(graph, _target(), SelectionPolicy(mode="prefill", allow_tuned=False))
     assert selection.unsupported_regions == ()
     body_names = {selection.body.name for selection in selection.selections}
     assert {"generic_gather", "generic_reduction"} <= body_names
@@ -91,9 +87,7 @@ def test_task31_builds_and_emits_complete_smollm_architecture_plan(tmp_path):
     region_kinds = {selected.region_id.rsplit(":", 1)[-1] for selected in selection.selections}
     assert {"rms_norm", "rope"} <= region_kinds
 
-    plan = assign_storage(
-        make_phase_schedule(selection, derive_dependencies(selection))
-    )
+    plan = assign_storage(make_phase_schedule(selection, derive_dependencies(selection)))
     verify_plan(plan)
     # At least one phase per Q/K/V/O, gate/up/down, and vocabulary projection.
     assert len(plan.phases) >= 7 * 2 + 1
@@ -108,26 +102,18 @@ def test_task31_builds_and_emits_complete_smollm_architecture_plan(tmp_path):
 
 def test_task31_builds_and_emits_stateful_smollm_decode_plan(tmp_path):
     torch.manual_seed(31)
-    model = StatefulSmolLMArchitecture(
-        layers=2, device="cpu", dtype=torch.bfloat16
-    )
+    model = StatefulSmolLMArchitecture(layers=2, device="cpu", dtype=torch.bfloat16)
     input_ids = torch.empty(1, 1, dtype=torch.int64, device="cpu")
     position_ids = torch.empty(1, 1, dtype=torch.int64, device="cpu")
     key_caches = tuple(
-        torch.empty(1, 4, 3, 64, dtype=torch.bfloat16, device="cpu")
-        for _ in range(2)
+        torch.empty(1, 4, 3, 64, dtype=torch.bfloat16, device="cpu") for _ in range(2)
     )
     value_caches = tuple(
-        torch.empty(1, 4, 3, 64, dtype=torch.bfloat16, device="cpu")
-        for _ in range(2)
+        torch.empty(1, 4, 3, 64, dtype=torch.bfloat16, device="cpu") for _ in range(2)
     )
-    valid_lengths = tuple(
-        torch.empty(1, dtype=torch.int32, device="cpu") for _ in range(2)
-    )
+    valid_lengths = tuple(torch.empty(1, dtype=torch.int32, device="cpu") for _ in range(2))
     args = (input_ids, position_ids, *key_caches, *value_caches, *valid_lengths)
-    exported = torch.export.export(
-        model, args
-    )
+    exported = torch.export.export(model, args)
     capture = capture_exported_program(
         exported,
         args=args,
@@ -135,17 +121,11 @@ def test_task31_builds_and_emits_stateful_smollm_decode_plan(tmp_path):
         model_name=SMOLLM_MODEL_NAME,
     )
 
-    graph = form_regions(
-        canonicalize_semantics(import_fx(capture.graph, capture.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(capture.graph, capture.context)))
 
-    selection = select_bodies(
-        graph, _target(), SelectionPolicy(mode="decode")
-    )
+    selection = select_bodies(graph, _target(), SelectionPolicy(mode="decode"))
     assert selection.unsupported_regions == ()
-    plan = assign_storage(
-        make_phase_schedule(selection, derive_dependencies(selection))
-    )
+    plan = assign_storage(make_phase_schedule(selection, derive_dependencies(selection)))
     verify_plan(plan)
     assert len(plan.storage.state) == 2
     assert all(state.capacity == 4 for state in plan.storage.state)
@@ -189,9 +169,7 @@ def test_task31_alias_views_keep_source_storage_offsets():
     from megabake.compiler import _alias_storage_offset
 
     graph = _sliced_projection_graph()
-    sliced = next(
-        value for value in graph.values.values() if value.storage_offset == 32
-    )
+    sliced = next(value for value in graph.values.values() if value.storage_offset == 32)
     base_id = sliced.storage_relation.storage_id
     base = torch.empty(1024)[16:]
     assert _alias_storage_offset(sliced.id, base_id, base, graph) == 48
@@ -208,9 +186,7 @@ def test_task31_plan_search_restores_state_between_runs():
         torch.zeros(1, 4, 3, 64, dtype=torch.bfloat16),
         torch.zeros(1, dtype=torch.int32),
     )
-    capture = capture_exported_program(
-        torch.export.export(model, args), args=args, model=model
-    )
+    capture = capture_exported_program(torch.export.export(model, args), args=args, model=model)
     graph = canonicalize_semantics(import_fx(capture.graph, capture.context))
     graph_inputs = capture.binding_values(args)
     snapshot = _StateSnapshot.create(graph, graph_inputs)

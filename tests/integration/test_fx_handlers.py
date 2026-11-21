@@ -25,9 +25,7 @@ def test_exported_fx_rebinds_inputs_parameters_and_uses_post_grad_cache():
     second = torch.randn(2, 4)
     exported = torch.export.export(model, (first,))
     backend = make_backend()
-    capture = capture_exported_program(
-        exported, args=(first,), model=model, backend=backend
-    )
+    capture = capture_exported_program(exported, args=(first,), model=model, backend=backend)
     assert capture.context.phase == "post_grad"
     assert capture.context.cache_state == "miss"
     assert capture.context.parameter_names == {"linear.weight", "linear.bias"}
@@ -40,9 +38,7 @@ def test_exported_fx_rebinds_inputs_parameters_and_uses_post_grad_cache():
         model.linear.weight.add_(0.5)
         assert torch.allclose(capture.run(second), model(second))
 
-    repeat = capture_exported_program(
-        exported, args=(first,), model=model, backend=backend
-    )
+    repeat = capture_exported_program(exported, args=(first,), model=model, backend=backend)
     assert repeat.context.phase == "post_grad"
     assert repeat.context.cache_state == "hit"
     assert backend.megabake_cache.hits == 1
@@ -64,9 +60,7 @@ def test_capture_transformer_extracts_fx_graph_without_torch_compile():
     model = AutoModelForCausalLM.from_config(config).eval()
     input_ids = torch.tensor([[1, 2, 3]])
     backend = make_backend(cache=False)
-    capture = capture_transformer(
-        model, input_ids, device="cpu", backend=backend
-    )
+    capture = capture_transformer(model, input_ids, device="cpu", backend=backend)
     assert capture.context.phase == "post_grad"
     assert capture.context.cache_state == "miss"
     assert any(name == "input_ids" for name in capture.context.input_order)
@@ -93,9 +87,7 @@ def test_capture_transformer_imports_and_dumps_compute_graph(tmp_path):
     model = AutoModelForCausalLM.from_config(config).eval()
     input_ids = torch.tensor([[1, 2, 3]])
     backend = make_backend(cache=False)
-    capture = capture_transformer(
-        model, input_ids, device="cpu", backend=backend
-    )
+    capture = capture_transformer(model, input_ids, device="cpu", backend=backend)
     graph = import_fx(capture.graph, capture.context)
     path = dump_compute_graph(graph, tmp_path / "compute_graph.txt")
 

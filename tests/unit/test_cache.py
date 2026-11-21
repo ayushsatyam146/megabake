@@ -36,9 +36,7 @@ def _prepared(model: torch.nn.Module, *inputs: torch.Tensor):
 
 def _selected_plan(model: torch.nn.Module, *inputs: torch.Tensor):
     prepared = _prepared(model, *inputs)
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
 
     def evaluate(plan, budget):
         return PlanMeasurement(
@@ -99,14 +97,14 @@ def test_plan_key_covers_semantics_shapes_strides_mode_and_toolchain():
 
     contiguous_plan, contiguous_context = _selected_plan(Map(), contiguous)
     strided_plan, strided_context = _selected_plan(Map(), strided)
-    assert make_plan_key(
-        contiguous_plan, contiguous_context
-    ) != make_plan_key(strided_plan, strided_context)
+    assert make_plan_key(contiguous_plan, contiguous_context) != make_plan_key(
+        strided_plan, strided_context
+    )
 
     smaller_plan, smaller_context = _selected_plan(Map(), torch.randn(3, 4))
-    assert make_plan_key(
-        contiguous_plan, contiguous_context
-    ) != make_plan_key(smaller_plan, smaller_context)
+    assert make_plan_key(contiguous_plan, contiguous_context) != make_plan_key(
+        smaller_plan, smaller_context
+    )
 
 
 def test_plan_key_ignores_parameter_contents_and_addresses():
@@ -120,16 +118,12 @@ def test_plan_key_ignores_parameter_contents_and_addresses():
     plan, first_context = _selected_plan(Model(), source, first_weight)
     second_context = _prepared(Model(), source, second_weight).context
 
-    assert make_plan_key(plan, first_context) == make_plan_key(
-        plan, second_context
-    )
+    assert make_plan_key(plan, first_context) == make_plan_key(plan, second_context)
 
 
 def test_plan_cache_reuses_compiled_artifact_and_stores_diagnostics():
     cache = PlanCache()
-    compiled = SimpleNamespace(
-        search=SimpleNamespace(report=lambda: {"selected": "test-plan"})
-    )
+    compiled = SimpleNamespace(search=SimpleNamespace(report=lambda: {"selected": "test-plan"}))
     compilations = 0
 
     def compiler():

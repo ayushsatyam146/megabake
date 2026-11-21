@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -19,8 +20,7 @@ from megabake.bodies import (
 from megabake.bodies.catalog import get_candidates
 from megabake.bodies.cuda.sm90.gemm import gemm_candidates
 from megabake.frontend import prepare_fx_graph
-from megabake.graph import import_fx
-from megabake.graph import Region
+from megabake.graph import Region, import_fx
 from megabake.ir import Accumulator, Binary, Cast, Constant, Unary
 from megabake.lowering import canonicalize_semantics
 from megabake.ops import ViewPlusGemm
@@ -56,9 +56,7 @@ def _policy(**changes):
 def _regions(model, *inputs):
     exported = torch.export.export(model, inputs)
     prepared = prepare_fx_graph(exported.graph_module, inputs)
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     return graph.regions
 
 
@@ -213,14 +211,10 @@ def test_emit_reduction_body_preserves_norm_epsilon_and_cast():
         "none",
     )
     program = replace(program, post=post, store=replace(program.store, dtype="torch.bfloat16"))
-    output_layout = replace(
-        config.layouts.outputs[program.store.value_id], dtype="torch.bfloat16"
-    )
+    output_layout = replace(config.layouts.outputs[program.store.value_id], dtype="torch.bfloat16")
     config = replace(
         config,
-        layouts=replace(
-            config.layouts, outputs={program.store.value_id: output_layout}
-        ),
+        layouts=replace(config.layouts, outputs={program.store.value_id: output_layout}),
     )
 
     body = emit_reduction_body(program, config)
@@ -249,9 +243,7 @@ def test_emit_contraction_body_generates_gemm_source():
     assert config.tiles.cta_shape == (128, 1)
     assert config.tiles.work_partition == "one output element per thread"
     assert config.tiles.reduction_tile == (32,)
-    assert config.evidence.revision.startswith(
-        "mirage@f9eb70c254acefc9f3667b2a973d0dcf25471fce"
-    )
+    assert config.evidence.revision.startswith("mirage@f9eb70c254acefc9f3667b2a973d0dcf25471fce")
     assert body.function_name == "run"
     assert body.threads_per_cta == 128
     assert body.output_tile_elements == 128
@@ -264,10 +256,7 @@ def test_emit_contraction_body_generates_gemm_source():
     assert "accumulator = cutlass.Float32(cutlass.Float32(0))" in body.source
     assert "tensor_bindings[0][o0, r0]" in body.source
     assert "tensor_bindings[1][r0, o1]" in body.source
-    assert (
-        "stored_value = cutlass.BFloat16((accumulator).to(cutlass.BFloat16))"
-        in body.source
-    )
+    assert "stored_value = cutlass.BFloat16((accumulator).to(cutlass.BFloat16))" in body.source
     assert "output[o0, o1] = stored_value" in body.source
 
 
@@ -306,8 +295,7 @@ def test_emit_contraction_body_preserves_bias_partial_dimensions_and_cast():
     region = next(
         region
         for region in _regions(Model(), source, weight, bias)
-        if region.tensor_programs
-        and region.tensor_programs[0].family == "contraction"
+        if region.tensor_programs and region.tensor_programs[0].family == "contraction"
     )
     program = region.tensor_programs[0]
     config = get_candidates(region, _target(), _policy()).configurations[0]
@@ -316,14 +304,10 @@ def test_emit_contraction_body_preserves_bias_partial_dimensions_and_cast():
         post=Cast(program.post.operand, "torch.float32", "none"),
         store=replace(program.store, dtype="torch.float32"),
     )
-    output_layout = replace(
-        config.layouts.outputs[program.store.value_id], dtype="torch.float32"
-    )
+    output_layout = replace(config.layouts.outputs[program.store.value_id], dtype="torch.float32")
     config = replace(
         config,
-        layouts=replace(
-            config.layouts, outputs={program.store.value_id: output_layout}
-        ),
+        layouts=replace(config.layouts, outputs={program.store.value_id: output_layout}),
     )
 
     body = emit_contraction_body(program, config)
@@ -351,15 +335,11 @@ def test_emit_contraction_body_rejects_incompatible_schedule():
 
     bad_tiles = replace(config.tiles, cta_shape=(32, 32))
     with pytest.raises(UnsupportedContractionBody, match="flat"):
-        emit_contraction_body(
-            region.tensor_programs[0], replace(config, tiles=bad_tiles)
-        )
+        emit_contraction_body(region.tensor_programs[0], replace(config, tiles=bad_tiles))
 
     bad_reduction = replace(config.tiles, reduction_tile=())
     with pytest.raises(UnsupportedContractionBody, match="reduction chunk"):
-        emit_contraction_body(
-            region.tensor_programs[0], replace(config, tiles=bad_reduction)
-        )
+        emit_contraction_body(region.tensor_programs[0], replace(config, tiles=bad_reduction))
 
 
 def test_catalog_describes_g0_range_and_rejects_incompatible_target():
@@ -460,9 +440,7 @@ def test_invalid_participation_and_layout_are_rejected():
     bad_layout = replace(config.layouts.inputs[first_input], strides=(1,))
     bad_inputs = {**config.layouts.inputs, first_input: bad_layout}
     with pytest.raises(InvalidBodyConfig, match="mismatched axes and strides"):
-        validate_body_config(
-            replace(config, layouts=replace(config.layouts, inputs=bad_inputs))
-        )
+        validate_body_config(replace(config, layouts=replace(config.layouts, inputs=bad_inputs)))
 
 
 def test_emit_map_body_binds_each_load_once():
@@ -512,7 +490,7 @@ def test_catalog_offers_a_target_the_generic_and_its_generation_providers():
         return [provider.provider_name for provider in catalog.providers(target)]
 
     assert names(_target()) == ["generic", "g0_range", "gemv", "attention"]
-    assert names(_target(architecture="sm100")) == ["generic", "blackwell_mma"]
+    assert names(_target(architecture="sm100")) == ["generic", "blackwell_mma", "sm100_attention"]
     assert names(_target(architecture="sm80")) == ["generic"]
     assert catalog.provider("attention").provider_name == "attention"
 
@@ -523,11 +501,15 @@ def test_catalog_offers_a_target_the_generic_and_its_generation_providers():
     region = next(
         region
         for region in _regions(
-            Model(), torch.randn(4, 64, dtype=torch.bfloat16), torch.randn(64, 64, dtype=torch.bfloat16)
+            Model(),
+            torch.randn(4, 64, dtype=torch.bfloat16),
+            torch.randn(64, 64, dtype=torch.bfloat16),
         )
         if region.tensor_programs[0].family == "contraction"
     )
-    graph = SimpleNamespace(ops={"op:mm": SimpleNamespace(tensor_program=region.tensor_programs[0])})
+    graph = SimpleNamespace(
+        ops={"op:mm": SimpleNamespace(tensor_program=region.tensor_programs[0])}
+    )
     assert catalog.launch_options(graph, _target(), table_launch=True) == HopperLaunchOptions(
         swap_ab=True, swap_ab_rows=16
     )

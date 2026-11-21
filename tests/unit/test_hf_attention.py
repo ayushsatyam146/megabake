@@ -9,17 +9,34 @@ transformers = pytest.importorskip("transformers")
 
 
 def _tiny_models():
-    from transformers import Gemma3TextConfig, Gemma3ForCausalLM, LlamaConfig, LlamaForCausalLM
+    from transformers import (
+        Gemma3ForCausalLM,
+        Gemma3TextConfig,
+        LlamaConfig,
+        LlamaForCausalLM,
+    )
 
     llama = LlamaConfig(
-        vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
-        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=64,
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
     )
     # One KV head, sliding and full layers, and a query_pre_attn_scalar scale.
     gemma = Gemma3TextConfig(
-        vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
-        num_attention_heads=4, num_key_value_heads=1, head_dim=32,
-        query_pre_attn_scalar=24, sliding_window=4, max_position_embeddings=64,
+        vocab_size=128,
+        hidden_size=64,
+        intermediate_size=128,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=32,
+        query_pre_attn_scalar=24,
+        sliding_window=4,
+        max_position_embeddings=64,
         layer_types=["sliding_attention", "full_attention"],
     )
     return (("llama", LlamaForCausalLM, llama), ("gemma3", Gemma3ForCausalLM, gemma))
@@ -82,7 +99,11 @@ def test_decode_step_matches_hugging_face_decode(name, model_class, config):
             cache = out.past_key_values
             expected.append(out.logits)
         step = DecodeStep(model, capacity=8)
-        state = [torch.zeros(s, dtype=d if d == torch.int32 else torch.float32) for layer in step.state_shapes() for s, d in layer]
+        state = [
+            torch.zeros(s, dtype=d if d == torch.int32 else torch.float32)
+            for layer in step.state_shapes()
+            for s, d in layer
+        ]
         for position in range(tokens.shape[1]):
             actual = step(tokens[:, position : position + 1], torch.tensor([[position]]), *state)
             torch.testing.assert_close(actual, expected[position], rtol=1e-4, atol=1e-4)

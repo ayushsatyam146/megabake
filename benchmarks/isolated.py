@@ -4,6 +4,8 @@ Graph replay and megabake_fast use prebuilt launches with fixed tensors.
 megabake_call additionally includes CuTe argument marshalling; megabake_bound
 includes the complete public-call binding and allocation overhead.
 
+    .venv/bin/python benchmarks/isolated.py --tune-shapes 2048x8192 --output tuning.json
+
     eager_graph      CUDA Graph replay of the eager kernels
     inductor_graph   CUDA Graph replay of the torch.compile (Inductor) kernels
     megabake_fast    prebuilt CuTe execution arguments, launch entry only
@@ -23,15 +25,17 @@ import time
 from pathlib import Path
 
 import torch
-from cuda.bindings import driver as cuda
+
+from megabake.platform import cuda
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from megabake import make_backend
-from megabake.compiler import _initial_ready, _input_tensors, _RuntimeState
 from benchmarks.measure import kernel_trace
 from benchmarks.workloads import mlp
+from megabake import make_backend
+from megabake.bodies.catalog import tuner_for_device
+from megabake.compiler import _initial_ready, _input_tensors, _RuntimeState
 
 
 def _single(launch, prepare, count):
@@ -89,12 +93,8 @@ def _measure(name, launch, prepare, arguments, traces, batch_size):
         launch(prepare())
     torch.cuda.synchronize()
     single_host, single_device = _single(launch, prepare, arguments.samples)
-    burst_host, burst_device = _burst(
-        launch, prepare, arguments.samples, arguments.burst
-    )
-    trace = kernel_trace(
-        lambda: launch(prepare()), traces / f"m{batch_size}-{name}-trace.json"
-    )
+    burst_host, burst_device = _burst(launch, prepare, arguments.samples, arguments.burst)
+    trace = kernel_trace(lambda: launch(prepare()), traces / f"m{batch_size}-{name}-trace.json")
     return {
         "single_launch_and_wait": _summary(single_host),
         "single_device_span": _summary(single_device),
@@ -122,9 +122,7 @@ def _capture(function, inputs):
 
 
 def _relative_l2(actual, expected):
-    return (
-        (actual.float() - expected.float()).norm() / expected.float().norm()
-    ).item()
+    return ((actual.float() - expected.float()).norm() / expected.float().norm()).item()
 
 
 def _graph_ordered_inputs(compiled, inputs):
@@ -208,10 +206,19 @@ def main() -> None:
     parser.add_argument("--samples", type=int, default=64)
     parser.add_argument("--burst", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=16)
+    parser.add_argument("--scheduler", choices=("auto", "phase", "region-events"), default="auto")
     parser.add_argument(
-        "--scheduler", choices=("auto", "phase", "region-events"), default="auto"
+        "--tune-shapes", nargs="+", help="output features x reduction, e.g. 2048x8192"
+    )
+    parser.add_argument("--tune-rows", type=int, default=1)
+    parser.add_argument("--tune-cache-mib", type=int, default=256)
+    parser.add_argument(
+        "--tune-split-limits", nargs="+", choices=("1", "2", "4", "8"), default=("1", "2", "4", "8")
     )
     arguments = parser.parse_args()
+    if arguments.tune_shapes:
+        tuner_for_device().tune_gemm(arguments)
+        return
     root = arguments.output.parent
     traces = root / "traces"
 
@@ -225,12 +232,9 @@ def main() -> None:
         "records": [],
     }
     for batch_size in arguments.batches:
-        source = torch.randn(
-            batch_size, 576, dtype=torch.bfloat16, device="cuda"
-        ) / (576**0.5)
+        source = torch.randn(batch_size, 576, dtype=torch.bfloat16, device="cuda") / (576**0.5)
         weights = tuple(
-            torch.randn(rows, columns, dtype=torch.bfloat16, device="cuda")
-            / (columns**0.5)
+            torch.randn(rows, columns, dtype=torch.bfloat16, device="cuda") / (columns**0.5)
             for rows, columns in ((1536, 576), (1536, 576), (576, 1536))
         )
         inputs = (source, *weights)
@@ -240,15 +244,13 @@ def main() -> None:
         eager_graph, eager_result = _capture(mlp, inputs)
         modes["eager_graph"] = _measure(
             "eager_graph",
-            lambda _: eager_graph.replay(),
+            lambda _: eager_graph.replay(),  # noqa: B023  # Callback is consumed within this loop iteration.
             lambda: None,
             arguments,
             traces,
             batch_size,
         )
-        modes["eager_graph"]["relative_l2_error"] = _relative_l2(
-            eager_result, reference
-        )
+        modes["eager_graph"]["relative_l2_error"] = _relative_l2(eager_result, reference)
 
         inductor = torch.compile(
             mlp, fullgraph=True, dynamic=False, mode="max-autotune-no-cudagraphs"
@@ -257,15 +259,13 @@ def main() -> None:
         inductor_graph, inductor_result = _capture(inductor, inputs)
         modes["inductor_graph"] = _measure(
             "inductor_graph",
-            lambda _: inductor_graph.replay(),
+            lambda _: inductor_graph.replay(),  # noqa: B023  # Callback is consumed within this loop iteration.
             lambda: None,
             arguments,
             traces,
             batch_size,
         )
-        modes["inductor_graph"]["relative_l2_error"] = _relative_l2(
-            inductor_result, reference
-        )
+        modes["inductor_graph"]["relative_l2_error"] = _relative_l2(inductor_result, reference)
 
         backend = make_backend(scheduler=arguments.scheduler, compile_kernel=True)
         bound = torch.compile(mlp, backend=backend, fullgraph=True, dynamic=False)
@@ -277,7 +277,7 @@ def main() -> None:
         # The isolated launcher below owns private buffers and epoch state.
         modes["megabake_bound"] = _measure(
             "megabake_bound",
-            lambda _: bound(*inputs),
+            lambda _: bound(*inputs),  # noqa: B023  # Callback is consumed within this loop iteration.
             lambda: None,
             arguments,
             traces,
@@ -297,9 +297,7 @@ def main() -> None:
                 traces,
                 batch_size,
             )
-            modes["megabake_fast"]["relative_l2_error"] = _relative_l2(
-                megabake.output, reference
-            )
+            modes["megabake_fast"]["relative_l2_error"] = _relative_l2(megabake.output, reference)
         modes["megabake_call"] = _measure(
             "megabake_call",
             megabake.launch_call,
@@ -308,9 +306,7 @@ def main() -> None:
             traces,
             batch_size,
         )
-        modes["megabake_call"]["relative_l2_error"] = _relative_l2(
-            megabake.output, reference
-        )
+        modes["megabake_call"]["relative_l2_error"] = _relative_l2(megabake.output, reference)
 
         for name, mode in modes.items():
             if not mode["relative_l2_error"] < 0.01:
@@ -325,9 +321,7 @@ def main() -> None:
             json.dumps(
                 {
                     "kernel_name": resources.kernel_name,
-                    "selected_plan": getattr(
-                        compiled.search, "selected_description", None
-                    ),
+                    "selected_plan": getattr(compiled.search, "selected_description", None),
                     "workers": compiled.plan.launch.grid_size,
                     "threads_per_block": compiled.plan.launch.threads_per_block,
                     "registers_per_thread": resources.registers_per_thread,
@@ -354,9 +348,7 @@ def main() -> None:
             }
         )
         arguments.output.parent.mkdir(parents=True, exist_ok=True)
-        arguments.output.write_text(
-            json.dumps(report, indent=2) + "\n", encoding="utf-8"
-        )
+        arguments.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
         print(f"\nM={batch_size}  (microseconds, medians)", flush=True)
         print(

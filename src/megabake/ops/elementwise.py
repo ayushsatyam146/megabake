@@ -80,27 +80,22 @@ def _chain_candidate(
         rejections.append("source effects do not fit a vector-chain body")
     if any(
         operation.results[0] in graph.outputs
-        or any(
-            user not in operation_ids
-            for user in graph.values[operation.results[0]].users
-        )
+        or any(user not in operation_ids for user in graph.values[operation.results[0]].users)
         for operation in operations[:-1]
     ):
         rejections.append("an intermediate value has an external use")
     if not all(
-        same_chain_layout(operation.results[0], tail.results[0], graph)
-        for operation in operations
+        same_chain_layout(operation.results[0], tail.results[0], graph) for operation in operations
     ):
         rejections.append("source ownership or broadcast contract changes")
 
     fused_program = compose_scalar_chain(operations, graph)
-    external_inputs = tuple(
-        load.value_id for load in fused_program.loads
-    ) if fused_program is not None else external_inputs_of(operations, graph)
-    saved_bytes = sum(
-        value_bytes(operation.results[0], graph) * 2
-        for operation in operations[:-1]
+    external_inputs = (
+        tuple(load.value_id for load in fused_program.loads)
+        if fused_program is not None
+        else external_inputs_of(operations, graph)
     )
+    saved_bytes = sum(value_bytes(operation.results[0], graph) * 2 for operation in operations[:-1])
     return RegionCandidate(
         id=f"region:{tail.id.removeprefix('op:')}:fused{suffix}",
         source_op_ids=tuple(operation.id for operation in operations),
@@ -179,9 +174,7 @@ def is_scalar_operation(operation: Op) -> bool:
     }
 
 
-def compose_scalar_chain(
-    chain: tuple[Op, ...], graph: ComputeGraph
-) -> TensorProgram | None:
+def compose_scalar_chain(chain: tuple[Op, ...], graph: ComputeGraph) -> TensorProgram | None:
     tail = chain[-1]
     tail_program = tail.tensor_program
     if not isinstance(tail_program, TensorProgram):
@@ -217,9 +210,7 @@ def compose_scalar_chain(
                 )
                 leaf_ids[leaf_key] = leaf_id
             replacements[load.id] = Load(leaf_id, load.dtype)
-        expressions[operation.results[0]] = substitute_loads(
-            program.combine, replacements
-        )
+        expressions[operation.results[0]] = substitute_loads(program.combine, replacements)
 
     return replace(
         tail_program,
@@ -232,4 +223,3 @@ def same_chain_layout(left_id: str, right_id: str, graph: ComputeGraph) -> bool:
     left = graph.values[left_id]
     right = graph.values[right_id]
     return left.shape == right.shape and left.strides == right.strides
-

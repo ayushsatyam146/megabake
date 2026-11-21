@@ -30,9 +30,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from megabake import make_backend  # noqa: E402
-from megabake.compiler import _RuntimeState  # noqa: E402
-from tests.fixtures import (  # noqa: E402
+from megabake import make_backend
+from megabake.compiler import _RuntimeState
+from tests.fixtures import (
     SMOLLM_MODEL_NAME,
     SMOLLM_REVISION,
     SmolLMArchitecture,
@@ -68,8 +68,7 @@ def _runtime_state(compiled: Any) -> _RuntimeState:
         item
         for item in gc.get_objects()
         # type() rather than isinstance(): dead weak proxies raise on isinstance.
-        if type(item) is _RuntimeState
-        and getattr(item, "generated", None) is compiled.generated
+        if type(item) is _RuntimeState and getattr(item, "generated", None) is compiled.generated
     ]
     if not states:
         raise RuntimeError("no runtime state found for the compiled kernel")
@@ -87,9 +86,11 @@ def _write_phases(path: Path, compiled: Any) -> None:
     selections = {item.region_id: item for item in plan.selection.selections}
     emissions = {item.index: item for item in compiled.generated.launch.phases}
     lines = [
-        f"{len(plan.phases)} phases, "
-        f"{compiled.resources.body_variant_count} body variants, "
-        f"{len(graph.ops)} graph operations",
+        (
+            f"{len(plan.phases)} phases, "
+            f"{compiled.resources.body_variant_count} body variants, "
+            f"{len(graph.ops)} graph operations"
+        ),
         "",
     ]
     for phase in plan.phases:
@@ -147,9 +148,7 @@ def _write_phase_table(path: Path, compiled: Any) -> None:
 def _write_address_table(path: Path, compiled: Any, state: _RuntimeState) -> int:
     launch = compiled.generated.launch
     dynamic = set(launch.dynamic_slots)
-    device_table = (
-        state._address_table.cpu().tolist() if state._address_table is not None else []
-    )
+    device_table = state._address_table.cpu().tolist() if state._address_table is not None else []
     workspace = state.workspace_base.data_ptr() if state.workspace_base is not None else 0
     mismatches = 0
     lines = [
@@ -218,9 +217,7 @@ def _dump(mode_dir: Path, backend: Any, extra: dict[str, Any]) -> dict[str, Any]
         "recurring_gpu_operations": trace.recurring_gpu_operations,
         "resources": dataclasses.asdict(compiled.resources),
     }
-    (mode_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2, default=str) + "\n"
-    )
+    (mode_dir / "summary.json").write_text(json.dumps(summary, indent=2, default=str) + "\n")
     return summary
 
 
@@ -253,16 +250,13 @@ def run_prefill(model: torch.nn.Module, args: argparse.Namespace, out: Path) -> 
                 {
                     "input_ids": ids,
                     "relative_error_vs_eager": _relative(actual, expected),
-                    "argmax_matches": bool(
-                        torch.equal(actual.argmax(-1), expected.argmax(-1))
-                    ),
+                    "argmax_matches": bool(torch.equal(actual.argmax(-1), expected.argmax(-1))),
                 }
             )
     return _dump(
         mode_dir,
         backend,
-        {"mode": "prefill", "compile_and_first_call_seconds": compile_seconds,
-         "calls": errors},
+        {"mode": "prefill", "compile_and_first_call_seconds": compile_seconds, "calls": errors},
     )
 
 
@@ -276,8 +270,7 @@ def run_decode(model: torch.nn.Module, args: argparse.Namespace, out: Path) -> d
 
     def fresh_state() -> list[torch.Tensor]:
         caches = [
-            torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
-            for _ in range(2 * layers)
+            torch.zeros(shape, device="cuda", dtype=torch.bfloat16) for _ in range(2 * layers)
         ]
         lengths = [torch.zeros(1, device="cuda", dtype=torch.int32) for _ in range(layers)]
         return caches + lengths
@@ -304,9 +297,7 @@ def run_decode(model: torch.nn.Module, args: argparse.Namespace, out: Path) -> d
                 {
                     "position": position,
                     "relative_error_vs_eager": _relative(actual, expected),
-                    "argmax_matches": bool(
-                        torch.equal(actual.argmax(-1), expected.argmax(-1))
-                    ),
+                    "argmax_matches": bool(torch.equal(actual.argmax(-1), expected.argmax(-1))),
                     "worst_cache_relative_error": max(cache_errors),
                     "valid_lengths": sorted(set(lengths)),
                     "reference_valid_lengths": sorted(
@@ -317,23 +308,39 @@ def run_decode(model: torch.nn.Module, args: argparse.Namespace, out: Path) -> d
     return _dump(
         mode_dir,
         backend,
-        {"mode": "decode", "capacity": args.capacity,
-         "compile_and_first_call_seconds": compile_seconds, "steps": steps},
+        {
+            "mode": "decode",
+            "capacity": args.capacity,
+            "compile_and_first_call_seconds": compile_seconds,
+            "steps": steps,
+        },
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--modes", nargs="+", choices=("prefill", "decode"),
-                        default=["prefill", "decode"])
-    parser.add_argument("--checkpoint", action="store_true",
-                        help=f"use {SMOLLM_MODEL_NAME}@{SMOLLM_REVISION[:8]} weights")
-    parser.add_argument("--layers", type=int, default=30,
-                        help="layer count for the random-weight architecture")
-    parser.add_argument("--input-ids", type=lambda value: [int(item) for item in value.split(",")],
-                        default=[1, 504, 3458, 314])
-    parser.add_argument("--capacity", type=int, default=4,
-                        help="KV cache capacity; decode runs this many advancing calls")
+    parser.add_argument(
+        "--modes", nargs="+", choices=("prefill", "decode"), default=["prefill", "decode"]
+    )
+    parser.add_argument(
+        "--checkpoint",
+        action="store_true",
+        help=f"use {SMOLLM_MODEL_NAME}@{SMOLLM_REVISION[:8]} weights",
+    )
+    parser.add_argument(
+        "--layers", type=int, default=30, help="layer count for the random-weight architecture"
+    )
+    parser.add_argument(
+        "--input-ids",
+        type=lambda value: [int(item) for item in value.split(",")],
+        default=[1, 504, 3458, 314],
+    )
+    parser.add_argument(
+        "--capacity",
+        type=int,
+        default=4,
+        help="KV cache capacity; decode runs this many advancing calls",
+    )
     parser.add_argument("--seed", type=int, default=31)
     parser.add_argument("--out", type=Path, default=Path("artifacts/megakernels"))
     args = parser.parse_args()

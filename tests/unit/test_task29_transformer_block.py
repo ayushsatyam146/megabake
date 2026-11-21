@@ -11,7 +11,6 @@ from megabake import (
     verify_plan,
 )
 from megabake.bodies import SelectionPolicy, TargetFacts
-from megabake.frontend import prepare_fx_graph
 from megabake.fx_handler.export import capture_exported_program
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
@@ -36,9 +35,7 @@ def _target() -> TargetFacts:
 def _plan(model, inputs, mode):
     exported = torch.export.export(model.eval(), inputs)
     prepared = capture_exported_program(exported, inputs, model=model, mode=mode)
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     selection = select_bodies(graph, _target(), SelectionPolicy(mode=mode))
     dependencies = derive_dependencies(selection)
     plan = assign_storage(make_phase_schedule(selection, dependencies))
@@ -93,16 +90,12 @@ def test_task29_forms_a_complete_block_plan(model, inputs, mode):
     plan = _plan(model, inputs, mode)
 
     assert plan.selection.report.complete
-    source_targets = [
-        selection.program.source_target
-        for selection in plan.selection.selections
-    ]
+    source_targets = [selection.program.source_target for selection in plan.selection.selections]
     assert source_targets.count("rms_norm") == 2
     assert source_targets.count("rope") == 2
     if mode == "prefill":
         assert any(
-            isinstance(candidate.semantics, Attention)
-            and candidate.executable
+            isinstance(candidate.semantics, Attention) and candidate.executable
             for region in plan.selection.graph.regions
             for candidate in region.fusion_candidates
         )

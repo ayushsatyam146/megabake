@@ -26,11 +26,7 @@ GENERATIONS: tuple[Generation, ...] = (sm90.GENERATION, sm100.GENERATION)
 
 def generation(target: TargetFacts) -> Generation | None:
     return next(
-        (
-            candidate
-            for candidate in GENERATIONS
-            if target.architecture in candidate.architectures
-        ),
+        (candidate for candidate in GENERATIONS if target.architecture in candidate.architectures),
         None,
     )
 
@@ -42,12 +38,31 @@ def providers(target: TargetFacts) -> tuple[BodyProvider, ...]:
 
 def provider(name: str) -> BodyProvider:
     """The provider that emits bodies configured with ``BodyConfig.provider``."""
-    for candidate in GENERIC + tuple(
-        item for found in GENERATIONS for item in found.providers
-    ):
+    for candidate in GENERIC + tuple(item for found in GENERATIONS for item in found.providers):
         if candidate.provider_name == name:
             return candidate
     raise KeyError(f"no body provider named {name!r}")
+
+
+def table_gemm(name: str):
+    """SM100 table helpers; Hopper retains its existing GEMM path."""
+    return sm100.table if name == sm100.table.PROVIDER_NAME else None
+
+
+def is_table_gemm(name: str) -> bool:
+    """Recognize Hopper and SM100 table GEMMs."""
+    return name == sm90.G0RangeBodyProvider.provider_name or table_gemm(name) is not None
+
+
+def tuner_for_device():
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("tuning requires a CUDA device")
+    major, minor = torch.cuda.get_device_capability()
+    if (major, minor) != (10, 0):
+        raise RuntimeError(f"no tuning provider for sm{major}{minor}")
+    return sm100.tuning
 
 
 def launch_options(
@@ -61,9 +76,7 @@ def launch_options(
     return found.launch_options(graph, table_launch, device)
 
 
-def get_candidates(
-    region: Region, target: TargetFacts, policy: SelectionPolicy
-) -> CandidateSet:
+def get_candidates(region: Region, target: TargetFacts, policy: SelectionPolicy) -> CandidateSet:
     configurations: list[BodyConfig] = []
     rejections: list[ProviderRejection] = []
     for candidate in providers(target):

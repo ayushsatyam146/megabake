@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import heapq
+from bisect import bisect_left, bisect_right
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from bisect import bisect_left, bisect_right
-import heapq
 
 from .bodies.interface import BodyConfig, ParticipantContract, WorkItem
 from .graph import ComputeGraph
@@ -198,6 +198,7 @@ class EventSchedule:
                 return event
         raise InvalidSchedule(f"event schedule has no event {event_id}")
 
+
 @dataclass(frozen=True)
 class EventScheduleSimulation:
     task_order: tuple[str, ...]
@@ -237,12 +238,8 @@ def _derive_dependencies(selection: BodySelectionPlan) -> DependencyPlan:
     if selection.graph is None:
         raise InvalidSchedule("body selection is missing its source graph")
 
-    selected_by_region = {
-        selected.region_id: selected for selected in selection.selections
-    }
-    tile_maps = {
-        tile_map.region_id: tile_map for tile_map in make_tile_maps(selection)
-    }
+    selected_by_region = {selected.region_id: selected for selected in selection.selections}
+    tile_maps = {tile_map.region_id: tile_map for tile_map in make_tile_maps(selection)}
     dependencies: list[RegionDependency] = []
 
     for consumer in selection.selections:
@@ -301,9 +298,7 @@ def make_phase_schedule(
     if not isinstance(dependencies, DependencyPlan):
         raise InvalidSchedule("dependencies must come from derive_dependencies")
 
-    selected_by_region = {
-        selected.region_id: selected for selected in selection.selections
-    }
+    selected_by_region = {selected.region_id: selected for selected in selection.selections}
     for dependency in dependencies.dependencies:
         if dependency.producer_region_id not in selected_by_region:
             raise InvalidSchedule(
@@ -326,16 +321,11 @@ def make_phase_schedule(
     selection = replace(
         selection, selections=tuple(selected_by_region[region_id] for region_id in order)
     )
-    tile_maps = {
-        tile_map.region_id: tile_map for tile_map in make_tile_maps(selection)
-    }
+    tile_maps = {tile_map.region_id: tile_map for tile_map in make_tile_maps(selection)}
     default_worker_count = _worker_count(selection, tile_maps)
     worker_capacity = (
         selection.target.multiprocessor_count
-        * min(
-            selected.resources.maximum_active_blocks or 1
-            for selected in selection.selections
-        )
+        * min(selected.resources.maximum_active_blocks or 1 for selected in selection.selections)
         if selection.target is not None and selection.selections
         else None
     )
@@ -344,9 +334,7 @@ def make_phase_schedule(
     elif worker_count < 1:
         raise InvalidSchedule(f"worker count {worker_count} is not positive")
     elif worker_capacity is not None and worker_count > worker_capacity:
-        raise InvalidSchedule(
-            f"worker count {worker_count} exceeds capacity {worker_capacity}"
-        )
+        raise InvalidSchedule(f"worker count {worker_count} exceeds capacity {worker_capacity}")
     phases: list[ScheduledPhase] = []
 
     for phase_index, region_id in enumerate(order):
@@ -375,9 +363,7 @@ def make_phase_schedule(
                     if folded
                     else _worker_assignments(region_id, work_items, worker_count)
                 ),
-                dependencies=tuple(
-                    sorted(dependencies.prerequisites_for(region_id))
-                ),
+                dependencies=tuple(sorted(dependencies.prerequisites_for(region_id))),
                 conversion_bodies=tuple(
                     conversion
                     for conversion in selection.conversions
@@ -543,9 +529,7 @@ def simulate_phase_schedule(schedule: PhaseSchedule) -> ScheduleSimulation:
                 )
         else:
             assigned = Counter(
-                work_item
-                for worker in phase.workers
-                for work_item in worker.work_items
+                work_item for worker in phase.workers for work_item in worker.work_items
             )
             if assigned != Counter(phase.work_items):
                 raise InvalidSchedule(f"phase {phase.index} has invalid work assignments")
@@ -558,17 +542,13 @@ def simulate_phase_schedule(schedule: PhaseSchedule) -> ScheduleSimulation:
                 raise InvalidSchedule("the final phase has an unnecessary barrier")
             if phase.barrier.kind != "grid":
                 raise InvalidSchedule(f"phase {phase.index} has an invalid barrier")
-            if phase.barrier.participating_workers != tuple(
-                range(schedule.worker_count)
-            ):
+            if phase.barrier.participating_workers != tuple(range(schedule.worker_count)):
                 raise InvalidSchedule(f"phase {phase.index} has an incomplete barrier")
             barrier_order.append(phase.barrier.id)
 
         phase_order.append(phase.region_id)
         work_counts[phase.region_id] = len(phase.work_items)
-        idle_counts[phase.region_id] = sum(
-            not worker.work_items for worker in phase.workers
-        )
+        idle_counts[phase.region_id] = sum(not worker.work_items for worker in phase.workers)
         interval.add(phase.region_id)
         if phase.recompute:
             recomputed.add(phase.region_id)
@@ -593,13 +573,8 @@ def make_event_schedule(
 ) -> EventSchedule:
     if not selection.report.complete:
         raise InvalidSchedule("cannot schedule a plan with unsupported regions")
-    phase_schedule = make_phase_schedule(
-        selection, dependencies, worker_count=worker_count
-    )
-    tile_maps = {
-        tile_map.region_id: tile_map
-        for tile_map in make_tile_maps(selection)
-    }
+    phase_schedule = make_phase_schedule(selection, dependencies, worker_count=worker_count)
+    tile_maps = {tile_map.region_id: tile_map for tile_map in make_tile_maps(selection)}
     selected_worker_count = phase_schedule.worker_count
     region_order = phase_schedule.region_ids
     task_records: list[ScheduledTask] = []
@@ -625,9 +600,7 @@ def make_event_schedule(
     grouped: dict[tuple[str, ...], dict[str, list[RegionDependency]]] = {}
     for prerequisite in prerequisites:
         by_consumer = grouped.setdefault(prerequisite.producer_task_ids, {})
-        by_consumer.setdefault(prerequisite.consumer_task_id, []).extend(
-            prerequisite.dependencies
-        )
+        by_consumer.setdefault(prerequisite.consumer_task_id, []).extend(prerequisite.dependencies)
 
     events: list[EventScheduleEvent] = []
     wait_events: dict[str, list[int]] = {}
@@ -638,11 +611,7 @@ def make_event_schedule(
             TilePrerequisite(
                 consumer_task_id,
                 producer_task_ids,
-                tuple(
-                    dict.fromkeys(
-                        by_consumer[consumer_task_id]
-                    )
-                ),
+                tuple(dict.fromkeys(by_consumer[consumer_task_id])),
             )
             for consumer_task_id in consumer_task_ids
         )
@@ -694,17 +663,13 @@ def make_region_event_schedule(
     *,
     worker_count: int | None = None,
 ) -> EventSchedule:
-    phase_schedule = make_phase_schedule(
-        selection, dependencies, worker_count=worker_count
-    )
+    phase_schedule = make_phase_schedule(selection, dependencies, worker_count=worker_count)
     tasks = tuple(
         ScheduledTask(
             id=f"{phase.region_id}:{worker_id}",
             order=phase.index * phase_schedule.worker_count + worker_id,
             region_id=phase.region_id,
-            work_item=(
-                phase.workers[worker_id].work_items or phase.work_items[:1]
-            )[0],
+            work_item=(phase.workers[worker_id].work_items or phase.work_items[:1])[0],
             worker_id=worker_id,
             wait_event_ids=(),
             release_event_ids=(),
@@ -744,9 +709,7 @@ def make_region_event_schedule(
     events: list[EventScheduleEvent] = []
     wait_events: dict[str, list[int]] = {}
     release_events: dict[str, list[int]] = {}
-    for event_id, (producer_task_ids, consumer_task_ids) in enumerate(
-        grouped.items()
-    ):
+    for event_id, (producer_task_ids, consumer_task_ids) in enumerate(grouped.items()):
         event = EventScheduleEvent(
             event_id,
             producer_task_ids,
@@ -807,8 +770,7 @@ def simulate_event_schedule(
 
     task_by_id = {task.id: task for task in schedule.tasks}
     duration_by_id = {
-        task_id: (len(task_by_id[task_id].work_items) or 1)
-        + delays.get(task_id, 0)
+        task_id: (len(task_by_id[task_id].work_items) or 1) + delays.get(task_id, 0)
         for task_id in task_by_id
     }
     worker_cursors = [0] * schedule.worker_count
@@ -923,9 +885,7 @@ def _tile_prerequisites(
     accesses_by_region: dict[str, dict[tuple[int, ...], object]] = {}
     for task in tasks:
         tasks_by_region.setdefault(task.region_id, {})[task.work_item.output_tile] = task
-        accesses_by_region.setdefault(task.region_id, {})[
-            task.work_item.output_tile
-        ] = next(
+        accesses_by_region.setdefault(task.region_id, {})[task.work_item.output_tile] = next(
             access
             for access in tile_maps[task.region_id].accesses
             if access.output.origin == task.work_item.output_tile
@@ -969,8 +929,7 @@ def _tile_prerequisites(
                 analysis_conservative = analysis_conservative or not exact
                 if exact and not exact_ids:
                     raise InvalidSchedule(
-                        f"{consumer_task_id} reads no producer tile for "
-                        f"{dependency.value_id}"
+                        f"{consumer_task_id} reads no producer tile for {dependency.value_id}"
                     )
                 if exact:
                     producer_ids_for_consumer = tuple(sorted(exact_ids))
@@ -980,11 +939,7 @@ def _tile_prerequisites(
                 ((), False),
             )
             grouped[key] = (
-                tuple(
-                    dependency
-                    for existing in dependencies_record
-                    if existing != dependency
-                )
+                tuple(dependency for existing in dependencies_record if existing != dependency)
                 + (dependency,),
                 conservative_record or analysis_conservative,
             )
@@ -1009,24 +964,16 @@ def _verify_event_schedule(schedule: EventSchedule) -> None:
         raise InvalidSchedule("event tasks do not use a common topological order")
     for worker in schedule.workers:
         worker_tasks = [schedule.task_for(task_id) for task_id in worker.task_ids]
-        if [task.order for task in worker_tasks] != sorted(
-            task.order for task in worker_tasks
-        ):
+        if [task.order for task in worker_tasks] != sorted(task.order for task in worker_tasks):
             raise InvalidSchedule(f"worker {worker.worker_id} task order is not topological")
     for event in schedule.events:
         if not event.producer_task_ids or not event.consumer_task_ids:
             raise InvalidSchedule(f"event {event.id} has no producers or consumers")
         if event.trigger_count != len(set(event.producer_task_ids)):
             raise InvalidSchedule(f"event {event.id} trigger count is not unique")
-        if any(
-            producer_task_id not in task_ids
-            for producer_task_id in event.producer_task_ids
-        ):
+        if any(producer_task_id not in task_ids for producer_task_id in event.producer_task_ids):
             raise InvalidSchedule(f"event {event.id} names an unknown producer")
-        if any(
-            consumer_task_id not in task_ids
-            for consumer_task_id in event.consumer_task_ids
-        ):
+        if any(consumer_task_id not in task_ids for consumer_task_id in event.consumer_task_ids):
             raise InvalidSchedule(f"event {event.id} names an unknown consumer")
 
     expected_waits: dict[str, set[int]] = {task.id: set() for task in schedule.tasks}
@@ -1051,20 +998,17 @@ def _verify_event_schedule(schedule: EventSchedule) -> None:
 
     expected_groups: dict[tuple[str, ...], set[str]] = {}
     for prerequisite in schedule.prerequisites:
-        expected_groups.setdefault(
-            prerequisite.producer_task_ids, set()
-        ).add(prerequisite.consumer_task_id)
+        expected_groups.setdefault(prerequisite.producer_task_ids, set()).add(
+            prerequisite.consumer_task_id
+        )
     actual_groups = {
-        event.producer_task_ids: set(event.consumer_task_ids)
-        for event in schedule.events
+        event.producer_task_ids: set(event.consumer_task_ids) for event in schedule.events
     }
     if actual_groups != expected_groups:
         raise InvalidSchedule("compressed events do not match concrete prerequisites")
 
 
-def _phase_finish_time(
-    schedule: EventSchedule, duration_by_id: Mapping[str, int]
-) -> int:
+def _phase_finish_time(schedule: EventSchedule, duration_by_id: Mapping[str, int]) -> int:
     finish_time = 0
     for phase in schedule.phase_schedule.phases:
         phase_duration = max(
@@ -1072,8 +1016,7 @@ def _phase_finish_time(
                 sum(
                     duration_by_id[task.id]
                     for task in schedule.tasks
-                    if task.region_id == phase.region_id
-                    and task.worker_id == worker.worker_id
+                    if task.region_id == phase.region_id and task.worker_id == worker.worker_id
                 )
                 for worker in phase.workers
             ),
@@ -1090,18 +1033,14 @@ def _tile_dependency(
     producer_map: TileMap,
     consumer_map: TileMap,
 ) -> RegionDependency:
-    producer_output_tiles = tuple(
-        access.output for access in producer_map.accesses
-    )
+    producer_output_tiles = tuple(access.output for access in producer_map.accesses)
     consumer_accesses = tuple(
         access
         for access in consumer_map.accesses
         if any(input_tile.value_id == value_id for input_tile in access.inputs)
     )
     if not consumer_accesses:
-        raise InvalidSchedule(
-            f"{consumer_region_id} has no mapped access to {value_id}"
-        )
+        raise InvalidSchedule(f"{consumer_region_id} has no mapped access to {value_id}")
     if all(not tile.origin for tile in producer_output_tiles):
         return RegionDependency(
             producer_region_id,
@@ -1138,9 +1077,7 @@ def _tile_dependency(
     all_origins = {tile.origin for tile in producer_output_tiles}
     for access in consumer_accesses:
         input_tile = next(
-            input_tile
-            for input_tile in access.inputs
-            if input_tile.value_id == value_id
+            input_tile for input_tile in access.inputs if input_tile.value_id == value_id
         )
         if (
             len(input_tile.origin) == rank
@@ -1176,9 +1113,7 @@ def _tile_dependency(
                 consumer_tiles.add(access.output.origin)
                 matched = True
         if exact and not matched:
-            raise InvalidSchedule(
-                f"{consumer_region_id} reads no producer tile for {value_id}"
-            )
+            raise InvalidSchedule(f"{consumer_region_id} reads no producer tile for {value_id}")
 
     if not exact:
         return RegionDependency(
@@ -1196,14 +1131,12 @@ def _tile_dependency(
         consumer_region_id,
         value_id,
         DependencyKind.PRODUCER_TO_CONSUMER,
-            tuple(sorted(producer_origins)),
+        tuple(sorted(producer_origins)),
         tuple(sorted(consumer_tiles)),
     )
 
 
-def _logical_tiles_overlap(
-    producer_tile: object, consumer_tile: object
-) -> tuple[bool, bool]:
+def _logical_tiles_overlap(producer_tile: object, consumer_tile: object) -> tuple[bool, bool]:
     if (
         len(producer_tile.origin) != len(consumer_tile.origin)
         or producer_tile.layout.shape != consumer_tile.layout.shape
@@ -1218,9 +1151,7 @@ def _logical_tiles_overlap(
     ):
         producer_end = producer_origin + producer_extent
         consumer_end = consumer_origin + consumer_extent
-        if max(producer_origin, consumer_origin) >= min(
-            producer_end, consumer_end
-        ):
+        if max(producer_origin, consumer_origin) >= min(producer_end, consumer_end):
             return False, True
     return True, True
 
@@ -1263,12 +1194,8 @@ def _storage_order_dependencies(
                 reads[selected.region_id] = reads[selected.region_id] | operand_storage
                 writes[selected.region_id] = writes[selected.region_id] | operand_storage
         if unknown_effects:
-            reads[selected.region_id] = reads[selected.region_id] | {
-                "unknown:global-storage"
-            }
-            writes[selected.region_id] = writes[selected.region_id] | {
-                "unknown:global-storage"
-            }
+            reads[selected.region_id] = reads[selected.region_id] | {"unknown:global-storage"}
+            writes[selected.region_id] = writes[selected.region_id] | {"unknown:global-storage"}
 
     dependencies: list[RegionDependency] = []
     selections = selection.selections
@@ -1315,10 +1242,7 @@ def _state_access_dependencies(
             shared = {
                 access.storage_identity
                 for access in earlier_states
-                if any(
-                    access.storage_identity == other.storage_identity
-                    for other in later_states
-                )
+                if any(access.storage_identity == other.storage_identity for other in later_states)
             }
             if not shared:
                 continue
@@ -1378,9 +1302,7 @@ def _dependency_plan(
     dependencies: tuple[RegionDependency, ...],
     selected_by_region: Mapping[str, SelectedBody],
 ) -> DependencyPlan:
-    prerequisites = {
-        region_id: set() for region_id in selected_by_region
-    }
+    prerequisites = {region_id: set() for region_id in selected_by_region}
     for dependency in dependencies:
         if dependency.producer_region_id == dependency.consumer_region_id:
             raise InvalidSchedule(f"region {dependency.producer_region_id} depends on itself")
@@ -1433,9 +1355,7 @@ def _level_order(
 def _topological_order(
     selections: tuple[SelectedBody, ...], dependencies: DependencyPlan
 ) -> tuple[str, ...]:
-    positions = {
-        selected.region_id: position for position, selected in enumerate(selections)
-    }
+    positions = {selected.region_id: position for position, selected in enumerate(selections)}
     consumers = {region_id: [] for region_id in positions}
     indegree = {region_id: 0 for region_id in positions}
     for dependency in dependencies.dependencies:
@@ -1462,19 +1382,14 @@ def _topological_order(
     return tuple(order)
 
 
-def _worker_count(
-    selection: BodySelectionPlan, tile_maps: Mapping[str, TileMap]
-) -> int:
-    maximum_work = max(
-        (len(tile_map.accesses) for tile_map in tile_maps.values()), default=0
-    )
+def _worker_count(selection: BodySelectionPlan, tile_maps: Mapping[str, TileMap]) -> int:
+    maximum_work = max((len(tile_map.accesses) for tile_map in tile_maps.values()), default=0)
     if maximum_work == 0:
         return 1
     if selection.target is None:
         return maximum_work
     active_blocks = min(
-        selected.resources.maximum_active_blocks or 1
-        for selected in selection.selections
+        selected.resources.maximum_active_blocks or 1 for selected in selection.selections
     )
     return min(maximum_work, selection.target.multiprocessor_count * active_blocks)
 
@@ -1575,10 +1490,11 @@ def _fold_small_intervals(
     for interval in intervals:
         costs = [rounds(region_id) for region_id in interval]
         if all(cost is not None for cost in costs):
+
             def fits() -> bool:
-                phases = sum(len(group) for group in pending) + len(interval)
+                phases = sum(len(group) for group in pending) + len(interval)  # noqa: B023  # Called immediately; intentionally reads current pending state after flush().
                 return (
-                    pending_rounds + sum(costs) <= _FOLD_MAX_ROUNDS
+                    pending_rounds + sum(costs) <= _FOLD_MAX_ROUNDS  # noqa: B023  # Called immediately; intentionally reads current pending state after flush().
                     and phases <= _FOLD_MAX_PHASES
                 )
 

@@ -1,15 +1,13 @@
-"""Show how MegaBake's CUTLASS GEMM fork differs from its pinned upstream file.
+"""Show how MegaBake's CUTLASS GEMM bodies differ from pinned upstream files.
 
-``src/megabake/bodies/cuda/sm90/cutlass_gemm.py`` is the kernel MegaBake runs and edits
-directly. ``src/megabake/bodies/cuda/sm90/cutlass_upstream/`` keeps the upstream file
-unmodified, with its revision and SHA-256 in ``UPSTREAM``.
+Upstream snapshots are stored beside the architecture-specific bodies.
 
     .venv/bin/python tools/vendor_cutlass.py          # diff upstream -> fork
     .venv/bin/python tools/vendor_cutlass.py --stat   # changed line counts only
     .venv/bin/python tools/vendor_cutlass.py --check  # verify the upstream copy's hash
 
-Upgrading CUTLASS: replace the upstream file and ``UPSTREAM``, then merge the
-upstream changes into the fork by hand, using this diff as the guide.
+Upgrading CUTLASS: replace the snapshot and its recorded hash, preserving any
+documented prefix, then merge upstream changes into the fork by hand.
 """
 
 from __future__ import annotations
@@ -21,14 +19,25 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-BODIES = ROOT / "src" / "megabake" / "bodies" / "cuda" / "sm90"
-UPSTREAM = BODIES / "cutlass_upstream"
-# Upstream file -> MegaBake's fork of it.
-FORKS = {"dense_gemm_persistent.py": BODIES / "cutlass_gemm.py"}
+BODIES = ROOT / "src" / "megabake" / "bodies" / "cuda"
+UPSTREAM = BODIES / "sm90" / "cutlass_upstream"
+FORKS = {"dense_gemm_persistent.py": BODIES / "sm90" / "cutlass_gemm.py"}
+SM100_UPSTREAM = BODIES / "sm100" / "cutlass_upstream"
+SM100_FORKS = {
+    "fp16_gemm_0.py": (
+        BODIES / "sm100" / "tcgen_gemm.py",
+        "a15471df9a2a9c80a6a772416210ea256a58b142aa4b6358ca01851f6f02362a",
+    ),
+    "dense_gemm_persistent.py": (
+        BODIES / "sm100" / "cutlass_gemm.py",
+        "4f3d5fa8c6032c2190933cb43c71d358bb200225fe7c0ec0b54014a9a6235362",
+    ),
+}
+SM100_HEADER = b"# ruff: noqa\n# fmt: off\n"
 
 
 def check_upstream() -> None:
-    """Fail unless every upstream copy has the SHA-256 recorded in UPSTREAM."""
+    """Fail unless every upstream copy has its recorded prefix and hash."""
     for line in (UPSTREAM / "UPSTREAM").read_text().splitlines():
         key, _, value = line.partition(":")
         if key.strip() != "sha256":
@@ -37,6 +46,14 @@ def check_upstream() -> None:
         actual = hashlib.sha256((UPSTREAM / name).read_bytes()).hexdigest()
         if actual != expected:
             raise SystemExit(f"cutlass_upstream/{name} was modified ({actual} != {expected})")
+    for name, (_, expected) in SM100_FORKS.items():
+        original = SM100_UPSTREAM / name
+        source = original.read_bytes()
+        if not source.startswith(SM100_HEADER):
+            raise SystemExit(f"upstream {original} lint header was modified")
+        actual = hashlib.sha256(source[len(SM100_HEADER) :]).hexdigest()
+        if actual != expected:
+            raise SystemExit(f"upstream {original} was modified ({actual} != {expected})")
 
 
 def main() -> int:
@@ -47,12 +64,19 @@ def main() -> int:
     check_upstream()
     if args.check:
         return 0
-    for name, fork in FORKS.items():
+    forks = [(UPSTREAM / name, fork) for name, fork in FORKS.items()]
+    forks.extend((SM100_UPSTREAM / name, fork) for name, (fork, _) in SM100_FORKS.items())
+    for original, fork in forks:
         subprocess.run(
             [
-                "git", "diff", "--no-index", *(["--stat"] if args.stat else []),
-                str((UPSTREAM / name).relative_to(ROOT)), str(fork.relative_to(ROOT)),
+                "git",
+                "diff",
+                "--no-index",
+                *(["--stat"] if args.stat else []),
+                str(original.relative_to(ROOT)),
+                str(fork.relative_to(ROOT)),
             ],
+            check=False,
             cwd=ROOT,
         )
     return 0

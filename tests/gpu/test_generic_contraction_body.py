@@ -3,11 +3,11 @@ from __future__ import annotations
 import importlib.util
 import sys
 
+import cuda.bindings.driver as cuda
 import pytest
 import torch
+from cutlass import cute
 from cutlass.cute.runtime import from_dlpack
-import cuda.bindings.driver as cuda
-import cutlass.cute as cute
 
 from megabake.bodies import emit_contraction_body
 from megabake.bodies.catalog import get_candidates
@@ -15,7 +15,6 @@ from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
-
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="contraction-body launcher requires CUDA"
@@ -43,14 +42,11 @@ def _target_and_policy():
 def _program(model, *inputs):
     exported = torch.export.export(model, inputs)
     prepared = prepare_fx_graph(exported.graph_module, inputs)
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     region = next(
         region
         for region in graph.regions
-        if region.tensor_programs
-        and region.tensor_programs[0].family == "contraction"
+        if region.tensor_programs and region.tensor_programs[0].family == "contraction"
     )
     target, policy = _target_and_policy()
     config = get_candidates(region, target, policy).configurations[0]
@@ -73,7 +69,7 @@ def _load_body(program, config, name, tmp_path):
 
 
 def _load_launcher(body_name, tensor_count, tmp_path):
-    source = f'''from {body_name} import run
+    source = f"""from {body_name} import run
 import cutlass.cute as cute
 import cuda.bindings.driver as cuda
 
@@ -94,7 +90,7 @@ def launch(
         block=[128, 1, 1],
         stream=stream,
     )
-'''
+"""
     module_name = f"megabake_{body_name}_launcher"
     path = tmp_path / f"{module_name}.py"
     path.write_text(source, encoding="utf-8")
@@ -113,10 +109,8 @@ def _view(tensor):
 
 
 def _run_body(name, program, config, sources, output, tmp_path):
-    body_module, body = _load_body(program, config, name, tmp_path)
-    launcher = _load_launcher(
-        f"megabake_{name}_body", len(program.loads) + 1, tmp_path
-    )
+    _body_module, body = _load_body(program, config, name, tmp_path)
+    launcher = _load_launcher(f"megabake_{name}_body", len(program.loads) + 1, tmp_path)
     threads = body.threads_per_cta
     tile_count = (output.numel() + threads - 1) // threads
     work = torch.arange(tile_count, device="cuda", dtype=torch.int64) * threads
@@ -149,12 +143,8 @@ def test_contraction_body_launcher_handles_gemm_strides_tails_and_bias(tmp_path)
     gpu_source = source.cuda()
     gpu_weight = weight.cuda()
     gpu_bias = bias.cuda()
-    gemm_output = torch.full(
-        (rows, columns), float("nan"), device="cuda", dtype=torch.bfloat16
-    )
-    biased_output = torch.full(
-        (rows, columns), float("nan"), device="cuda", dtype=torch.bfloat16
-    )
+    gemm_output = torch.full((rows, columns), float("nan"), device="cuda", dtype=torch.bfloat16)
+    biased_output = torch.full((rows, columns), float("nan"), device="cuda", dtype=torch.bfloat16)
     _run_body(
         "gemm",
         gemm_program,

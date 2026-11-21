@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import replace
 from types import SimpleNamespace
 
-import torch
 import pytest
+import torch
 
 import megabake.planner as planner_module
 from megabake import make_tile_maps, select_bodies
@@ -42,9 +42,7 @@ def _target() -> TargetFacts:
 def _graph(model, *inputs):
     exported = torch.export.export(model, inputs)
     prepared = prepare_fx_graph(exported.graph_module, inputs)
-    return form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    return form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
 
 
 def test_select_bodies_prefers_measured_gemm_and_maps_complete_reduction_domain():
@@ -56,9 +54,7 @@ def test_select_bodies_prefers_measured_gemm_and_maps_complete_reduction_domain(
     weight = torch.randn(128, 128, dtype=torch.bfloat16)
     selection = select_bodies(_graph(Model(), source, weight), _target())
     selected = next(
-        selected
-        for selected in selection.selections
-        if selected.program.family == "contraction"
+        selected for selected in selection.selections if selected.program.family == "contraction"
     )
 
     assert selected.body.provider == "g0_range"
@@ -71,9 +67,7 @@ def test_select_bodies_prefers_measured_gemm_and_maps_complete_reduction_domain(
     assert len(tile_map.accesses) == 2
     assert tile_map.work_items[0].reduction_range == (0, 128)
 
-    access = next(
-        access for access in tile_map.accesses if access.output.origin == (64, 0)
-    )
+    access = next(access for access in tile_map.accesses if access.output.origin == (64, 0))
     left, right = access.inputs
     assert left.shape == (64, 128)
     assert right.shape == (128, 128)
@@ -95,9 +89,7 @@ def test_select_bodies_uses_legal_vector_chain_and_preserves_fallback():
     value = torch.randn(2, 3)
     selection = select_bodies(_graph(Model(), value), _target())
 
-    assert [selected.region_id for selected in selection.selections] == [
-        "region:mul:fused"
-    ]
+    assert [selected.region_id for selected in selection.selections] == ["region:mul:fused"]
     selected = selection.selections[0]
     assert selected.source_op_ids == ("op:relu", "op:add", "op:mul")
     assert selected.inputs == ("value:arg0_1",)
@@ -307,9 +299,7 @@ def test_make_tile_maps_clips_partial_output_tiles():
     weight = torch.randn(128, 128, dtype=torch.bfloat16)
     selection = select_bodies(_graph(Model(), source, weight), _target())
     tile_map = make_tile_maps(selection)[0]
-    partial = next(
-        access for access in tile_map.accesses if access.output.origin[0] == 64
-    )
+    partial = next(access for access in tile_map.accesses if access.output.origin[0] == 64)
     left = partial.inputs[0]
 
     assert partial.output.shape == (1, 128)
@@ -380,11 +370,7 @@ def test_make_tile_maps_inserts_layout_conversion_with_cost_and_dependency(
         value_id = program.loads[0].value_id
         layouts = replace(
             config.layouts,
-            inputs={
-                value_id: replace(
-                    config.layouts.inputs[value_id], strides=(1, 3)
-                )
-            },
+            inputs={value_id: replace(config.layouts.inputs[value_id], strides=(1, 3))},
         )
         return replace(result, configurations=(replace(config, layouts=layouts),))
 
@@ -396,9 +382,7 @@ def test_make_tile_maps_inserts_layout_conversion_with_cost_and_dependency(
         if selected.program.family in {"elementwise", "copy"}
     )
     reduction = next(
-        selected
-        for selected in selection.selections
-        if selected.program.family == "reduction"
+        selected for selected in selection.selections if selected.program.family == "reduction"
     )
 
     assert len(selection.conversions) == 1
@@ -454,9 +438,7 @@ def test_mode_policy_selects_attention_body_from_actual_query_work():
         grouped_value = value.permute(0, 2, 1, 3).repeat_interleave(
             source.shape[2] // value.shape[2], dim=1
         )
-        scores = (
-            query @ grouped_key.transpose(-2, -1)
-        ) * source.shape[-1] ** -0.5 + mask
+        scores = (query @ grouped_key.transpose(-2, -1)) * source.shape[-1] ** -0.5 + mask
         probabilities = torch.softmax(scores.float(), dim=-1).to(source.dtype)
         return probabilities @ grouped_value
 
@@ -469,11 +451,15 @@ def test_mode_policy_selects_attention_body_from_actual_query_work():
         key = torch.randn(2, 7, 2, 8, dtype=torch.bfloat16)
         value = torch.randn(2, 7, 2, 8, dtype=torch.bfloat16)
         mask = torch.randn(2, 1, query_length, 7, dtype=torch.bfloat16)
-        return select_bodies(
-            _graph(Model(), source, key, value, mask),
-            _target(),
-            SelectionPolicy(mode=mode),
-        ).selections[0].body.name
+        return (
+            select_bodies(
+                _graph(Model(), source, key, value, mask),
+                _target(),
+                SelectionPolicy(mode=mode),
+            )
+            .selections[0]
+            .body.name
+        )
 
     assert selected_body("prefill", 5) == "attention_prefill_rows"
     assert selected_body("decode", 1) == "attention_decode_rows"
@@ -529,11 +515,12 @@ def test_mode_policy_rejects_prefill_for_stateful_cache():
         boundary_output=None,
         cache=CacheEffects("stateful"),
     )
-    graph = replace(graph, regions=(replace(graph.regions[0], semantics=stateful), *graph.regions[1:]))
+    graph = replace(
+        graph, regions=(replace(graph.regions[0], semantics=stateful), *graph.regions[1:])
+    )
 
     with pytest.raises(ValueError, match="prefill mode cannot compile"):
         select_bodies(graph, _target(), SelectionPolicy(mode="prefill"))
-
 
 
 def _region_check_fixture():

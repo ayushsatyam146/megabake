@@ -78,8 +78,7 @@ def _rms_norm_candidate(mean: Op, graph: ComputeGraph) -> RegionCandidate | None
         return None
 
     output_domains = tuple(
-        IterationDomain(f"o{index}", size)
-        for index, size in enumerate(tail_value.shape)
+        IterationDomain(f"o{index}", size) for index, size in enumerate(tail_value.shape)
     )
     reduction_domain = IterationDomain("r0", x_value.shape[-1])
     output_axes = tuple(domain.axis for domain in output_domains)
@@ -98,16 +97,12 @@ def _rms_norm_candidate(mean: Op, graph: ComputeGraph) -> RegionCandidate | None
         leaf_loads.append(load)
         return Load(load.id, load.dtype)
 
-    x_reduction_load = leaf_load(
-        x_id, (*output_axes[:-1], reduction_domain.axis)
-    )
+    x_reduction_load = leaf_load(x_id, (*output_axes[:-1], reduction_domain.axis))
     x_post_load = leaf_load(x_id, output_axes)
     weight_reduction_load = (
         leaf_load(weight_id, (reduction_domain.axis,)) if weight_id is not None else None
     )
-    weight_post_load = (
-        leaf_load(weight_id, output_axes[-1:]) if weight_id is not None else None
-    )
+    weight_post_load = leaf_load(weight_id, output_axes[-1:]) if weight_id is not None else None
     residual_id = None
     if (
         tail.tensor_program is not None
@@ -117,11 +112,7 @@ def _rms_norm_candidate(mean: Op, graph: ComputeGraph) -> RegionCandidate | None
         for operand_id in tail.operands:
             if operand_id != operations[-2].results[0]:
                 residual_id = operand_id
-    residual_load = (
-        leaf_load(residual_id, output_axes)
-        if residual_id is not None
-        else None
-    )
+    residual_load = leaf_load(residual_id, output_axes) if residual_id is not None else None
 
     expressions: dict[str, ScalarExpression] = {}
     post_expressions: dict[str, ScalarExpression] = {}
@@ -156,17 +147,13 @@ def _rms_norm_candidate(mean: Op, graph: ComputeGraph) -> RegionCandidate | None
                 if load.value_id in x_expression_ids:
                     expression = x_post_load if after_mean else x_reduction_load
                 elif weight_reduction_load is not None and load.value_id == weight_id:
-                    expression = (
-                        weight_post_load if after_mean else weight_reduction_load
-                    )
+                    expression = weight_post_load if after_mean else weight_reduction_load
                 elif residual_load is not None and load.value_id == residual_id:
                     expression = residual_load
                 else:
                     return None
             replacements[load.id] = expression
-        target_expressions[operation.results[0]] = substitute_loads(
-            program.combine, replacements
-        )
+        target_expressions[operation.results[0]] = substitute_loads(program.combine, replacements)
 
     program = TensorProgram(
         family="reduction",
@@ -210,10 +197,7 @@ def _rms_norm_candidate(mean: Op, graph: ComputeGraph) -> RegionCandidate | None
         live_outputs=live_outputs_of(tuple(operations), graph),
         tensor_program=program,
         semantics=RMSNorm(x_value.shape[-1], epsilon, weight_id, residual_id),
-        cost_bytes=sum(
-            value_bytes(operation.results[0], graph)
-            for operation in operations[:-1]
-        ),
+        cost_bytes=sum(value_bytes(operation.results[0], graph) for operation in operations[:-1]),
         rejections=tuple(rejections),
     )
 
@@ -227,9 +211,7 @@ def _rms_norm_chain(
     if len(mean_program.reduction_axes) != 1:
         return None
     pow_operation = producer_of(mean.operands[0], graph)
-    if pow_operation is None or not matches_target(
-        pow_operation, "aten.pow.Tensor_Scalar"
-    ):
+    if pow_operation is None or not matches_target(pow_operation, "aten.pow.Tensor_Scalar"):
         return None
     cast_operation = producer_of(pow_operation.operands[0], graph)
     if cast_operation is not None and matches_target(
@@ -242,8 +224,7 @@ def _rms_norm_chain(
 
     add = sole_user(mean, graph)
     if add is None or not (
-        matches_target(add, "aten.add.Scalar")
-        or matches_target(add, "aten.add.Tensor")
+        matches_target(add, "aten.add.Scalar") or matches_target(add, "aten.add.Tensor")
     ):
         return None
     rsqrt = sole_user(add, graph)
@@ -261,8 +242,7 @@ def _rms_norm_chain(
         if (
             user is not None
             and matches_target(user, "prims.convert_element_type.default")
-            and graph.values[user.operands[0]].dtype
-            != graph.values[user.results[0]].dtype
+            and graph.values[user.operands[0]].dtype != graph.values[user.results[0]].dtype
         ):
             return user
         return None
@@ -311,9 +291,7 @@ def _rms_norm_chain(
         residual = None
     else:
         residual_id = next(
-            operand_id
-            for operand_id in residual.operands
-            if operand_id != tail.results[0]
+            operand_id for operand_id in residual.operands if operand_id != tail.results[0]
         )
         if (
             residual_id not in graph.inputs
@@ -352,4 +330,3 @@ def _rms_norm_chain(
     ):
         return None
     return tuple(operations), x_id, weight_id, add_program.combine.rhs.value
-

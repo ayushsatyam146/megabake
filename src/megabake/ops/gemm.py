@@ -129,8 +129,7 @@ def _gemm_epilogue_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate |
     ):
         return None
     if not all(
-        same_chain_layout(operation.results[0], tail.results[0], graph)
-        for operation in chain
+        same_chain_layout(operation.results[0], tail.results[0], graph) for operation in chain
     ):
         return None
     composed = compose_scalar_chain(chain, graph)
@@ -142,9 +141,7 @@ def _gemm_epilogue_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate |
         for load in composed.loads
         if (found := _viewed_contraction(load.value_id, graph)) is not None
     }
-    contraction_ids = list(
-        dict.fromkeys(contraction.id for contraction, _ in leaves.values())
-    )
+    contraction_ids = list(dict.fromkeys(contraction.id for contraction, _ in leaves.values()))
     if not 1 <= len(contraction_ids) <= 2:
         return None
     order = list(graph.ops)
@@ -161,10 +158,7 @@ def _gemm_epilogue_candidate(tail: Op, graph: ComputeGraph) -> RegionCandidate |
         return None
     for contraction in contractions:
         views = [
-            view
-            for found, path in leaves.values()
-            if found.id == contraction.id
-            for view in path
+            view for found, path in leaves.values() if found.id == contraction.id for view in path
         ]
         allowed = chain_ids | {view.id for view in views}
         path_values = (contraction.results[0], *(view.results[0] for view in views))
@@ -286,9 +280,7 @@ def _epilogue_chain(tail: Op, graph: ComputeGraph) -> tuple[Op, ...]:
     )
 
 
-def _viewed_contraction(
-    value_id: str, graph: ComputeGraph
-) -> tuple[Op, tuple[Op, ...]] | None:
+def _viewed_contraction(value_id: str, graph: ComputeGraph) -> tuple[Op, tuple[Op, ...]] | None:
     """The contraction whose result ``value_id`` is, through aliasing views,
     and those views."""
     views: list[Op] = []
@@ -324,8 +316,7 @@ def _pairs_with(first: TensorProgram, second: TensorProgram, graph: ComputeGraph
         and (first_left.axes, first_left.strides, first_left.dtype, first_left.source_shape)
         == (second_left.axes, second_left.strides, second_left.dtype, second_left.source_shape)
         and left_values[0].storage_relation.storage_id is not None
-        and left_values[0].storage_relation.storage_id
-        == left_values[1].storage_relation.storage_id
+        and left_values[0].storage_relation.storage_id == left_values[1].storage_relation.storage_id
         and left_values[0].storage_offset == left_values[1].storage_offset
         and first.combine == second.combine
         and first.post == second.post
@@ -381,9 +372,7 @@ def _contiguous_strides(shape: tuple[int, ...]) -> tuple[int, ...]:
     return tuple(reversed(strides))
 
 
-def _significant_strides(
-    strides: tuple[int, ...], shape: tuple[int, ...]
-) -> tuple[int, ...]:
+def _significant_strides(strides: tuple[int, ...], shape: tuple[int, ...]) -> tuple[int, ...]:
     # A size-1 axis never moves, so its stride does not matter.
     return tuple(stride for stride, size in zip(strides, shape, strict=True) if size != 1)
 
@@ -446,4 +435,3 @@ def _gemm_load_axes(
         else:
             return None
     return tuple(result)
-

@@ -7,7 +7,6 @@ from torch.autograd import DeviceType
 from megabake import make_backend
 from tests.fixtures import CompleteMLP
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),
     reason="task 16 requires an SM90 CUDA device",
@@ -27,9 +26,7 @@ def test_task16_compiles_complete_mlp_and_rebinds_weights(tmp_path, batch_size):
     model = CompleteMLP().eval()
     backend = make_backend(dump_dir=tmp_path)
     optimized = torch.compile(model, backend=backend, fullgraph=True, dynamic=False)
-    source = torch.randn(
-        batch_size, 576, dtype=torch.bfloat16, device="cuda"
-    ) / (576**0.5)
+    source = torch.randn(batch_size, 576, dtype=torch.bfloat16, device="cuda") / (576**0.5)
 
     with torch.no_grad():
         first = optimized(source)
@@ -58,10 +55,13 @@ def test_task16_compiles_complete_mlp_and_rebinds_weights(tmp_path, batch_size):
         "l_self_parameters_up_weight_",
         "l_self_parameters_down_weight_",
     }
-    assert sum(
-        selection.body.provider == "g0_range"
-        for selection in compiled.plan.selection.selections
-    ) == 3
+    assert (
+        sum(
+            selection.body.provider == "g0_range"
+            for selection in compiled.plan.selection.selections
+        )
+        == 3
+    )
     assert any("convert_element_type" in operation_id for operation_id in source_ops)
     assert any(operation_id.endswith(":mul") for operation_id in source_ops)
     assert compiled.generated.source_path.exists()
@@ -87,8 +87,6 @@ def test_task16_warmed_megabake_launches_one_kernel(tmp_path):
             torch.cuda.synchronize()
 
     kernel_names = [
-        event.name
-        for event in profiler.events()
-        if event.device_type == DeviceType.CUDA
+        event.name for event in profiler.events() if event.device_type == DeviceType.CUDA
     ]
     assert len(kernel_names) == 1

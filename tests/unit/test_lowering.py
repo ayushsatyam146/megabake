@@ -85,8 +85,7 @@ def _read_load(program: TensorProgram, load_id: str, coordinates: dict[str, int]
         coordinate_values.append(coordinate)
         offset += coordinate * stride
     if load.source_shape is not None and any(
-        not 0 <= coordinate < size
-        for coordinate, size in zip(coordinate_values, load.source_shape)
+        not 0 <= coordinate < size for coordinate, size in zip(coordinate_values, load.source_shape)
     ):
         return torch.zeros(1, dtype=_dtype(load.dtype))[0]
     source = values[load.value_id]
@@ -99,10 +98,7 @@ def _loads(
     return {
         load.id: _read_load(program, load.id, coordinates, values)
         for load in program.loads
-        if all(
-            not isinstance(axis, str) or axis in coordinates
-            for axis in load.axes
-        )
+        if all(not isinstance(axis, str) or axis in coordinates for axis in load.axes)
     }
 
 
@@ -121,14 +117,10 @@ def _evaluate_expression(
         return accumulator
     if isinstance(expression, Cast):
         return torch.as_tensor(
-            _evaluate_expression(
-                expression.operand, loads, accumulator, coordinates
-            )
+            _evaluate_expression(expression.operand, loads, accumulator, coordinates)
         ).to(_dtype(expression.dtype))
     if isinstance(expression, Unary):
-        value = _evaluate_expression(
-            expression.operand, loads, accumulator, coordinates
-        )
+        value = _evaluate_expression(expression.operand, loads, accumulator, coordinates)
         functions = {
             "relu": torch.relu,
             "neg": torch.neg,
@@ -147,12 +139,8 @@ def _evaluate_expression(
         value = expression.start + coordinates[expression.axis] * expression.step
         return torch.tensor(value, dtype=_dtype(expression.dtype))
     if isinstance(expression, Binary):
-        lhs = _evaluate_expression(
-            expression.lhs, loads, accumulator, coordinates
-        )
-        rhs = _evaluate_expression(
-            expression.rhs, loads, accumulator, coordinates
-        )
+        lhs = _evaluate_expression(expression.lhs, loads, accumulator, coordinates)
+        rhs = _evaluate_expression(expression.rhs, loads, accumulator, coordinates)
         functions = {
             "add": operator.add,
             "sub": operator.sub,
@@ -171,15 +159,9 @@ def _evaluate_expression(
         return functions[expression.operator](lhs, rhs)
     if isinstance(expression, Where):
         return torch.where(
-            _evaluate_expression(
-                expression.condition, loads, accumulator, coordinates
-            ),
-            _evaluate_expression(
-                expression.true_value, loads, accumulator, coordinates
-            ),
-            _evaluate_expression(
-                expression.false_value, loads, accumulator, coordinates
-            ),
+            _evaluate_expression(expression.condition, loads, accumulator, coordinates),
+            _evaluate_expression(expression.true_value, loads, accumulator, coordinates),
+            _evaluate_expression(expression.false_value, loads, accumulator, coordinates),
         )
     raise AssertionError(f"unsupported test expression {expression!r}")
 
@@ -196,12 +178,8 @@ def _evaluate_program(program: TensorProgram, values: dict) -> torch.Tensor:
     for size, stride in zip(program.store.shape, program.store.strides):
         maximum_store_offset += max(size - 1, 0) * abs(stride)
     storage = torch.empty(maximum_store_offset + 1, dtype=_dtype(program.store.dtype))
-    result = storage.as_strided(
-        program.store.shape, program.store.strides, storage_offset=0
-    )
-    for output_coordinates in itertools.product(
-        *(range(domain.size) for domain in output_domains)
-    ):
+    result = storage.as_strided(program.store.shape, program.store.strides, storage_offset=0)
+    for output_coordinates in itertools.product(*(range(domain.size) for domain in output_domains)):
         output_map = {
             domain.axis: coordinate
             for domain, coordinate in zip(output_domains, output_coordinates)
@@ -254,9 +232,7 @@ def _evaluate_canonical_program(
             indices = values[program.semantics["indices"]]
             return (data[indices],)
         source = values[program.semantics["source"]]
-        indices = tuple(
-            values[value_id] for value_id in program.semantics["indices"]
-        )
+        indices = tuple(values[value_id] for value_id in program.semantics["indices"])
         return (source[indices],)
     if program.family == "softmax_statistics":
         source = values[program.semantics["input"]]
@@ -277,9 +253,7 @@ def _evaluate_graph(graph, values: dict):
         assert program is not None, operation.numerical_rules
         if isinstance(program, TensorProgram):
             assert len(operation.results) == 1
-            environment[operation.results[0]] = _evaluate_program(
-                program, environment
-            )
+            environment[operation.results[0]] = _evaluate_program(program, environment)
         else:
             results = _evaluate_canonical_program(program, environment)
             assert len(results) == len(operation.results)
@@ -353,9 +327,7 @@ def test_lower_semantics_supports_scalar_attribute_and_lift_fresh_copy():
         mask_node.meta["val"] = mask
         constant_node = fx_graph.get_attr("zero")
         constant_node.meta["val"] = zero
-        lifted = fx_graph.call_function(
-            torch.ops.aten.lift_fresh_copy.default, (constant_node,)
-        )
+        lifted = fx_graph.call_function(torch.ops.aten.lift_fresh_copy.default, (constant_node,))
         lifted.meta["val"] = zero
         result = fx_graph.call_function(
             torch.ops.aten.where.self, (mask_node, lifted, constant_node)
@@ -366,9 +338,7 @@ def test_lower_semantics_supports_scalar_attribute_and_lift_fresh_copy():
     graph = canonicalize_semantics(import_fx(module, _context(module, mask)))
 
     assert all(operation.tensor_program is not None for operation in graph.ops.values())
-    assert graph.ops["op:zero"].tensor_program.combine == Constant(
-        0.0, "torch.bfloat16"
-    )
+    assert graph.ops["op:zero"].tensor_program.combine == Constant(0.0, "torch.bfloat16")
     assert graph.ops["op:lift_fresh_copy_default"].tensor_program.family == "copy"
 
     torch.testing.assert_close(
@@ -438,13 +408,16 @@ def test_canonicalize_semantics_supports_shared_targets_and_preserves_programs()
         assert canonical_operation.tensor_program == operation.tensor_program
 
     torch.testing.assert_close(
-        _evaluate_graph(canonical, {
-            "x": x,
-            "y": y,
-            "ids": ids,
-            "weights": weights,
-            "mask": mask,
-        }),
+        _evaluate_graph(
+            canonical,
+            {
+                "x": x,
+                "y": y,
+                "ids": ids,
+                "weights": weights,
+                "mask": mask,
+            },
+        ),
         model(x, y, ids, weights, mask),
     )
 
@@ -480,9 +453,7 @@ def test_canonicalize_semantics_supports_multi_result_online_softmax():
             assert projection.storage_relation.aliases == (source_id,)
             assert projection.storage_relation.unknown is False
 
-    torch.testing.assert_close(
-        _evaluate_graph(canonical, {"x": x}), model(x)
-    )
+    torch.testing.assert_close(_evaluate_graph(canonical, {"x": x}), model(x))
 
 
 def test_canonicalize_semantics_supports_concat_semantics():
@@ -494,13 +465,9 @@ def test_canonicalize_semantics_supports_concat_semantics():
     x = torch.randn(2, 3)
     model = Model().eval()
     graph_module = torch.fx.symbolic_trace(model)
-    cat_node = next(
-        node for node in graph_module.graph.nodes if node.op == "call_function"
-    )
+    cat_node = next(node for node in graph_module.graph.nodes if node.op == "call_function")
     cat_node.meta["val"] = model(x)
-    canonical = canonicalize_semantics(
-        import_fx(graph_module, _context(graph_module, x))
-    )
+    canonical = canonicalize_semantics(import_fx(graph_module, _context(graph_module, x)))
     concat_operation = canonical.ops["op:cat_default"]
     program = concat_operation.tensor_program
     assert isinstance(program, TensorProgram)
@@ -509,9 +476,7 @@ def test_canonicalize_semantics_supports_concat_semantics():
         canonical.inputs[0],
         canonical.inputs[0],
     )
-    torch.testing.assert_close(
-        _evaluate_graph(canonical, {"x": x}), model(x)
-    )
+    torch.testing.assert_close(_evaluate_graph(canonical, {"x": x}), model(x))
 
 
 def test_lower_semantics_supports_broadcast_advanced_indexing():
@@ -528,9 +493,7 @@ def test_lower_semantics_supports_broadcast_advanced_indexing():
 
     assert all(operation.tensor_program is not None for operation in graph.ops.values())
     torch.testing.assert_close(
-        _evaluate_graph(
-            graph, {"source": source, "first": first, "second": second}
-        ),
+        _evaluate_graph(graph, {"source": source, "first": first, "second": second}),
         model(source, first, second),
     )
 
@@ -574,9 +537,7 @@ def test_lower_semantics_supports_scalar_multiply():
 
     assert graph.ops["op:mul_scalar"].attributes["target"] == "aten.mul.Scalar"
     assert all(operation.tensor_program is not None for operation in graph.ops.values())
-    torch.testing.assert_close(
-        _evaluate_graph(graph, {"values": values}), model(values)
-    )
+    torch.testing.assert_close(_evaluate_graph(graph, {"values": values}), model(values))
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -764,7 +725,7 @@ def test_lower_semantics_covers_softmax_clamp_and_exact_gelu():
         operation.attributes["target"]
         for operation in graph.ops.values()
         if operation.tensor_program is None
-        }
+    }
     amax_operation = next(
         operation
         for operation in graph.ops.values()
@@ -868,9 +829,7 @@ def test_task23_convolution_is_an_indexed_grouped_contraction():
 def test_task23_pooling_is_an_indexed_reduction_with_masked_windows():
     class Model(torch.nn.Module):
         def forward(self, source):
-            return torch.nn.functional.avg_pool2d(
-                source, (2, 2), stride=(1, 1), padding=(1, 1)
-            )
+            return torch.nn.functional.avg_pool2d(source, (2, 2), stride=(1, 1), padding=(1, 1))
 
     source = torch.randn(2, 3, 5, 6)
     graph = lower_semantics(_import(Model(), source))

@@ -3,11 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 
 import cutlass
-import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
-from cuda.bindings import driver as cuda
 import pytest
 import torch
+from cuda.bindings import driver as cuda
+from cutlass import cute
+from cutlass.cute.runtime import from_dlpack
 
 from megabake import (
     admit_runtime,
@@ -22,13 +22,15 @@ from megabake.frontend import prepare_fx_graph
 from megabake.graph import import_fx
 from megabake.lowering import canonicalize_semantics
 from megabake.regions import form_regions
-from megabake.runtime import cooperative_worker_loop, grid_barrier, make_ready
+from megabake.runtime import (
+    cooperative_worker_loop,
+    grid_barrier,
+    make_ready,
+    ready_slots,
+)
 from megabake.schedule import WorkerAssignment
 
-
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA is required"
-)
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 
 
 @cute.jit
@@ -109,6 +111,7 @@ def _launch(
 
 def _target() -> TargetFacts:
     from megabake.compiler import _target_facts
+
     return _target_facts(torch.device("cuda"))
 
 
@@ -122,9 +125,7 @@ def _plan(workers: int):
     value = torch.randn(2, 3)
     exported = torch.export.export(Model(), (value,))
     prepared = prepare_fx_graph(exported.graph_module, (value,))
-    graph = form_regions(
-        canonicalize_semantics(import_fx(prepared.graph, prepared.context))
-    )
+    graph = form_regions(canonicalize_semantics(import_fx(prepared.graph, prepared.context)))
     selection = select_bodies(graph, _target())
     schedule = make_phase_schedule(selection, derive_dependencies(selection))
     plan = assign_storage(schedule)
@@ -140,9 +141,7 @@ def _plan(workers: int):
             ),
             barrier=None
             if phase.barrier is None
-            else replace(
-                phase.barrier, participating_workers=tuple(range(workers))
-            ),
+            else replace(phase.barrier, participating_workers=tuple(range(workers))),
         )
         for phase in plan.phases
     )
@@ -170,9 +169,7 @@ def _plan(workers: int):
 
 
 def _flat(tensor):
-    return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(
-        leading_dim=tensor.ndim - 1
-    )
+    return from_dlpack(tensor, assumed_align=16).mark_layout_dynamic(leading_dim=tensor.ndim - 1)
 
 
 def test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid():
@@ -181,8 +178,8 @@ def test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid():
     stream = torch.cuda.Stream(device=device)
     with torch.cuda.stream(stream):
         source = torch.ones(257, device=device, dtype=torch.float32)
-        produced = torch.empty(60, device=device, dtype=torch.float32)
-        ready = make_ready(60, device)
+        produced = torch.empty(max(4, sms), device=device, dtype=torch.float32)
+        ready = make_ready(4, device)
         sink = torch.empty(1, device=device, dtype=torch.float32)
         compiled = cute.compile(
             _launch,
@@ -203,7 +200,7 @@ def test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid():
             _flat(produced),
             _flat(ready_tensor),
             _flat(sink),
-            cutlass.Int32(ready_tensor.numel() - 2),
+            cutlass.Int32(ready_tensor.numel() - ready_slots(0)),
             cutlass.Int32(epoch),
             cuda.CUstream(active_stream.cuda_stream),
         )
@@ -212,7 +209,8 @@ def test_phase_runtime_ports_delay_idle_rebinding_and_largest_grid():
     assert admit_runtime(four_worker_plan).max_workers >= 4
     invocation = execute_phase_plan(four_worker_plan, kernel, stream)
     assert invocation.epoch == 0
-    assert invocation.barrier_count == 2
+    # The independent sum and amax share one barrier before their addition.
+    assert invocation.barrier_count == 1
     assert sink.item() == 300_000.0
 
     current_source = torch.full((257,), 2.0, device=device, dtype=torch.float32)
@@ -234,6 +232,8 @@ def test_phase_runtime_rejects_cuda_graph_capture():
     capture_stream = torch.cuda.Stream()
     with torch.cuda.stream(capture_stream):
         graph = torch.cuda.CUDAGraph()
-        with pytest.raises(Exception, match="CUDA Graph capture is not supported"):
-            with torch.cuda.graph(graph, stream=capture_stream):
-                execute_phase_plan(plan, kernel, capture_stream)
+        with (
+            pytest.raises(Exception, match="CUDA Graph capture is not supported"),
+            torch.cuda.graph(graph, stream=capture_stream),
+        ):
+            execute_phase_plan(plan, kernel, capture_stream)

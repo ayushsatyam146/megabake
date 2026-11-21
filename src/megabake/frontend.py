@@ -3,19 +3,20 @@ from __future__ import annotations
 import hashlib
 import operator
 import re
-from pathlib import Path
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any
 
 import torch
 from torch.utils import _pytree as pytree
 
-from .fx_handler.utils import dump_graph
 from .diagnostics import CompilerError
+from .fx_handler.utils import dump_graph
 
-
-_PINNED_TORCH = (2, 14)
+PINNED_TORCH = (2, 14)
+SUPPORTED_CAPABILITIES = frozenset({(9, 0), (10, 0), (10, 3), (12, 0), (12, 1)})
 
 
 @dataclass
@@ -99,9 +100,7 @@ class PreparedFX:
     example_inputs: tuple[Any, ...] = ()
 
 
-_SPLITS = frozenset(
-    {torch.ops.aten.split.Tensor, torch.ops.aten.split_with_sizes.default}
-)
+_SPLITS = frozenset({torch.ops.aten.split.Tensor, torch.ops.aten.split_with_sizes.default})
 
 
 def split_to_slices(graph_module: Any) -> None:
@@ -189,7 +188,8 @@ def _cse_key(target: Any, args: Any, kwargs: Any) -> Any:
         if isinstance(value, dict):
             return ("dict", *sorted((key, freeze(item)) for key, item in value.items()))
         if value is None or isinstance(
-            value, (bool, int, float, str, torch.dtype, torch.device, torch.layout, torch.memory_format)
+            value,
+            (bool, int, float, str, torch.dtype, torch.device, torch.layout, torch.memory_format),
         ):
             # Distinguish 1 from 1.0 and True.
             return (type(value).__name__, value)
@@ -203,7 +203,7 @@ def _cse_key(target: Any, args: Any, kwargs: Any) -> Any:
     return key
 
 
-def _torch_version() -> tuple[int, int]:
+def torch_version() -> tuple[int, int]:
     match = re.match(r"(\d+)\.(\d+)", torch.__version__)
     if match is None:
         raise RuntimeError(f"Cannot parse PyTorch version {torch.__version__!r}")
@@ -211,15 +211,16 @@ def _torch_version() -> tuple[int, int]:
 
 
 def _check_torch_version() -> None:
-    if _torch_version() != _PINNED_TORCH:
+    if torch_version() != PINNED_TORCH:
         raise RuntimeError(
-            f"MegaBake supports PyTorch {_PINNED_TORCH[0]}.{_PINNED_TORCH[1]}; "
+            f"MegaBake supports PyTorch {PINNED_TORCH[0]}.{PINNED_TORCH[1]}; "
             f"found {torch.__version__}"
         )
 
 
 def _torch_internals() -> SimpleNamespace:
     from torch._functorch.aot_autograd import aot_module_simplified, make_boxed_func
+    from torch._inductor import config as inductor_config
     from torch._inductor.compile_fx import (
         _recursive_post_grad_passes,
         _recursive_record_original_output_strides,
@@ -230,7 +231,6 @@ def _torch_internals() -> SimpleNamespace:
         partition_fn,
         run_pre_grad_passes,
     )
-    from torch._inductor import config as inductor_config
     from torch._inductor.decomposition import select_decomp_table
     from torch._inductor.fx_passes.post_grad import view_to_reshape
     from torch._inductor.virtualized import V
@@ -271,9 +271,7 @@ def _graph_hash(graph: Any) -> str:
 
 def _capture_key(graph: Any, example_inputs: Sequence[Any]) -> str:
     input_text = "|".join(_input_fingerprint(value) for value in example_inputs)
-    return hashlib.sha256(
-        (_graph_hash(graph) + "\0" + input_text).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256((_graph_hash(graph) + "\0" + input_text).encode("utf-8")).hexdigest()
 
 
 def _placeholder_specs(
@@ -342,9 +340,7 @@ def _make_context(
         input_order=names,
         input_specs=specs,
         input_kinds=kinds,
-        parameter_names=(
-            inferred_parameters if parameter_names is None else parameter_names
-        ),
+        parameter_names=(inferred_parameters if parameter_names is None else parameter_names),
         output_structure=output_structure,
         output_count=output_count,
         output_tree_spec=output_tree_spec,
@@ -366,9 +362,7 @@ def _validate_options(options: Mapping[str, Any]) -> dict[str, Any]:
     if mode not in {"prefill", "decode"}:
         raise ValueError(f"Unsupported mode {mode!r}; expected 'prefill' or 'decode'")
     if fallback not in {"error", "inductor"}:
-        raise ValueError(
-            f"Unsupported fallback {fallback!r}; expected 'error' or 'inductor'"
-        )
+        raise ValueError(f"Unsupported fallback {fallback!r}; expected 'error' or 'inductor'")
     if not isinstance(options.get("cache", True), bool):
         raise TypeError("cache must be a boolean")
     model_name = options.get("model_name", "model")
@@ -382,9 +376,7 @@ def _validate_options(options: Mapping[str, Any]) -> dict[str, Any]:
         raise TypeError("compile_kernel must be True, False, or None for automatic")
     scheduler = options.get("scheduler", "auto")
     if scheduler not in {"phase", "region-events", "auto"}:
-        raise ValueError(
-            "scheduler must be 'phase', 'region-events', or 'auto'"
-        )
+        raise ValueError("scheduler must be 'phase', 'region-events', or 'auto'")
     return {
         "mode": mode,
         "fallback": fallback,
@@ -407,9 +399,7 @@ def _infer_parameter_bindings(
     input_kinds: Mapping[str, str] | None,
     parameter_names: set[str] | None,
 ) -> tuple[Mapping[str, str] | None, set[str] | None]:
-    placeholder_names = [
-        node.name for node in graph.graph.nodes if node.op == "placeholder"
-    ]
+    placeholder_names = [node.name for node in graph.graph.nodes if node.op == "placeholder"]
     inferred_kinds = dict(input_kinds or {})
     inferred_parameters = set(parameter_names or ())
     if parameter_names is None:
@@ -418,9 +408,7 @@ def _infer_parameter_bindings(
                 inferred_parameters.add(name)
     if input_kinds is None:
         for name in placeholder_names:
-            inferred_kinds[name] = (
-                "parameter" if name in inferred_parameters else "runtime"
-            )
+            inferred_kinds[name] = "parameter" if name in inferred_parameters else "runtime"
     return inferred_kinds, inferred_parameters
 
 
@@ -448,20 +436,15 @@ def _prepare_fx_graph(
     internals = _torch_internals()
     _reject_symbolic_shapes(graph)
     dump_directory = (
-        Path(options["dump_dir"])
-        / _safe_model_name(model_name or options["model_name"])
+        Path(options["dump_dir"]) / _safe_model_name(model_name or options["model_name"])
         if options["dump_dir"] is not None
         else None
     )
-    dump_graph(
-        "input", graph, dump_directory, "Initial FX graph received by MegaBake."
-    )
+    dump_graph("input", graph, dump_directory, "Initial FX graph received by MegaBake.")
     if not internals.graph_returns_tuple(graph):
         internals.make_graph_return_tuple(graph, example_inputs, lambda value, _: value)
     dump_graph("normalized", graph, dump_directory, "Normalized FX graph return.")
-    context = _make_context(
-        graph, example_inputs, options, input_kinds, parameter_names
-    )
+    context = _make_context(graph, example_inputs, options, input_kinds, parameter_names)
     if contexts is not None:
         contexts.append(context)
     if output_tree_spec is not None:
@@ -471,14 +454,10 @@ def _prepare_fx_graph(
     def pre_grad_callback(pre_grad_graph: Any, inputs: Sequence[Any]) -> Any:
         transformed = internals.run_pre_grad_passes(pre_grad_graph, inputs)
         dump_graph("pre_grad", transformed, dump_directory)
-        context.captures.append(
-            CaptureRecord("pre_grad", "miss", _graph_hash(transformed))
-        )
+        context.captures.append(CaptureRecord("pre_grad", "miss", _graph_hash(transformed)))
         return transformed
 
-    def prepare_aot_graph(
-        prepared_graph: Any, inputs: Sequence[Any]
-    ) -> Callable[..., Any]:
+    def prepare_aot_graph(prepared_graph: Any, inputs: Sequence[Any]) -> Callable[..., Any]:
         dump_graph(
             "aot",
             prepared_graph,
@@ -521,9 +500,7 @@ def _prepare_fx_graph(
         internals.view_to_reshape(prepared_graph)
         fake_mode = internals.fake_tensor_prop(prepared_graph, inputs)
         internals.record_original_output_strides(prepared_graph)
-        with internals.V.set_fake_mode(fake_mode), internals.cuda_device_context(
-            prepared_graph
-        ):
+        with internals.V.set_fake_mode(fake_mode), internals.cuda_device_context(prepared_graph):
             internals.recursive_post_grad_passes(prepared_graph, is_inference=True)
         split_to_slices(prepared_graph)
         eliminate_common_subexpressions(prepared_graph)
@@ -616,8 +593,7 @@ def make_backend(**options: Any) -> Callable[..., Any]:
             unexpected = ", ".join(sorted(dynamo_kwargs))
             raise TypeError(f"Unsupported Dynamo backend options: {unexpected}")
         if torch.is_grad_enabled() and any(
-            isinstance(value, torch.Tensor) and value.requires_grad
-            for value in example_inputs
+            isinstance(value, torch.Tensor) and value.requires_grad for value in example_inputs
         ):
             raise RuntimeError("MegaBake supports inference only")
         input_kinds, parameter_names = _infer_parameter_bindings(
@@ -670,10 +646,7 @@ def make_backend(**options: Any) -> Callable[..., Any]:
                     cache=plan_cache,
                 )
             except CompilerError as error:
-                if (
-                    validated_options["fallback"] != "inductor"
-                    or not error.safe_for_fallback
-                ):
+                if validated_options["fallback"] != "inductor" or not error.safe_for_fallback:
                     raise
                 forward = wrap(compile_inductor_fallback(prepared, str(error)))
                 backend.megabake_last_fallback = forward
@@ -708,16 +681,14 @@ def make_backend(**options: Any) -> Callable[..., Any]:
 
 
 def _can_auto_compile(example_inputs: Sequence[Any]) -> bool:
-    tensors = [
-        value for value in example_inputs if isinstance(value, torch.Tensor)
-    ]
+    tensors = [value for value in example_inputs if isinstance(value, torch.Tensor)]
     if not tensors or any(tensor.device.type != "cuda" for tensor in tensors):
         return False
     try:
         capability = torch.cuda.get_device_capability(tensors[0].device)
-    except Exception:
+    except Exception:  # noqa: BLE001  # Preserve the diagnostic/fallback boundary for arbitrary backend failures.
         return False
-    return capability in {(9, 0), (10, 0), (10, 3), (12, 0), (12, 1)}
+    return capability in SUPPORTED_CAPABILITIES
 
 
 def prepare_fx_graph(

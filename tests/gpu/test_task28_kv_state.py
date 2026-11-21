@@ -6,7 +6,6 @@ import torch
 from megabake import make_backend
 from megabake.fx_handler.transformers import StatefulAttention
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability(0) != (9, 0),
     reason="task 28 requires an SM90 CUDA device",
@@ -50,9 +49,7 @@ def test_task28_compiles_prefill_then_two_advancing_decode_calls(tmp_path):
         first = optimized(*inputs)
         second = optimized(source, key * 0.5, value * 0.5, *inputs[3:])
         expected_first = model(*expected_inputs)
-        expected_second = model(
-            source, key * 0.5, value * 0.5, *expected_inputs[3:]
-        )
+        expected_second = model(source, key * 0.5, value * 0.5, *expected_inputs[3:])
 
     torch.testing.assert_close(first, expected_first, rtol=0, atol=0)
     torch.testing.assert_close(second, expected_second, rtol=0, atol=0)
@@ -62,9 +59,7 @@ def test_task28_compiles_prefill_then_two_advancing_decode_calls(tmp_path):
     assert int(valid_length.item()) == 3
 
     compiled = backend.megabake_last_compiled
-    assert compiled.plan.selection.selections[0].body.name == (
-        "attention_stateful_decode_rows"
-    )
+    assert compiled.plan.selection.selections[0].body.name == ("attention_stateful_decode_rows")
     assert compiled.plan.storage.state[0].capacity == 3
     assert compiled.plan.storage.state[0].lifetime == "boundary_state"
     assert compiled.generated.source_path.exists()

@@ -43,7 +43,9 @@ def _compile(model_name: str, mode: str) -> None:
             step, shapes = decode_module(model, 128)
             state = [torch.zeros(s, device="cuda", dtype=d) for layer in shapes for s, d in layer]
             compiled = torch.compile(step, backend=backend, fullgraph=True, dynamic=False)
-            compiled(torch.tensor([[504]], device="cuda"), torch.tensor([[0]], device="cuda"), *state)
+            compiled(
+                torch.tensor([[504]], device="cuda"), torch.tensor([[0]], device="cuda"), *state
+            )
 
 
 def main() -> int:
@@ -61,6 +63,7 @@ def main() -> int:
     )
     result = subprocess.run(
         [sys.executable, __file__, "--model", args.model, "--mode", args.mode, "--compile-only"],
+        check=False,
         env=environment,
         capture_output=True,
         text=True,

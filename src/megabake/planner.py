@@ -17,8 +17,8 @@ from .plan import (
     CuTeLayout,
     InvalidTileMap,
     LogicalTile,
-    ResourceRequirements,
     RejectionRecord,
+    ResourceRequirements,
     SelectedBody,
     TileAccess,
     TileGrid,
@@ -63,9 +63,7 @@ def enumerate_body_selections(
     entry = _SELECTION_CACHE.get(key)
     if entry is not None and entry[0] is graph:
         return entry[1]
-    selections = _enumerate_body_selections(
-        graph, target, policy, max_plans=max_plans
-    )[0]
+    selections = _enumerate_body_selections(graph, target, policy, max_plans=max_plans)[0]
     if len(_SELECTION_CACHE) >= 8:
         _SELECTION_CACHE.pop(next(iter(_SELECTION_CACHE)))
     _SELECTION_CACHE[key] = (graph, selections)
@@ -75,14 +73,10 @@ def enumerate_body_selections(
 _SELECTION_CACHE: dict[tuple[Any, ...], tuple[ComputeGraph, tuple[BodySelectionPlan, ...]]] = {}
 
 
-def _validated_policy(
-    graph: ComputeGraph, policy: SelectionPolicy | None
-) -> SelectionPolicy:
+def _validated_policy(graph: ComputeGraph, policy: SelectionPolicy | None) -> SelectionPolicy:
     selected_policy = policy or SelectionPolicy()
     if selected_policy.mode not in {"prefill", "decode"}:
-        raise ValueError(
-            f"selection mode {selected_policy.mode!r} must be 'prefill' or 'decode'"
-        )
+        raise ValueError(f"selection mode {selected_policy.mode!r} must be 'prefill' or 'decode'")
     stateful = any(
         isinstance(semantics, Attention) and semantics.cache.policy == "stateful"
         for region in graph.regions
@@ -137,7 +131,9 @@ def _enumerate_body_selections(
                 tensor_programs=(candidate.tensor_program,),
             )
             options.extend(
-                _body_options(candidate_region, candidate.tensor_program, target, selected_policy, rejections)
+                _body_options(
+                    candidate_region, candidate.tensor_program, target, selected_policy, rejections
+                )
             )
 
         if all(
@@ -150,18 +146,13 @@ def _enumerate_body_selections(
         if region.tensor_programs:
             program = region.tensor_programs[0]
             if isinstance(program, TensorProgram):
-                options.extend(
-                    _body_options(region, program, target, selected_policy, rejections)
-                )
+                options.extend(_body_options(region, program, target, selected_policy, rejections))
             else:
                 unsupported.append(UnsupportedRegion(region.id, "tensor program is unknown"))
         else:
             unsupported.append(UnsupportedRegion(region.id, "region has no tensor program"))
         if not options:
-            if all(
-                operation_id in covered_by_candidates
-                for operation_id in region.source_op_ids
-            ):
+            if all(operation_id in covered_by_candidates for operation_id in region.source_op_ids):
                 covered_empty_regions.append(len(options_by_region))
                 options_by_region.append([None])
                 continue
@@ -184,9 +175,8 @@ def _enumerate_body_selections(
     for index, option in all_options:
         region_operations = set(graph.regions[index].source_op_ids)
         candidate_operations = set(option[0].source_op_ids)
-        if (
-            not region_operations <= candidate_operations
-            or covered_operations.intersection(candidate_operations)
+        if not region_operations <= candidate_operations or covered_operations.intersection(
+            candidate_operations
         ):
             continue
         first_combination[index] = option
@@ -233,8 +223,7 @@ def _enumerate_body_selections(
                     option
                     for option in options
                     if option is not None
-                    and set(graph.regions[index].source_op_ids)
-                    <= set(option[0].source_op_ids)
+                    and set(graph.regions[index].source_op_ids) <= set(option[0].source_op_ids)
                 ),
                 None,
             )
@@ -242,8 +231,7 @@ def _enumerate_body_selections(
                 continue
             replacement_operations = set(replacement[0].source_op_ids)
             replaced_indices = {
-                operation_indices[operation_id]
-                for operation_id in replacement_operations
+                operation_indices[operation_id] for operation_id in replacement_operations
             }
             replaced_operations = {
                 operation_id
@@ -257,8 +245,7 @@ def _enumerate_body_selections(
                 first_combination[replaced_index] = None
             first_combination[index] = replacement
             operation_indices.update(
-                (operation_id, index)
-                for operation_id in replacement_operations
+                (operation_id, index) for operation_id in replacement_operations
             )
 
     combination_limit = max_plans * 16
@@ -269,9 +256,7 @@ def _enumerate_body_selections(
             break
     seed = (tuple(first_combination),)
     combinations = (
-        seed
-        if combination_count > combination_limit
-        else chain(seed, product(*options_by_region))
+        seed if combination_count > combination_limit else chain(seed, product(*options_by_region))
     )
     examined_combinations = 0
     for combination in combinations:
@@ -365,9 +350,7 @@ def _body_options(
     ]
 
 
-def _selected_body(
-    region: Region, program: TensorProgram, body: BodyConfig
-) -> SelectedBody:
+def _selected_body(region: Region, program: TensorProgram, body: BodyConfig) -> SelectedBody:
     return SelectedBody(
         region_id=region.id,
         source_op_ids=region.source_op_ids,
@@ -443,6 +426,8 @@ def _attention_body_order(
 def _contraction_body_order(
     config: BodyConfig, program: TensorProgram, policy: SelectionPolicy
 ) -> tuple[int, ...]:
+    if config.selection_priority:
+        return (config.selection_priority, 0, 0, 0, *_body_cost(config))
     small_m = program.store.shape[0] <= 16
     mode_priority = 0 if (policy.mode == "decode") == small_m else 1
     small_tile = config.tiles.cta_shape[-1] <= 64
@@ -459,7 +444,9 @@ def _contraction_body_order(
 
 
 def make_tile_maps(selection: BodySelectionPlan) -> tuple[TileMap, ...]:
-    return tuple(_cached_tile_map(selected, selection.conversions) for selected in selection.selections)
+    return tuple(
+        _cached_tile_map(selected, selection.conversions) for selected in selection.selections
+    )
 
 
 # Tile maps enumerate every output tile and its input tiles, which for large
@@ -471,9 +458,7 @@ _TILE_MAP_CACHE: dict[tuple[int, tuple[int, ...]], tuple[Any, tuple[Any, ...], T
 _TILE_MAP_CACHE_LIMIT = 8192
 
 
-def _cached_tile_map(
-    selected: SelectedBody, conversions: Sequence[ConversionBody]
-) -> TileMap:
+def _cached_tile_map(selected: SelectedBody, conversions: Sequence[ConversionBody]) -> TileMap:
     relevant = tuple(
         conversion
         for conversion in conversions
@@ -482,8 +467,10 @@ def _cached_tile_map(
     )
     key = (id(selected), tuple(id(conversion) for conversion in relevant))
     entry = _TILE_MAP_CACHE.get(key)
-    if entry is not None and entry[0] is selected and all(
-        old is new for old, new in zip(entry[1], relevant, strict=True)
+    if (
+        entry is not None
+        and entry[0] is selected
+        and all(old is new for old, new in zip(entry[1], relevant, strict=True))
     ):
         return entry[2]
     tile_map = _make_tile_map(selected, conversions)
@@ -495,8 +482,7 @@ def _cached_tile_map(
 
 def _body_cost(config: BodyConfig) -> tuple[int, int]:
     base_cost = (
-        config.participants.participating_threads
-        * config.participants.registers_per_thread
+        config.participants.participating_threads * config.participants.registers_per_thread
         + config.scratch.size_bytes
     )
     saved_bytes = config.evidence.measurements.get("fusion_saved_bytes", 0)
@@ -565,9 +551,7 @@ def _make_tile_map(
         raise InvalidTileMap(f"{selected.region_id} has no output layout")
     output_layout = CuTeLayout.from_contract(output_contract)
     output_domains = tuple(
-        domain
-        for domain in program.iteration_domains
-        if domain.axis not in program.reduction_axes
+        domain for domain in program.iteration_domains if domain.axis not in program.reduction_axes
     )
     output_axes = tuple(domain.axis for domain in output_domains)
     if tuple(output_contract.axes) != output_axes:
@@ -590,7 +574,9 @@ def _make_tile_map(
         if contract.dtype != load.dtype or (
             conversion is None and tuple(contract.strides) != tuple(load.strides)
         ):
-            raise InvalidTileMap(f"{selected.region_id} input layout does not match {load.value_id}")
+            raise InvalidTileMap(
+                f"{selected.region_id} input layout does not match {load.value_id}"
+            )
         base_layout = (
             conversion.target_layout
             if conversion is not None
@@ -599,12 +585,9 @@ def _make_tile_map(
         if tuple(contract.axes) == tuple(load.axes):
             layout = base_layout
         else:
-            domain_sizes = {
-                domain.axis: domain.size for domain in program.iteration_domains
-            }
+            domain_sizes = {domain.axis: domain.size for domain in program.iteration_domains}
             shape = load.source_shape or tuple(
-                1 if isinstance(axis, int) else domain_sizes[axis]
-                for axis in load.axes
+                1 if isinstance(axis, int) else domain_sizes[axis] for axis in load.axes
             )
             layout = CuTeLayout(
                 load.dtype,
@@ -616,8 +599,7 @@ def _make_tile_map(
 
     grid = TileGrid(program.store.shape, _output_tile_shape(program, body))
     reduction_size = prod(
-        domain.size for domain in program.iteration_domains
-        if domain.axis in program.reduction_axes
+        domain.size for domain in program.iteration_domains if domain.axis in program.reduction_axes
     )
     reduction_range = (0, reduction_size) if program.reduction_axes else None
     accesses = tuple(
@@ -679,9 +661,7 @@ def _output_tile_shape(program: TensorProgram, body: BodyConfig) -> tuple[int, .
     return body.tiles.cta_shape
 
 
-def _row_major_tile_shape(
-    shape: Sequence[int], element_limit: int
-) -> tuple[int, ...]:
+def _row_major_tile_shape(shape: Sequence[int], element_limit: int) -> tuple[int, ...]:
     tile_shape = [1] * len(shape)
     remaining = element_limit
     for dimension in reversed(range(len(shape))):
@@ -734,9 +714,7 @@ def _input_tile(
             shape.append(reduction_domains[axis])
             continue
         if not isinstance(axis, AxisAffine):
-            raise InvalidTileMap(
-                f"input axis {axis} is not connected to the iteration domains"
-            )
+            raise InvalidTileMap(f"input axis {axis} is not connected to the iteration domains")
         minimum, maximum = _affine_bounds(axis, axis_ranges)
         if maximum < 0 or minimum >= layout.shape[len(origin)]:
             origin.append(0)
@@ -747,13 +725,8 @@ def _input_tile(
     return _logical_tile(load.value_id, tuple(load.axes), layout, tuple(origin), tuple(shape))
 
 
-def _affine_bounds(
-    axis: AxisAffine, ranges: dict[str, tuple[int, int]]
-) -> tuple[int, int]:
-    if any(
-        term.scale <= 0 or term.divisor <= 0 or term.modulus < 0
-        for term in axis.terms
-    ):
+def _affine_bounds(axis: AxisAffine, ranges: dict[str, tuple[int, int]]) -> tuple[int, int]:
+    if any(term.scale <= 0 or term.divisor <= 0 or term.modulus < 0 for term in axis.terms):
         raise InvalidTileMap("affine input axis is not monotonic")
     values = []
     for bound in (0, 1):
@@ -776,9 +749,7 @@ def _logical_tile(
 ) -> LogicalTile:
     clipped_shape = tuple(
         min(extent, dimension - begin)
-        for extent, dimension, begin in zip(
-            tile_shape, layout.shape, origin, strict=True
-        )
+        for extent, dimension, begin in zip(tile_shape, layout.shape, origin, strict=True)
     )
     if any(extent <= 0 for extent in clipped_shape):
         raise InvalidTileMap(f"tile for {value_id} is empty")
